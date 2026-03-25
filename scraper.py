@@ -496,7 +496,8 @@ async def scrape_card_images(page: Page, limit: int = 0):
     BATCH_DELAY = 1.5         # seconds between batches
     DB_BATCH    = 500         # cards per DB fetch
     total_ok    = 0
-    total_fail  = 0
+    total_no_image = 0
+    total_error = 0
 
     console.print(f"\n[bold]Phase 4: Scraping image URLs via in-browser fetch ({FETCH_BATCH}x parallel)[/bold]\n")
 
@@ -537,36 +538,129 @@ async def scrape_card_images(page: Page, limit: int = 0):
                         return Promise.all(urls.map(async (url) => {
                             try {
                                 const resp = await fetch(url);
-                                if (resp.status !== 200) return null;
+                                if (resp.status !== 200) return {hash: null, reason: 'http_' + resp.status};
                                 const html = await resp.text();
                                 const match = html.match(re);
-                                return match ? match[1] : null;
-                            } catch { return null; }
+                                if (match) return {hash: match[1], reason: null};
+                                // Check if page loaded but has no card image
+                                if (html.includes('pricecharting.com') || html.includes('sportscardspro.com')) {
+                                    return {hash: null, reason: 'no_image_on_page'};
+                                }
+                                return {hash: null, reason: 'blocked_or_empty'};
+                            } catch(e) { return {hash: null, reason: 'fetch_error'}; }
                         }));
                     }""", urls)
                 except Exception:
-                    results = [None] * len(batch)
+                    results = [{"hash": None, "reason": "evaluate_error"}] * len(batch)
 
-                for card, img_hash in zip(batch, results):
+                for card, result in zip(batch, results):
                     pid = card["product_id"]
+                    img_hash = result.get("hash") if isinstance(result, dict) else result
+                    reason = result.get("reason", "") if isinstance(result, dict) else ""
+
                     if img_hash:
                         image_url = f"https://storage.googleapis.com/images.pricecharting.com/{img_hash}/1600.jpg"
                         db.update_card_image_url(pid, image_url)
                         total_ok += 1
-                    else:
+                    elif reason == "no_image_on_page":
+                        # Page loaded fine but card genuinely has no image
                         db.mark_card_no_image(pid)
-                        total_fail += 1
+                        total_no_image += 1
+                    else:
+                        # Rate-limited or blocked — mark as error so it can be retried
+                        db.mark_card_error(pid, reason or "unknown")
+                        total_error += 1
 
                 progress.advance(ptask, len(batch))
                 await asyncio.sleep(BATCH_DELAY)
 
-        console.print(f"  Batch done -- OK: [green]{total_ok}[/green], No image: [yellow]{total_fail}[/yellow]")
+        console.print(f"  Batch done -- OK: [green]{total_ok}[/green], No image: [yellow]{total_no_image}[/yellow], Errors: [red]{total_error}[/red]")
 
         if limit > 0 and total_ok >= limit:
             break
 
-    console.print(f"\n  Image URLs found: [green]{total_ok}[/green], no image: [yellow]{total_fail}[/yellow]")
-    db.log_event("phase4_complete", f"Found {total_ok} image URLs, {total_fail} no image")
+    console.print(f"\n  Fast pass: [green]{total_ok}[/green] found, [yellow]{total_no_image}[/yellow] no image, [red]{total_error}[/red] errors")
+
+    # Automatic fallback: retry errored cards with direct browser page visits
+    if total_error > 0:
+        browser_limit = (limit - total_ok) if limit > 0 else 0
+        if limit == 0 or browser_limit > 0:
+            console.print(f"\n[bold]Phase 4b: Retrying {total_error} errors via direct browser visit[/bold]\n")
+            browser_ok, browser_no_img = await _retry_errors_with_browser(page, limit=browser_limit)
+            total_ok += browser_ok
+            total_no_image += browser_no_img
+            remaining_errors = total_error - browser_ok - browser_no_img
+        else:
+            remaining_errors = total_error
+    else:
+        remaining_errors = 0
+
+    console.print(f"\n  Final: [green]{total_ok}[/green] image URLs, [yellow]{total_no_image}[/yellow] no image, [red]{remaining_errors}[/red] remaining errors")
+    db.log_event("phase4_complete", f"Found {total_ok} image URLs, {total_no_image} no image, {remaining_errors} remaining errors")
+
+
+async def _retry_errors_with_browser(page: Page, limit: int = 0) -> tuple[int, int]:
+    """
+    Retry errored cards by visiting each card's detail page in the browser.
+    Slower but more reliable — bypasses rate limits since it's a full page load.
+    Returns (ok_count, no_image_count).
+    """
+    total_ok = 0
+    total_no_image = 0
+
+    while True:
+        cards = db.get_errored_cards(100)
+        if not cards:
+            break
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Browser retry", total=len(cards))
+
+            for card in cards:
+                title = (card["product_name"] or "")[:35]
+                progress.update(task, description=f"Retry: {title}")
+
+                url = card.get("full_url")
+                pid = card["product_id"]
+
+                if not url:
+                    db.mark_card_no_image(pid)
+                    total_no_image += 1
+                    progress.advance(task)
+                    continue
+
+                ok = await safe_goto(page, url)
+                if not ok:
+                    progress.advance(task)
+                    continue  # Leave as error, try again next run
+
+                image_url = await extract_card_image_browser(page)
+
+                if image_url:
+                    if image_url.startswith("/"):
+                        image_url = f"{config.BASE_URL}{image_url}"
+                    db.update_card_image_url(pid, image_url)
+                    total_ok += 1
+                else:
+                    db.mark_card_no_image(pid)
+                    total_no_image += 1
+
+                progress.advance(task)
+
+                if limit > 0 and total_ok >= limit:
+                    console.print(f"  Browser retry: [green]{total_ok}[/green] found, [yellow]{total_no_image}[/yellow] no image")
+                    return total_ok, total_no_image
+
+                await random_delay()
+
+    console.print(f"  Browser retry: [green]{total_ok}[/green] found, [yellow]{total_no_image}[/yellow] no image")
+    return total_ok, total_no_image
 
 
 def _extract_image_url_from_html(html: str) -> str | None:
