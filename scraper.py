@@ -579,10 +579,88 @@ async def scrape_card_images(page: Page, limit: int = 0):
         if limit > 0 and total_ok >= limit:
             break
 
-    console.print(f"\n  Image URLs found: [green]{total_ok}[/green], No image: [yellow]{total_no_image}[/yellow], Errors (retryable): [red]{total_error}[/red]")
+    console.print(f"\n  Fast pass: [green]{total_ok}[/green] found, [yellow]{total_no_image}[/yellow] no image, [red]{total_error}[/red] errors")
+
+    # Automatic fallback: retry errored cards with direct browser page visits
     if total_error > 0:
-        console.print(f"  [dim]Run --reset-errors then --phase 4 to retry errors[/dim]")
-    db.log_event("phase4_complete", f"Found {total_ok} image URLs, {total_no_image} no image, {total_error} errors")
+        browser_limit = (limit - total_ok) if limit > 0 else 0
+        if limit == 0 or browser_limit > 0:
+            console.print(f"\n[bold]Phase 4b: Retrying {total_error} errors via direct browser visit[/bold]\n")
+            browser_ok, browser_no_img = await _retry_errors_with_browser(page, limit=browser_limit)
+            total_ok += browser_ok
+            total_no_image += browser_no_img
+            remaining_errors = total_error - browser_ok - browser_no_img
+        else:
+            remaining_errors = total_error
+    else:
+        remaining_errors = 0
+
+    console.print(f"\n  Final: [green]{total_ok}[/green] image URLs, [yellow]{total_no_image}[/yellow] no image, [red]{remaining_errors}[/red] remaining errors")
+    db.log_event("phase4_complete", f"Found {total_ok} image URLs, {total_no_image} no image, {remaining_errors} remaining errors")
+
+
+async def _retry_errors_with_browser(page: Page, limit: int = 0) -> tuple[int, int]:
+    """
+    Retry errored cards by visiting each card's detail page in the browser.
+    Slower but more reliable — bypasses rate limits since it's a full page load.
+    Returns (ok_count, no_image_count).
+    """
+    total_ok = 0
+    total_no_image = 0
+
+    while True:
+        cards = db.get_errored_cards(100)
+        if not cards:
+            break
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Browser retry", total=len(cards))
+
+            for card in cards:
+                title = (card["product_name"] or "")[:35]
+                progress.update(task, description=f"Retry: {title}")
+
+                url = card.get("full_url")
+                pid = card["product_id"]
+
+                if not url:
+                    db.mark_card_no_image(pid)
+                    total_no_image += 1
+                    progress.advance(task)
+                    continue
+
+                ok = await safe_goto(page, url)
+                if not ok:
+                    progress.advance(task)
+                    continue  # Leave as error, try again next run
+
+                image_url = await extract_card_image_browser(page)
+
+                if image_url:
+                    if image_url.startswith("/"):
+                        image_url = f"{config.BASE_URL}{image_url}"
+                    db.update_card_image_url(pid, image_url)
+                    total_ok += 1
+                else:
+                    db.mark_card_no_image(pid)
+                    total_no_image += 1
+
+                progress.advance(task)
+
+                if limit > 0 and total_ok >= limit:
+                    console.print(f"  Browser retry: [green]{total_ok}[/green] found, [yellow]{total_no_image}[/yellow] no image")
+                    return total_ok, total_no_image
+
+                await random_delay()
+
+    console.print(f"  Browser retry: [green]{total_ok}[/green] found, [yellow]{total_no_image}[/yellow] no image")
+    return total_ok, total_no_image
 
 
 def _extract_image_url_from_html(html: str) -> str | None:

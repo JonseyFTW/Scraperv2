@@ -184,6 +184,16 @@ def get_cards_needing_images(limit: int = 500) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_errored_cards(limit: int = 500) -> list[dict]:
+    """Get cards that errored during image scraping (rate-limited/blocked)."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT * FROM cards WHERE status='error' ORDER BY set_slug, id LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def get_cards_needing_download(limit: int = 500) -> list[dict]:
     conn = get_connection()
     rows = conn.execute("""
