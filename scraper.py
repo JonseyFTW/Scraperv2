@@ -22,7 +22,13 @@ from pathlib import Path
 import aiohttp
 import aiofiles
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
-from playwright_stealth import stealth_async
+try:
+    from playwright_stealth import stealth_async  # v1.x
+except ImportError:
+    from playwright_stealth import Stealth  # v2.x
+    _stealth_instance = Stealth()
+    async def stealth_async(page):
+        await _stealth_instance.apply_stealth_async(page)
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
