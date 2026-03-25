@@ -131,26 +131,27 @@ def get_collection():
 
 def get_cards_needing_embeddings(limit: int = 500) -> list[dict]:
     """Get downloaded cards that don't have embeddings yet."""
+    collection = get_collection()
+
+    # Get all IDs already in ChromaDB so we can skip them in SQL
+    existing_ids = set()
+    if collection.count() > 0:
+        # Fetch all existing IDs from ChromaDB
+        all_existing = collection.get(include=[])
+        existing_ids = set(all_existing["ids"])
+
     conn = db.get_connection()
     rows = conn.execute("""
         SELECT * FROM cards
         WHERE status = 'downloaded' AND image_path IS NOT NULL
         ORDER BY id
-        LIMIT ?
-    """, (limit,)).fetchall()
+    """).fetchall()
     conn.close()
 
-    cards = [dict(r) for r in rows]
-    if not cards:
-        return []
-
     # Filter out cards already in ChromaDB
-    collection = get_collection()
-    card_ids = [str(c["product_id"]) for c in cards]
-    existing = collection.get(ids=card_ids)
-    existing_ids = set(existing["ids"])
+    cards = [dict(r) for r in rows if str(r["product_id"]) not in existing_ids]
 
-    return [c for c in cards if str(c["product_id"]) not in existing_ids]
+    return cards[:limit]
 
 
 # ---------------------------------------------------------------------------
