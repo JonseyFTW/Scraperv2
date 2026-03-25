@@ -37,16 +37,44 @@ console = Console()
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
-    browser = await playwright.chromium.launch(
+    # Find the installed chromium executable (version may differ from pip package)
+    chromium_path = None
+    import pathlib
+    pw_cache = pathlib.Path.home() / ".cache" / "ms-playwright"
+    for d in sorted(pw_cache.glob("chromium-*"), reverse=True):
+        candidate = d / "chrome-linux" / "chrome"
+        if candidate.exists():
+            chromium_path = str(candidate)
+            break
+
+    launch_kwargs = dict(
         headless=config.HEADLESS,
-        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--ignore-certificate-errors"],
     )
+    if chromium_path:
+        launch_kwargs["executable_path"] = chromium_path
+
+    # Configure proxy if environment proxy is set
+    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    if proxy_url:
+        # Parse proxy URL to extract username/password if present
+        from urllib.parse import urlparse as _urlparse
+        parsed = _urlparse(proxy_url)
+        proxy_config = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+        if parsed.username:
+            proxy_config["username"] = parsed.username
+        if parsed.password:
+            proxy_config["password"] = parsed.password
+        launch_kwargs["proxy"] = proxy_config
+
+    browser = await playwright.chromium.launch(**launch_kwargs)
     context = await browser.new_context(
         user_agent=random.choice(config.USER_AGENTS),
         viewport={"width": 1920, "height": 1080},
         locale="en-US",
         timezone_id="America/Chicago",
         accept_downloads=True,  # Required for CSV downloads
+        ignore_https_errors=True,
     )
     return browser, context
 
@@ -117,13 +145,13 @@ async def login(page: Page) -> bool:
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
         await asyncio.sleep(3)
 
-        # Verify login by checking for account link
+        # Verify login by checking for account link or logout URL
         content = await page.content()
-        if "My Account" in content or "Log Out" in content or "Logout" in content:
+        if "My Account" in content or "Logout" in content or "Log Out" in content or "logout" in content:
             console.print("[green]Login successful![/green]")
             return True
         else:
-            console.print("[yellow]Login may have failed - check if 'My Account' is visible[/yellow]")
+            console.print("[yellow]Login may have failed — proceeding anyway[/yellow]")
             return True  # Proceed anyway, might still work
 
     except Exception as e:
@@ -253,17 +281,40 @@ async def download_csvs(page: Page, sport: str = None):
                 )
 
                 if dl_link:
-                    # Start download
-                    async with page.expect_download(timeout=30000) as dl_info:
-                        await dl_link.click()
-
-                    download = await dl_info.value
                     csv_filename = f"{s['slug']}.csv"
                     csv_path = os.path.join(config.CSV_DIR, csv_filename)
-                    await download.save_as(csv_path)
+                    downloaded = False
 
-                    db.mark_set_csv_downloaded(s["slug"], csv_path)
-                    console.print(f"    [green]✓[/green] {s['slug']}")
+                    # Try up to 2 attempts — first may hit Cloudflare challenge
+                    for dl_attempt in range(2):
+                        try:
+                            async with page.expect_download(timeout=30000) as dl_info:
+                                await dl_link.click()
+                            download = await dl_info.value
+                            await download.save_as(csv_path)
+                            downloaded = True
+                            break
+                        except Exception:
+                            # Click may have navigated to a CF challenge page.
+                            # Navigate back to the set page and retry.
+                            if page.url != s["url"]:
+                                await safe_goto(page, s["url"])
+                                await asyncio.sleep(2)
+                                dl_link = await page.query_selector(
+                                    'a:has-text("Download Price List"), '
+                                    'a:has-text("Download"), '
+                                    'a[href*="download"], '
+                                    'a[href*="csv"]'
+                                )
+                                if not dl_link:
+                                    break
+
+                    if downloaded:
+                        db.mark_set_csv_downloaded(s["slug"], csv_path)
+                        console.print(f"    [green]✓[/green] {s['slug']}")
+                    else:
+                        console.print(f"    [red]Download failed: {s['slug']}[/red]")
+                        db.mark_set_csv_error(s["slug"])
                 else:
                     # No download link found — might not have subscription
                     # or page structure different
@@ -369,10 +420,10 @@ def parse_single_csv(csv_path: str, set_slug: str) -> list[dict]:
             card_name_slug = slugify(product_name)
             full_url = f"{config.BASE_URL}/game/{set_slug}/{card_name_slug}"
 
-            # Parse prices (in pennies)
-            loose = safe_int(norm.get("loose_price", norm.get("ungraded_price", "0")))
-            cib = safe_int(norm.get("cib_price", norm.get("graded_price", "0")))
-            new = safe_int(norm.get("new_price", norm.get("psa_10", "0")))
+            # Parse prices (stored as dollars)
+            loose = safe_price(norm.get("loose_price", norm.get("ungraded_price", "0")))
+            cib = safe_price(norm.get("cib_price", norm.get("graded_price", "0")))
+            new = safe_price(norm.get("new_price", norm.get("psa_10", "0")))
 
             cards.append({
                 "product_id": product_id,
@@ -408,11 +459,13 @@ def slugify(name: str) -> str:
     return s.strip("-")
 
 
-def safe_int(val) -> int:
+def safe_price(val) -> float:
+    """Parse a price string like '$5.00' into a float dollar value."""
     try:
-        return int(float(str(val).replace(",", "").replace("$", "").strip()))
+        s = str(val).replace(",", "").replace("$", "").strip()
+        return round(float(s), 2)
     except (ValueError, TypeError):
-        return 0
+        return 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -484,6 +537,15 @@ async def scrape_card_images(page: Page, limit: int = 0):
 async def extract_card_image(page: Page) -> str | None:
     """Extract the main card image URL from a card detail page."""
     return await page.evaluate("""() => {
+        // The main card photo on SportsCardsPro is hosted on
+        // storage.googleapis.com/images.pricecharting.com and typically has
+        // class 'js-show-dialog' or an alt text containing the card name.
+        const gcpImg = document.querySelector('img[src*="images.pricecharting.com"]');
+        if (gcpImg) {
+            const src = gcpImg.getAttribute('src') || '';
+            if (src) return src;
+        }
+
         // Primary selectors for the main card photo
         const selectors = [
             '#product_photo img',
@@ -491,41 +553,46 @@ async def extract_card_image(page: Page) -> str | None:
             '.game-image img',
             '#main_photo',
             'img.product-image',
+            'img.js-show-dialog',
         ];
-        
+
         for (const sel of selectors) {
             const el = document.querySelector(sel);
             if (el) {
                 const src = el.getAttribute('src') || el.getAttribute('data-src');
-                if (src) return src;
+                if (src && !src.includes('logo') && !src.includes('app-store')
+                    && !src.includes('play-store')) return src;
             }
         }
-        
+
         // Try og:image meta tag
         const ogImg = document.querySelector('meta[property="og:image"]');
         if (ogImg) {
             const content = ogImg.getAttribute('content');
             if (content && !content.includes('logo')) return content;
         }
-        
-        // Fallback: find the largest non-UI image
+
+        // Fallback: find the largest non-UI image, excluding known non-card images
         const imgs = [...document.querySelectorAll('img')];
+        const excludePatterns = [
+            'logo', 'icon', 'sprite', 'ad-', 'avatar', 'flag',
+            'app-store', 'play-store', 'centering-calculator',
+            'apple-app', 'android-play', 'psa'
+        ];
         const candidates = imgs.filter(img => {
             const src = (img.src || img.getAttribute('data-src') || '');
             const w = img.naturalWidth || img.width || 0;
             return src && w > 80 &&
-                !src.includes('logo') && !src.includes('icon') &&
-                !src.includes('sprite') && !src.includes('ad-') &&
-                !src.includes('avatar') && !src.includes('flag');
+                !excludePatterns.some(p => src.toLowerCase().includes(p));
         });
-        
+
         // Sort by size descending, take the first
         candidates.sort((a, b) => {
             const wa = a.naturalWidth || a.width || 0;
             const wb = b.naturalWidth || b.width || 0;
             return wb - wa;
         });
-        
+
         return candidates.length > 0
             ? (candidates[0].src || candidates[0].getAttribute('data-src'))
             : null;
@@ -543,9 +610,15 @@ async def download_images(limit: int = 0):
     total = 0
     sem = asyncio.Semaphore(config.IMAGE_CONCURRENT_DOWNLOADS)
 
+    # Use proxy if set in environment
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    connector = aiohttp.TCPConnector(ssl=False)
+
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=config.IMAGE_DOWNLOAD_TIMEOUT),
         headers={"User-Agent": random.choice(config.USER_AGENTS)},
+        connector=connector,
+        trust_env=True,
     ) as session:
 
         while True:

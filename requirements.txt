@@ -1,5 +1,5 @@
-playwright==1.49.1
-playwright-stealth==1.0.6
+playwright>=1.52.0
+playwright-stealth>=1.0.6
 aiohttp>=3.9.0
 aiofiles>=23.0.0
 rich>=13.0.0
