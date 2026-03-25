@@ -127,6 +127,8 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="Max cards to process")
     parser.add_argument("--stats", action="store_true", help="Show progress")
     parser.add_argument("--reset-errors", action="store_true", help="Reset errors to retry")
+    parser.add_argument("--reset-no-image", action="store_true", help="Reset 'no image' cards to retry")
+    parser.add_argument("--failures", action="store_true", help="Show image failure breakdown")
     parser.add_argument("--headed", action="store_true", help="Show browser window")
 
     args = parser.parse_args()
@@ -142,6 +144,29 @@ def main():
         db.reset_errors()
         console.print("[green]Errors reset to pending.[/green]")
         show_stats()
+        return
+
+    if args.reset_no_image:
+        import database as db
+        db.init_db()
+        count = db.reset_no_image()
+        console.print(f"[green]Reset {count} 'no image' cards back to pending for retry.[/green]")
+        show_stats()
+        return
+
+    if args.failures:
+        import database as db
+        db.init_db()
+        stats = db.get_image_failure_stats()
+        if not stats:
+            console.print("[green]No failures found.[/green]")
+        else:
+            table = Table(title="Image Failure Breakdown", show_header=True, header_style="bold cyan")
+            table.add_column("Reason", style="white", min_width=30)
+            table.add_column("Count", justify="right", style="yellow", min_width=10)
+            for reason, count in stats.items():
+                table.add_row(reason, str(count))
+            console.print(table)
         return
 
     if args.headed:

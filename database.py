@@ -263,3 +263,33 @@ def reset_errors():
     conn.execute("UPDATE cards SET status='pending', error_msg=NULL WHERE status='error'")
     conn.commit()
     conn.close()
+
+
+def reset_no_image():
+    """Reset 'no_image' cards back to pending so they can be retried."""
+    conn = get_connection()
+    count = conn.execute("SELECT COUNT(*) as c FROM cards WHERE status='no_image'").fetchone()["c"]
+    conn.execute("UPDATE cards SET status='pending' WHERE status='no_image'")
+    conn.commit()
+    conn.close()
+    return count
+
+
+def get_image_failure_stats() -> dict:
+    """Get breakdown of cards without images by error reason."""
+    conn = get_connection()
+    stats = {}
+    # Error reasons
+    rows = conn.execute("""
+        SELECT error_msg, COUNT(*) as c FROM cards
+        WHERE status='error' AND error_msg IS NOT NULL
+        GROUP BY error_msg ORDER BY c DESC
+    """).fetchall()
+    for r in rows:
+        stats[f"error: {r['error_msg']}"] = r["c"]
+    # No image count
+    no_img = conn.execute("SELECT COUNT(*) as c FROM cards WHERE status='no_image'").fetchone()["c"]
+    if no_img:
+        stats["no_image (confirmed)"] = no_img
+    conn.close()
+    return stats

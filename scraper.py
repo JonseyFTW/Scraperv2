@@ -537,24 +537,37 @@ async def scrape_card_images(page: Page, limit: int = 0):
                         return Promise.all(urls.map(async (url) => {
                             try {
                                 const resp = await fetch(url);
-                                if (resp.status !== 200) return null;
+                                if (resp.status !== 200) return {hash: null, reason: 'http_' + resp.status};
                                 const html = await resp.text();
                                 const match = html.match(re);
-                                return match ? match[1] : null;
-                            } catch { return null; }
+                                if (match) return {hash: match[1], reason: null};
+                                // Check if page loaded but has no card image
+                                if (html.includes('pricecharting.com') || html.includes('sportscardspro.com')) {
+                                    return {hash: null, reason: 'no_image_on_page'};
+                                }
+                                return {hash: null, reason: 'blocked_or_empty'};
+                            } catch(e) { return {hash: null, reason: 'fetch_error'}; }
                         }));
                     }""", urls)
                 except Exception:
-                    results = [None] * len(batch)
+                    results = [{"hash": None, "reason": "evaluate_error"}] * len(batch)
 
-                for card, img_hash in zip(batch, results):
+                for card, result in zip(batch, results):
                     pid = card["product_id"]
+                    img_hash = result.get("hash") if isinstance(result, dict) else result
+                    reason = result.get("reason", "") if isinstance(result, dict) else ""
+
                     if img_hash:
                         image_url = f"https://storage.googleapis.com/images.pricecharting.com/{img_hash}/1600.jpg"
                         db.update_card_image_url(pid, image_url)
                         total_ok += 1
-                    else:
+                    elif reason == "no_image_on_page":
+                        # Page loaded fine but card genuinely has no image
                         db.mark_card_no_image(pid)
+                        total_fail += 1
+                    else:
+                        # Rate-limited or blocked — mark as error so it can be retried
+                        db.mark_card_error(pid, reason or "unknown")
                         total_fail += 1
 
                 progress.advance(ptask, len(batch))
