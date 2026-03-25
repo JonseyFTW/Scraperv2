@@ -57,6 +57,13 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
 ]
 
+# ── VPN / Proxy ──────────────────────────────────────────────────────────
+# Set via env vars or edit directly. Used by Playwright browser.
+# NordVPN SOCKS5: socks5://user:pass@server:1080
+# Example servers: us5580.nordvpn.com, us9591.nordvpn.com, us7265.nordvpn.com
+# Get credentials at: https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/service-credentials/
+PROXY_URL = os.environ.get("SCP_PROXY", "")  # e.g. socks5://user:pass@us5580.nordvpn.com:1080
+
 # Ensure dirs exist
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CSV_DIR, exist_ok=True)

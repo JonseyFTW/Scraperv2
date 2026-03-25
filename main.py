@@ -130,6 +130,8 @@ def main():
     parser.add_argument("--reset-no-image", action="store_true", help="Reset 'no image' cards to retry")
     parser.add_argument("--failures", action="store_true", help="Show image failure breakdown")
     parser.add_argument("--headed", action="store_true", help="Show browser window")
+    parser.add_argument("--proxy", type=str, default="",
+                        help="SOCKS5 proxy URL, e.g. socks5://user:pass@us5580.nordvpn.com:1080")
 
     args = parser.parse_args()
     print_banner()
@@ -137,6 +139,10 @@ def main():
     if args.stats:
         show_stats()
         return
+
+    if args.proxy:
+        import config as cfg
+        cfg.PROXY_URL = args.proxy
 
     if args.reset_errors:
         import database as db

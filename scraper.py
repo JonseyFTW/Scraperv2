@@ -60,10 +60,9 @@ async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
     if chromium_path:
         launch_kwargs["executable_path"] = chromium_path
 
-    # Configure proxy if environment proxy is set
-    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    # Configure proxy: prefer SCP_PROXY (VPN), fall back to system proxy
+    proxy_url = config.PROXY_URL or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
     if proxy_url:
-        # Parse proxy URL to extract username/password if present
         from urllib.parse import urlparse as _urlparse
         parsed = _urlparse(proxy_url)
         proxy_config = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
@@ -71,6 +70,7 @@ async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
             proxy_config["username"] = parsed.username
         if parsed.password:
             proxy_config["password"] = parsed.password
+        console.print(f"[cyan]Using proxy: {parsed.hostname}:{parsed.port}[/cyan]")
         launch_kwargs["proxy"] = proxy_config
 
     browser = await playwright.chromium.launch(**launch_kwargs)
