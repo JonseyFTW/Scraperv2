@@ -58,7 +58,7 @@ USER_AGENTS = [
 ]
 
 # ── VPN / Proxy ──────────────────────────────────────────────────────────
-# NordVPN SOCKS5 proxy for faster multi-IP scraping.
+# NordVPN HTTP proxy for faster multi-IP scraping.
 # Get credentials at: https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/service-credentials/
 NORD_USER = ""          # Your NordVPN service username
 NORD_PASS = ""          # Your NordVPN service password
@@ -71,9 +71,10 @@ NORD_SERVERS = [        # Add/remove servers as needed (US servers work best)
 ]
 
 # Build proxy URLs from credentials + servers (or use SCP_PROXY env var for manual override)
+# NordVPN HTTP proxy runs on port 89
 PROXY_URL = os.environ.get("SCP_PROXY", "")
 if not PROXY_URL and NORD_USER and NORD_SERVERS:
-    PROXY_URLS = [f"socks5://{NORD_USER}:{NORD_PASS}@{server}:1080" for server in NORD_SERVERS]
+    PROXY_URLS = [f"http://{NORD_USER}:{NORD_PASS}@{server}:89" for server in NORD_SERVERS]
     PROXY_URL = ",".join(PROXY_URLS)  # comma-separated for multi-proxy mode
 elif PROXY_URL:
     PROXY_URLS = [p.strip() for p in PROXY_URL.split(",") if p.strip()]
