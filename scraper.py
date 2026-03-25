@@ -42,7 +42,7 @@ console = Console()
 # Browser helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
+async def create_browser(playwright, proxy_override: str = None) -> tuple[Browser, BrowserContext]:
     # Find the installed chromium executable (version may differ from pip package)
     chromium_path = None
     import pathlib
@@ -60,8 +60,8 @@ async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
     if chromium_path:
         launch_kwargs["executable_path"] = chromium_path
 
-    # Configure proxy: prefer SCP_PROXY (VPN), fall back to system proxy
-    proxy_url = config.PROXY_URL or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    # Configure proxy: explicit override > SCP_PROXY > system proxy
+    proxy_url = proxy_override or config.PROXY_URL or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
     if proxy_url:
         from urllib.parse import urlparse as _urlparse
         parsed = _urlparse(proxy_url)
@@ -597,6 +597,125 @@ async def scrape_card_images(page: Page, limit: int = 0):
 
     console.print(f"\n  Final: [green]{total_ok}[/green] image URLs, [yellow]{total_no_image}[/yellow] no image, [red]{remaining_errors}[/red] remaining errors")
     db.log_event("phase4_complete", f"Found {total_ok} image URLs, {total_no_image} no image, {remaining_errors} remaining errors")
+
+
+async def scrape_card_images_multi(proxies: list[str], limit: int = 0):
+    """
+    Run multiple browser instances in parallel, each with a different proxy/VPN.
+    Each worker grabs its own batch of pending cards from the DB, so no duplicates.
+
+    Usage:
+        py main.py --phase 4 --proxy "socks5://u:p@us5580.nordvpn.com:1080,socks5://u:p@us9591.nordvpn.com:1080"
+    """
+    from playwright.async_api import async_playwright
+
+    num_workers = len(proxies)
+    console.print(f"\n[bold]Phase 4 (multi-proxy): {num_workers} browsers in parallel[/bold]\n")
+    for i, p in enumerate(proxies):
+        from urllib.parse import urlparse as _up
+        host = _up(p).hostname or p
+        console.print(f"  Worker {i+1}: [cyan]{host}[/cyan]")
+
+    # Shared counters (safe because asyncio is single-threaded)
+    totals = {"ok": 0, "no_image": 0, "error": 0}
+
+    async def worker(worker_id: int, proxy: str):
+        FETCH_BATCH = 3
+        BATCH_DELAY = 3.0
+        DB_BATCH = 200
+
+        label = f"W{worker_id}"
+        from urllib.parse import urlparse as _up
+        host = _up(proxy).hostname or proxy
+
+        async with async_playwright() as pw:
+            browser, context = await create_browser(pw, proxy_override=proxy)
+            page = await new_stealth_page(context)
+
+            try:
+                await login(page)
+                await safe_goto(page, f"{config.BASE_URL}/login", wait_for_cf=True)
+
+                while True:
+                    cards = db.get_cards_needing_images(DB_BATCH)
+                    if not cards:
+                        break
+
+                    if limit > 0:
+                        remaining = limit - totals["ok"]
+                        if remaining <= 0:
+                            break
+                        cards = cards[:remaining]
+
+                    for i in range(0, len(cards), FETCH_BATCH):
+                        batch = cards[i:i + FETCH_BATCH]
+                        urls = [c["full_url"] for c in batch]
+
+                        try:
+                            results = await page.evaluate("""async (urls) => {
+                                const re = /https:\\/\\/storage\\.googleapis\\.com\\/images\\.pricecharting\\.com\\/([^\\/\\s"'<>]+)\\/\\d+/;
+                                return Promise.all(urls.map(async (url) => {
+                                    try {
+                                        const resp = await fetch(url);
+                                        if (resp.status !== 200) return {hash: null, reason: 'http_' + resp.status};
+                                        const html = await resp.text();
+                                        const match = html.match(re);
+                                        if (match) return {hash: match[1], reason: null};
+                                        if (html.includes('pricecharting.com') || html.includes('sportscardspro.com')) {
+                                            return {hash: null, reason: 'no_image_on_page'};
+                                        }
+                                        return {hash: null, reason: 'blocked_or_empty'};
+                                    } catch(e) { return {hash: null, reason: 'fetch_error'}; }
+                                }));
+                            }""", urls)
+                        except Exception:
+                            results = [{"hash": None, "reason": "evaluate_error"}] * len(batch)
+
+                        for card, result in zip(batch, results):
+                            pid = card["product_id"]
+                            img_hash = result.get("hash") if isinstance(result, dict) else result
+                            reason = result.get("reason", "") if isinstance(result, dict) else ""
+
+                            if img_hash:
+                                image_url = f"https://storage.googleapis.com/images.pricecharting.com/{img_hash}/1600.jpg"
+                                db.update_card_image_url(pid, image_url)
+                                totals["ok"] += 1
+                            elif reason == "no_image_on_page":
+                                db.mark_card_no_image(pid)
+                                totals["no_image"] += 1
+                            else:
+                                db.mark_card_error(pid, reason or "unknown")
+                                totals["error"] += 1
+
+                        await asyncio.sleep(BATCH_DELAY)
+
+                    console.print(
+                        f"  [{label}] OK: [green]{totals['ok']}[/green], "
+                        f"No image: [yellow]{totals['no_image']}[/yellow], "
+                        f"Errors: [red]{totals['error']}[/red]"
+                    )
+
+                    if limit > 0 and totals["ok"] >= limit:
+                        break
+
+            except Exception as e:
+                console.print(f"  [{label}] [red]Worker error: {e}[/red]")
+            finally:
+                await context.close()
+                await browser.close()
+
+        console.print(f"  [{label}] [dim]Done ({host})[/dim]")
+
+    # Launch all workers concurrently
+    await asyncio.gather(*[worker(i + 1, p) for i, p in enumerate(proxies)])
+
+    console.print(
+        f"\n  [bold]Multi-proxy final:[/bold] [green]{totals['ok']}[/green] found, "
+        f"[yellow]{totals['no_image']}[/yellow] no image, "
+        f"[red]{totals['error']}[/red] errors"
+    )
+    db.log_event("phase4_multi_complete",
+                 f"proxies={num_workers}, ok={totals['ok']}, no_image={totals['no_image']}, errors={totals['error']}")
 
 
 async def _retry_errors_with_browser(page: Page, limit: int = 0) -> tuple[int, int]:
