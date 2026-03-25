@@ -36,6 +36,7 @@ DATA_DIR = os.path.join(PROJECT_DIR, "data")
 CSV_DIR = os.path.join(DATA_DIR, "csvs")
 IMAGE_DIR = os.path.join(PROJECT_DIR, "images")
 DB_PATH = os.path.join(DATA_DIR, "sportscards.db")
+CHROMA_DIR = os.path.join(DATA_DIR, "chromadb")
 
 # ── Scraping behavior ─────────────────────────────────────────────────────
 REQUEST_DELAY_MIN = 3.0        # Min seconds between page loads
@@ -60,3 +61,4 @@ USER_AGENTS = [
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CSV_DIR, exist_ok=True)
 os.makedirs(IMAGE_DIR, exist_ok=True)
+os.makedirs(CHROMA_DIR, exist_ok=True)

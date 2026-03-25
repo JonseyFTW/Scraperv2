@@ -3,3 +3,4 @@ playwright-stealth>=1.0.6
 aiohttp>=3.9.0
 aiofiles>=23.0.0
 rich>=13.0.0
+chromadb>=1.0.0
