@@ -146,11 +146,25 @@ def get_cards_needing_embeddings(limit: int = 500) -> list[dict]:
 
     # Filter out cards already in ChromaDB
     collection = get_collection()
-    card_ids = [str(c["product_id"]) for c in cards]
-    existing = collection.get(ids=card_ids)
-    existing_ids = set(existing["ids"])
+    existing_count = collection.count()
 
-    return [c for c in cards if str(c["product_id"]) not in existing_ids]
+    if existing_count == 0:
+        return cards
+
+    # Check in batches — ChromaDB .get() can be slow with large ID lists
+    existing_ids = set()
+    card_ids = [str(c["product_id"]) for c in cards]
+    batch_size = 100
+    for i in range(0, len(card_ids), batch_size):
+        batch = card_ids[i:i + batch_size]
+        try:
+            result = collection.get(ids=batch)
+            existing_ids.update(result["ids"])
+        except Exception:
+            pass  # IDs not found — that's fine
+
+    remaining = [c for c in cards if str(c["product_id"]) not in existing_ids]
+    return remaining
 
 
 # ---------------------------------------------------------------------------
@@ -186,10 +200,16 @@ def generate_embeddings(limit: int = 0):
         ) as progress:
             task = progress.add_task("Embedding", total=len(cards))
 
+            skipped_missing = 0
+
             for card in cards:
                 progress.update(task, description=f"Embed: {(card['product_name'] or 'img')[:30]}")
 
-                if card["image_path"] and os.path.exists(card["image_path"]):
+                if not card["image_path"]:
+                    skipped_missing += 1
+                elif not os.path.exists(card["image_path"]):
+                    skipped_missing += 1
+                else:
                     vec = _embed_image(card["image_path"])
                     if vec is not None:
                         batch_ids.append(str(card["product_id"]))
@@ -206,6 +226,13 @@ def generate_embeddings(limit: int = 0):
 
                 if limit > 0 and total >= limit:
                     break
+
+        if skipped_missing > 0:
+            console.print(f"  [yellow]Skipped {skipped_missing} cards (image file not found on disk)[/yellow]")
+            if skipped_missing == len(cards):
+                # All cards have missing files — show a sample path to help debug
+                sample = cards[0]["image_path"] if cards else "?"
+                console.print(f"  [dim]Sample path: {sample}[/dim]")
 
         # Flush batch to ChromaDB
         if batch_ids:
