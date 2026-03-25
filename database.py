@@ -40,9 +40,9 @@ def init_db():
             full_url        TEXT,
             image_url       TEXT,
             image_path      TEXT,
-            loose_price     INTEGER,           -- in pennies
-            cib_price       INTEGER,
-            new_price       INTEGER,
+            loose_price     REAL,              -- in dollars
+            cib_price       REAL,
+            new_price       REAL,
             graded_price    TEXT,              -- JSON of grade prices
             status          TEXT DEFAULT 'pending', -- pending | image_found | downloaded | no_image | error
             error_msg       TEXT,
