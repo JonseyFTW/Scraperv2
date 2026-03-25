@@ -169,7 +169,7 @@ def get_cards_needing_embeddings(limit: int = 500) -> list[dict]:
     conn = db.get_connection()
     rows = conn.execute("""
         SELECT c.* FROM cards c
-        LEFT JOIN embeddings e ON c.slug = e.card_slug
+        LEFT JOIN embeddings e ON c.product_id = e.card_slug
         WHERE c.status = 'downloaded' AND c.image_path IS NOT NULL AND e.card_slug IS NULL
         ORDER BY c.id
         LIMIT ?
@@ -206,12 +206,12 @@ def generate_embeddings(limit: int = 0):
             task = progress.add_task("Embedding", total=len(cards))
 
             for card in cards:
-                progress.update(task, description=f"Embed: {(card['title'] or 'img')[:30]}")
+                progress.update(task, description=f"Embed: {(card['product_name'] or 'img')[:30]}")
 
                 if card["image_path"] and os.path.exists(card["image_path"]):
                     vec = _embed_image(card["image_path"])
                     if vec is not None:
-                        save_embedding(card["slug"], vec)
+                        save_embedding(card["product_id"], vec)
                         total += 1
 
                 progress.advance(task)
@@ -261,15 +261,15 @@ def search_by_image(image_path: str, top_k: int = 10):
     table.add_column("Set")
     table.add_column("Image Path", style="dim")
 
-    for i, (slug, sim) in enumerate(top, 1):
+    for i, (card_id, sim) in enumerate(top, 1):
         row = conn.execute(
-            "SELECT title, set_slug, image_path FROM cards WHERE slug=?", (slug,)
+            "SELECT product_name, set_slug, image_path FROM cards WHERE product_id=?", (card_id,)
         ).fetchone()
         if row:
             table.add_row(
                 str(i),
                 f"{sim:.4f}",
-                row["title"] or "Unknown",
+                row["product_name"] or "Unknown",
                 row["set_slug"] or "",
                 row["image_path"] or ""
             )
@@ -305,12 +305,12 @@ def search_by_text(query: str, top_k: int = 10):
     table.add_column("Title", style="cyan")
     table.add_column("Set")
 
-    for i, (slug, sim) in enumerate(top, 1):
+    for i, (card_id, sim) in enumerate(top, 1):
         row = conn.execute(
-            "SELECT title, set_slug FROM cards WHERE slug=?", (slug,)
+            "SELECT product_name, set_slug FROM cards WHERE product_id=?", (card_id,)
         ).fetchone()
         if row:
-            table.add_row(str(i), f"{sim:.4f}", row["title"] or "?", row["set_slug"] or "")
+            table.add_row(str(i), f"{sim:.4f}", row["product_name"] or "?", row["set_slug"] or "")
 
     conn.close()
     console.print(table)
