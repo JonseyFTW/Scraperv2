@@ -97,11 +97,10 @@ async def run_phase(phase: int, sport: str = None, limit: int = 0):
         await scraper.download_images(limit)
         return
 
-    # Multi-proxy mode: if PROXY_URL contains commas, run parallel browsers
+    # Multi-proxy mode: multiple VPN servers = parallel browsers
     import config as cfg
-    if phase == 4 and "," in (cfg.PROXY_URL or ""):
-        proxies = [p.strip() for p in cfg.PROXY_URL.split(",") if p.strip()]
-        await scraper.scrape_card_images_multi(proxies, limit)
+    if phase == 4 and len(cfg.PROXY_URLS) > 1:
+        await scraper.scrape_card_images_multi(cfg.PROXY_URLS, limit)
         return
 
     from playwright.async_api import async_playwright
@@ -150,6 +149,7 @@ def main():
     if args.proxy:
         import config as cfg
         cfg.PROXY_URL = args.proxy
+        cfg.PROXY_URLS = [p.strip() for p in args.proxy.split(",") if p.strip()]
 
     if args.reset_errors:
         import database as db

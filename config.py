@@ -58,11 +58,27 @@ USER_AGENTS = [
 ]
 
 # ── VPN / Proxy ──────────────────────────────────────────────────────────
-# Set via env vars or edit directly. Used by Playwright browser.
-# NordVPN SOCKS5: socks5://user:pass@server:1080
-# Example servers: us5580.nordvpn.com, us9591.nordvpn.com, us7265.nordvpn.com
+# NordVPN SOCKS5 proxy for faster multi-IP scraping.
 # Get credentials at: https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/service-credentials/
-PROXY_URL = os.environ.get("SCP_PROXY", "")  # e.g. socks5://user:pass@us5580.nordvpn.com:1080
+NORD_USER = ""          # Your NordVPN service username
+NORD_PASS = ""          # Your NordVPN service password
+NORD_SERVERS = [        # Add/remove servers as needed (US servers work best)
+    # "us5580.nordvpn.com",
+    # "us9591.nordvpn.com",
+    # "us7265.nordvpn.com",
+    # "us8674.nordvpn.com",
+    # "us9147.nordvpn.com",
+]
+
+# Build proxy URLs from credentials + servers (or use SCP_PROXY env var for manual override)
+PROXY_URL = os.environ.get("SCP_PROXY", "")
+if not PROXY_URL and NORD_USER and NORD_SERVERS:
+    PROXY_URLS = [f"socks5://{NORD_USER}:{NORD_PASS}@{server}:1080" for server in NORD_SERVERS]
+    PROXY_URL = ",".join(PROXY_URLS)  # comma-separated for multi-proxy mode
+elif PROXY_URL:
+    PROXY_URLS = [p.strip() for p in PROXY_URL.split(",") if p.strip()]
+else:
+    PROXY_URLS = []
 
 # Ensure dirs exist
 os.makedirs(DATA_DIR, exist_ok=True)
