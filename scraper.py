@@ -496,7 +496,8 @@ async def scrape_card_images(page: Page, limit: int = 0):
     BATCH_DELAY = 1.5         # seconds between batches
     DB_BATCH    = 500         # cards per DB fetch
     total_ok    = 0
-    total_fail  = 0
+    total_no_image = 0
+    total_error = 0
 
     console.print(f"\n[bold]Phase 4: Scraping image URLs via in-browser fetch ({FETCH_BATCH}x parallel)[/bold]\n")
 
@@ -564,22 +565,24 @@ async def scrape_card_images(page: Page, limit: int = 0):
                     elif reason == "no_image_on_page":
                         # Page loaded fine but card genuinely has no image
                         db.mark_card_no_image(pid)
-                        total_fail += 1
+                        total_no_image += 1
                     else:
                         # Rate-limited or blocked — mark as error so it can be retried
                         db.mark_card_error(pid, reason or "unknown")
-                        total_fail += 1
+                        total_error += 1
 
                 progress.advance(ptask, len(batch))
                 await asyncio.sleep(BATCH_DELAY)
 
-        console.print(f"  Batch done -- OK: [green]{total_ok}[/green], No image: [yellow]{total_fail}[/yellow]")
+        console.print(f"  Batch done -- OK: [green]{total_ok}[/green], No image: [yellow]{total_no_image}[/yellow], Errors: [red]{total_error}[/red]")
 
         if limit > 0 and total_ok >= limit:
             break
 
-    console.print(f"\n  Image URLs found: [green]{total_ok}[/green], no image: [yellow]{total_fail}[/yellow]")
-    db.log_event("phase4_complete", f"Found {total_ok} image URLs, {total_fail} no image")
+    console.print(f"\n  Image URLs found: [green]{total_ok}[/green], No image: [yellow]{total_no_image}[/yellow], Errors (retryable): [red]{total_error}[/red]")
+    if total_error > 0:
+        console.print(f"  [dim]Run --reset-errors then --phase 4 to retry errors[/dim]")
+    db.log_event("phase4_complete", f"Found {total_ok} image URLs, {total_no_image} no image, {total_error} errors")
 
 
 def _extract_image_url_from_html(html: str) -> str | None:
