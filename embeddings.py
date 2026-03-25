@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-SportsCardPro Scraper - CLIP Embedding Generator
+SportsCardPro Scraper - CLIP Embedding Generator (ChromaDB)
 
 Generates vector embeddings for downloaded card images using OpenCLIP.
-These embeddings enable fast visual similarity search via cosine distance.
+Stores embeddings in ChromaDB for fast indexed similarity search.
 
 Usage:
-    python embeddings.py generate          # Generate embeddings for all downloaded cards
-    python embeddings.py search image.jpg  # Find top matches for an input image
-    python embeddings.py stats             # Show embedding coverage
+    python embeddings.py generate              # Generate embeddings for all downloaded cards
+    python embeddings.py search image.jpg      # Find top matches for an input image
+    python embeddings.py text-search "query"   # Find matches by text description
+    python embeddings.py stats                 # Show embedding coverage
+    python embeddings.py migrate               # Migrate embeddings from SQLite to ChromaDB
 
 Requirements (install separately — these are large):
-    pip install open-clip-torch torch torchvision numpy --break-system-packages
+    pip install open-clip-torch torch torchvision numpy chromadb
 """
 import argparse
 import os
 import sys
-import sqlite3
-import json
-import struct
 from datetime import datetime, timezone
 
+import chromadb
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 from rich.table import Table
@@ -47,13 +47,11 @@ def _load_model():
         import torch
     except ImportError:
         console.print("[red]Missing dependencies. Install with:[/red]")
-        console.print("  pip install open-clip-torch torch torchvision --break-system-packages")
+        console.print("  pip install open-clip-torch torch torchvision")
         sys.exit(1)
 
     console.print("[cyan]Loading CLIP model (first time takes a minute)...[/cyan]")
 
-    # ViT-B/32 is a good balance of speed and accuracy
-    # For better accuracy at the cost of speed, use ViT-L/14
     model_name = "ViT-B-32"
     pretrained = "laion2b_s34b_b79k"
 
@@ -109,73 +107,50 @@ def _embed_text(text: str):
     return features.cpu().numpy().flatten()
 
 
-def _vector_to_bytes(vec) -> bytes:
-    """Serialize numpy vector to bytes for SQLite storage."""
-    return vec.tobytes()
-
-
-def _bytes_to_vector(data: bytes):
-    """Deserialize bytes back to numpy vector."""
-    import numpy as np
-    return np.frombuffer(data, dtype=np.float32)
-
-
-def _cosine_similarity(a, b):
-    """Compute cosine similarity between two vectors."""
-    import numpy as np
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
-
-
 # ---------------------------------------------------------------------------
-# Database: embeddings table
+# ChromaDB
 # ---------------------------------------------------------------------------
 
-def init_embeddings_table():
-    conn = db.get_connection()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS embeddings (
-            card_slug   TEXT PRIMARY KEY,
-            vector      BLOB NOT NULL,
-            model       TEXT DEFAULT 'ViT-B-32',
-            created_at  TEXT,
-            FOREIGN KEY (card_slug) REFERENCES cards(slug)
-        );
-    """)
-    conn.commit()
-    conn.close()
+_chroma_client = None
+_chroma_collection = None
 
 
-def save_embedding(card_slug: str, vector, model_name: str = "ViT-B-32"):
-    conn = db.get_connection()
-    conn.execute("""
-        INSERT INTO embeddings (card_slug, vector, model, created_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(card_slug) DO UPDATE SET vector=excluded.vector, created_at=excluded.created_at
-    """, (card_slug, _vector_to_bytes(vector), model_name, datetime.now(timezone.utc).isoformat()))
-    conn.commit()
-    conn.close()
+def get_collection():
+    """Get or create the ChromaDB collection for card embeddings."""
+    global _chroma_client, _chroma_collection
+    if _chroma_collection is not None:
+        return _chroma_collection
 
-
-def get_all_embeddings() -> list[tuple]:
-    """Returns list of (card_slug, vector) tuples."""
-    conn = db.get_connection()
-    rows = conn.execute("SELECT card_slug, vector FROM embeddings").fetchall()
-    conn.close()
-    return [(r["card_slug"], _bytes_to_vector(r["vector"])) for r in rows]
+    _chroma_client = chromadb.PersistentClient(path=config.CHROMA_DIR)
+    _chroma_collection = _chroma_client.get_or_create_collection(
+        name="card_images",
+        metadata={"hnsw:space": "cosine"},
+    )
+    return _chroma_collection
 
 
 def get_cards_needing_embeddings(limit: int = 500) -> list[dict]:
     """Get downloaded cards that don't have embeddings yet."""
     conn = db.get_connection()
     rows = conn.execute("""
-        SELECT c.* FROM cards c
-        LEFT JOIN embeddings e ON c.product_id = e.card_slug
-        WHERE c.status = 'downloaded' AND c.image_path IS NOT NULL AND e.card_slug IS NULL
-        ORDER BY c.id
+        SELECT * FROM cards
+        WHERE status = 'downloaded' AND image_path IS NOT NULL
+        ORDER BY id
         LIMIT ?
     """, (limit,)).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+
+    cards = [dict(r) for r in rows]
+    if not cards:
+        return []
+
+    # Filter out cards already in ChromaDB
+    collection = get_collection()
+    card_ids = [str(c["product_id"]) for c in cards]
+    existing = collection.get(ids=card_ids)
+    existing_ids = set(existing["ids"])
+
+    return [c for c in cards if str(c["product_id"]) not in existing_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -184,17 +159,23 @@ def get_cards_needing_embeddings(limit: int = 500) -> list[dict]:
 
 def generate_embeddings(limit: int = 0):
     """Generate CLIP embeddings for all downloaded cards."""
-    init_embeddings_table()
     batch_size = 100 if limit == 0 else min(limit, 100)
     total = 0
 
-    console.print(f"\n[bold]Generating CLIP embeddings[/bold]\n")
+    console.print(f"\n[bold]Generating CLIP embeddings (ChromaDB)[/bold]\n")
     _load_model()
+
+    collection = get_collection()
 
     while True:
         cards = get_cards_needing_embeddings(batch_size)
         if not cards:
             break
+
+        # Batch buffers for ChromaDB upsert
+        batch_ids = []
+        batch_embeddings = []
+        batch_metadatas = []
 
         with Progress(
             SpinnerColumn(),
@@ -211,24 +192,76 @@ def generate_embeddings(limit: int = 0):
                 if card["image_path"] and os.path.exists(card["image_path"]):
                     vec = _embed_image(card["image_path"])
                     if vec is not None:
-                        save_embedding(card["product_id"], vec)
+                        batch_ids.append(str(card["product_id"]))
+                        batch_embeddings.append(vec.tolist())
+                        batch_metadatas.append({
+                            "product_name": card["product_name"] or "",
+                            "set_slug": card["set_slug"] or "",
+                            "image_path": card["image_path"] or "",
+                            "loose_price": float(card["loose_price"] or 0),
+                        })
                         total += 1
 
                 progress.advance(task)
 
                 if limit > 0 and total >= limit:
-                    console.print(f"\n[yellow]Reached limit of {limit}[/yellow]")
-                    return
+                    break
 
-    console.print(f"\n[green]Generated {total} embeddings[/green]")
+        # Flush batch to ChromaDB
+        if batch_ids:
+            collection.upsert(
+                ids=batch_ids,
+                embeddings=batch_embeddings,
+                metadatas=batch_metadatas,
+            )
+
+        if limit > 0 and total >= limit:
+            console.print(f"\n[yellow]Reached limit of {limit}[/yellow]")
+            break
+
+    console.print(f"\n[green]Generated {total} embeddings ({collection.count()} total in ChromaDB)[/green]")
+
+
+def _display_results(results: dict, title: str):
+    """Display ChromaDB query results in a rich table."""
+    table = Table(title=title, show_header=True)
+    table.add_column("Rank", style="bold", width=5)
+    table.add_column("Similarity", justify="right", width=10)
+    table.add_column("Title", style="cyan")
+    table.add_column("Set")
+    table.add_column("Price", justify="right")
+    table.add_column("Image Path", style="dim")
+
+    ids = results["ids"][0]
+    distances = results["distances"][0]
+    metadatas = results["metadatas"][0]
+
+    for i, (card_id, dist, meta) in enumerate(zip(ids, distances, metadatas), 1):
+        # ChromaDB cosine distance = 1 - similarity
+        similarity = 1.0 - dist
+        price = meta.get("loose_price", 0)
+        price_str = f"${price:.2f}" if price else ""
+        table.add_row(
+            str(i),
+            f"{similarity:.4f}",
+            meta.get("product_name", "Unknown"),
+            meta.get("set_slug", ""),
+            price_str,
+            meta.get("image_path", ""),
+        )
+
+    console.print(table)
 
 
 def search_by_image(image_path: str, top_k: int = 10):
     """Find the top-K most similar cards to an input image."""
-    init_embeddings_table()
-
     if not os.path.exists(image_path):
         console.print(f"[red]Image not found: {image_path}[/red]")
+        return
+
+    collection = get_collection()
+    if collection.count() == 0:
+        console.print("[yellow]No embeddings in database yet. Run 'generate' first.[/yellow]")
         return
 
     console.print(f"[cyan]Embedding query image...[/cyan]")
@@ -237,92 +270,38 @@ def search_by_image(image_path: str, top_k: int = 10):
         return
 
     console.print(f"[cyan]Searching {top_k} closest matches...[/cyan]")
+    results = collection.query(
+        query_embeddings=[query_vec.tolist()],
+        n_results=min(top_k, collection.count()),
+    )
 
-    all_embs = get_all_embeddings()
-    if not all_embs:
-        console.print("[yellow]No embeddings in database yet. Run 'generate' first.[/yellow]")
-        return
-
-    # Compute similarities
-    results = []
-    for slug, vec in all_embs:
-        sim = _cosine_similarity(query_vec, vec)
-        results.append((slug, sim))
-
-    results.sort(key=lambda x: x[1], reverse=True)
-    top = results[:top_k]
-
-    # Fetch card details
-    conn = db.get_connection()
-    table = Table(title=f"Top {top_k} Matches", show_header=True)
-    table.add_column("Rank", style="bold", width=5)
-    table.add_column("Similarity", justify="right", width=10)
-    table.add_column("Title", style="cyan")
-    table.add_column("Set")
-    table.add_column("Image Path", style="dim")
-
-    for i, (card_id, sim) in enumerate(top, 1):
-        row = conn.execute(
-            "SELECT product_name, set_slug, image_path FROM cards WHERE product_id=?", (card_id,)
-        ).fetchone()
-        if row:
-            table.add_row(
-                str(i),
-                f"{sim:.4f}",
-                row["product_name"] or "Unknown",
-                row["set_slug"] or "",
-                row["image_path"] or ""
-            )
-
-    conn.close()
-    console.print(table)
+    _display_results(results, f"Top {top_k} Matches")
 
 
 def search_by_text(query: str, top_k: int = 10):
     """Find cards matching a text description using CLIP text encoding."""
-    init_embeddings_table()
+    collection = get_collection()
+    if collection.count() == 0:
+        console.print("[yellow]No embeddings in database yet.[/yellow]")
+        return
 
     console.print(f"[cyan]Encoding text query: '{query}'[/cyan]")
     query_vec = _embed_text(query)
 
-    all_embs = get_all_embeddings()
-    if not all_embs:
-        console.print("[yellow]No embeddings in database yet.[/yellow]")
-        return
+    results = collection.query(
+        query_embeddings=[query_vec.tolist()],
+        n_results=min(top_k, collection.count()),
+    )
 
-    results = []
-    for slug, vec in all_embs:
-        sim = _cosine_similarity(query_vec, vec)
-        results.append((slug, sim))
-
-    results.sort(key=lambda x: x[1], reverse=True)
-    top = results[:top_k]
-
-    conn = db.get_connection()
-    table = Table(title=f"Top {top_k} Text Matches for '{query}'", show_header=True)
-    table.add_column("Rank", width=5)
-    table.add_column("Score", justify="right", width=10)
-    table.add_column("Title", style="cyan")
-    table.add_column("Set")
-
-    for i, (card_id, sim) in enumerate(top, 1):
-        row = conn.execute(
-            "SELECT product_name, set_slug FROM cards WHERE product_id=?", (card_id,)
-        ).fetchone()
-        if row:
-            table.add_row(str(i), f"{sim:.4f}", row["product_name"] or "?", row["set_slug"] or "")
-
-    conn.close()
-    console.print(table)
+    _display_results(results, f"Top {top_k} Text Matches for '{query}'")
 
 
 def show_embedding_stats():
-    init_embeddings_table()
+    collection = get_collection()
+    total_embs = collection.count()
+
     conn = db.get_connection()
-
     total_cards = conn.execute("SELECT COUNT(*) as c FROM cards WHERE status='downloaded'").fetchone()["c"]
-    total_embs = conn.execute("SELECT COUNT(*) as c FROM embeddings").fetchone()["c"]
-
     conn.close()
 
     console.print(f"\n  Downloaded cards: [cyan]{total_cards}[/cyan]")
@@ -330,6 +309,61 @@ def show_embedding_stats():
     if total_cards > 0:
         pct = (total_embs / total_cards) * 100
         console.print(f"  Coverage:         [green]{pct:.1f}%[/green]")
+    console.print(f"  Storage:          [dim]{config.CHROMA_DIR}[/dim]")
+
+
+def migrate_from_sqlite():
+    """Migrate existing embeddings from SQLite blob storage to ChromaDB."""
+    import numpy as np
+
+    conn = db.get_connection()
+
+    # Check if the old embeddings table exists
+    table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'"
+    ).fetchone()
+
+    if not table_exists:
+        console.print("[yellow]No SQLite embeddings table found — nothing to migrate.[/yellow]")
+        conn.close()
+        return
+
+    rows = conn.execute("""
+        SELECT e.card_slug, e.vector, c.product_name, c.set_slug, c.image_path, c.loose_price
+        FROM embeddings e
+        LEFT JOIN cards c ON c.product_id = e.card_slug
+    """).fetchall()
+    conn.close()
+
+    if not rows:
+        console.print("[yellow]No embeddings found in SQLite — nothing to migrate.[/yellow]")
+        return
+
+    console.print(f"[cyan]Migrating {len(rows)} embeddings from SQLite to ChromaDB...[/cyan]")
+
+    collection = get_collection()
+    batch_ids = []
+    batch_embeddings = []
+    batch_metadatas = []
+
+    for r in rows:
+        vec = np.frombuffer(r["vector"], dtype=np.float32)
+        batch_ids.append(str(r["card_slug"]))
+        batch_embeddings.append(vec.tolist())
+        batch_metadatas.append({
+            "product_name": r["product_name"] or "",
+            "set_slug": r["set_slug"] or "",
+            "image_path": r["image_path"] or "",
+            "loose_price": float(r["loose_price"] or 0),
+        })
+
+    collection.upsert(
+        ids=batch_ids,
+        embeddings=batch_embeddings,
+        metadatas=batch_metadatas,
+    )
+
+    console.print(f"[green]Migrated {len(batch_ids)} embeddings to ChromaDB[/green]")
 
 
 def main():
@@ -348,6 +382,7 @@ def main():
     txt_parser.add_argument("--top", type=int, default=10, help="Number of results")
 
     subparsers.add_parser("stats", help="Show embedding stats")
+    subparsers.add_parser("migrate", help="Migrate embeddings from SQLite to ChromaDB")
 
     args = parser.parse_args()
 
@@ -359,6 +394,8 @@ def main():
         search_by_text(args.query, args.top)
     elif args.command == "stats":
         show_embedding_stats()
+    elif args.command == "migrate":
+        migrate_from_sqlite()
     else:
         parser.print_help()
 
