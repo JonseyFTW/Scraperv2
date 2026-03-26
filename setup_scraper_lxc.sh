@@ -292,12 +292,28 @@ SCP_EMAIL=${SCP_EMAIL}
 SCP_PASSWORD=${SCP_PASSWORD}
 ENVEOF"
 
-# Helper command
+# Helper command with update support
 pct exec "$CTID" -- bash -c "cat > /usr/local/bin/scraper << 'SCRIPTEOF'
 #!/bin/bash
-cd ${INSTALL_DIR}
+INSTALL_DIR=\"${INSTALL_DIR}\"
+cd \"\$INSTALL_DIR\"
 set -a; source .env; set +a
 source venv/bin/activate
+
+if [[ \"\${1:-}\" == \"update\" ]]; then
+    echo \"Pulling latest changes...\"
+    git pull origin ${REPO_BRANCH}
+    echo \"Updating dependencies...\"
+    pip install -q -r requirements.txt
+    echo \"Done! Scraper is up to date.\"
+    exit 0
+fi
+
+if [[ \"\${1:-}\" == \"vpn\" ]]; then
+    nordvpn status
+    exit 0
+fi
+
 python main.py \"\$@\"
 SCRIPTEOF
 chmod +x /usr/local/bin/scraper"
