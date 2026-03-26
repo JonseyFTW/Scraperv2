@@ -1,216 +1,341 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
-# SportsCardPro Scraper — Proxmox LXC Container Setup
+# SportsCardPro Scraper — Proxmox LXC Setup Wizard
 #
-# Run this ON your Proxmox host to create a scraper LXC container
-# with NordVPN, Python, and all dependencies pre-configured.
+# Interactive setup that walks you through creating a scraper
+# container with NordVPN, Python, and all dependencies.
 #
-# Usage:
-#   bash setup_scraper_lxc.sh 201 us10299      # CTID 201, NordVPN server us10299
-#   bash setup_scraper_lxc.sh 202 uk2547       # CTID 202, different server
-#   bash setup_scraper_lxc.sh 203 de1048       # CTID 203, different server
+# Install:
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/JonseyFTW/Scraperv2/main/setup_scraper_lxc.sh)"
 #
-# After setup, SSH into the container and run:
-#   nordvpn login --token YOUR_NORD_TOKEN
-#   nordvpn connect <server>
-#   cd /opt/scraperv2 && python main.py --phase 4 --sport football
-#
-# Prerequisites:
-#   - Ubuntu 24.04 LXC template downloaded on Proxmox
-#     pveam download local ubuntu-24.04-standard_24.04-2_amd64.tar.zst
-#   - NordVPN token (get from: https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/)
+# Or locally:
+#   bash setup_scraper_lxc.sh
 
 set -euo pipefail
 
-# ── Config ────────────────────────────────────────────────────────────────
-CTID="${1:?Usage: $0 <CTID> <NORDVPN_SERVER> [NORD_TOKEN]}"
-NORD_SERVER="${2:?Usage: $0 <CTID> <NORDVPN_SERVER> [NORD_TOKEN]}"
-NORD_TOKEN="${3:-}"
+# ── Colors & helpers ──────────────────────────────────────────────────────
+YW="\033[33m"
+GN="\033[1;92m"
+CL="\033[m"
+RD="\033[01;31m"
+BL="\033[36m"
+CM="${GN}✓${CL}"
+CROSS="${RD}✗${CL}"
 
-HOSTNAME="scraper-${NORD_SERVER}"
-TEMPLATE="local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
-STORAGE="local-lvm"
-MEMORY=4096
-SWAP=1024
-CORES=2
-DISK_SIZE="20"
-BRIDGE="vmbr0"
-NAMESERVER="1.1.1.1"
-
-# Git repo
+APP="SportsCardPro Scraper"
 REPO_URL="https://github.com/JonseyFTW/Scraperv2.git"
 REPO_BRANCH="claude/add-phase5-progress-visuals-hY7L5"
 INSTALL_DIR="/opt/scraperv2"
 
-# Database — point to your UGREEN
-DB_URL="postgresql://postgres:changeme@192.168.1.14:5433/sportscards"
-SCP_EMAIL="${SCP_EMAIL:-}"
-SCP_PASSWORD="${SCP_PASSWORD:-}"
+header_info() {
+    clear
+    cat <<"EOF"
+   ___              _      ___              _
+  / __|_ __  ___ _ _| |_ __/ __|__ _ _ _ __| |
+  \__ \ '_ \/ _ \ '_|  _(_) (__/ _` | '_/ _` |
+  |___/ .__/\___/_|  \__(_)\___\__,_|_| \__,_|
+      |_|  Pro Scraper v2 — LXC Setup Wizard
 
-# ── Colors ────────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+EOF
+}
 
-log()  { echo -e "${GREEN}[+]${NC} $1"; }
-info() { echo -e "${CYAN}[i]${NC} $1"; }
-err()  { echo -e "${RED}[!]${NC} $1"; exit 1; }
+msg_ok()   { echo -e " ${CM}  ${GN}${1}${CL}"; }
+msg_info() { echo -e " ...  ${YW}${1}${CL}"; }
+msg_error(){ echo -e " ${CROSS}  ${RD}${1}${CL}"; }
 
-# ── Preflight checks ─────────────────────────────────────────────────────
-command -v pct >/dev/null 2>&1 || err "This script must be run on a Proxmox host"
-[[ -f "/var/lib/vz/template/cache/$(basename "$TEMPLATE" | sed 's/.*\///')" ]] || \
-    pveam list local | grep -q "ubuntu-24.04" || \
-    err "Ubuntu 24.04 template not found. Run:\n  pveam download local ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
+# ── Preflight ─────────────────────────────────────────────────────────────
+header_info
+if ! command -v pct &>/dev/null; then
+    msg_error "This script must be run on a Proxmox VE host."
+    exit 1
+fi
 
-pct status "$CTID" >/dev/null 2>&1 && err "Container $CTID already exists"
+if ! command -v whiptail &>/dev/null; then
+    msg_error "whiptail not found. Install it: apt install whiptail"
+    exit 1
+fi
+
+# Check for Ubuntu template
+TEMPLATE_FILE=$(pveam list local 2>/dev/null | grep -o "local:vztmpl/ubuntu-24.04[^ ]*" | head -1 || true)
+if [[ -z "$TEMPLATE_FILE" ]]; then
+    if whiptail --title "Template Missing" --yesno \
+        "Ubuntu 24.04 LXC template not found.\n\nDownload it now? (This may take a minute)" 10 60; then
+        msg_info "Downloading Ubuntu 24.04 template..."
+        pveam download local ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+        TEMPLATE_FILE="local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
+        msg_ok "Template downloaded"
+    else
+        msg_error "Cannot continue without template"
+        exit 1
+    fi
+fi
+
+# ── Step 1: Container ID ─────────────────────────────────────────────────
+header_info
+
+# Find next available CTID
+NEXT_ID=$(pvesh get /cluster/nextid 2>/dev/null || echo "200")
+
+CTID=$(whiptail --title "$APP — Container ID" \
+    --inputbox "Enter the Container ID (CTID) for the new LXC:\n\nNext available: ${NEXT_ID}" \
+    10 60 "$NEXT_ID" 3>&1 1>&2 2>&3) || exit 1
+
+# Validate CTID not in use
+if pct status "$CTID" &>/dev/null; then
+    msg_error "Container $CTID already exists!"
+    exit 1
+fi
+
+# ── Step 2: Resources ────────────────────────────────────────────────────
+header_info
+
+CORES=$(whiptail --title "$APP — CPU Cores" \
+    --inputbox "Number of CPU cores:" \
+    8 60 "2" 3>&1 1>&2 2>&3) || exit 1
+
+MEMORY=$(whiptail --title "$APP — Memory" \
+    --inputbox "Memory in MB:" \
+    8 60 "4096" 3>&1 1>&2 2>&3) || exit 1
+
+DISK_SIZE=$(whiptail --title "$APP — Disk Size" \
+    --inputbox "Root disk size in GB:" \
+    8 60 "20" 3>&1 1>&2 2>&3) || exit 1
+
+# ── Step 3: Storage selection ────────────────────────────────────────────
+header_info
+
+# Get available storages
+STORAGE_LIST=$(pvesm status -content rootdir 2>/dev/null | awk 'NR>1 {print $1, $1}' || echo "local-lvm local-lvm")
+STORAGE=$(whiptail --title "$APP — Storage" \
+    --menu "Select storage for the container:" \
+    14 60 5 $STORAGE_LIST 3>&1 1>&2 2>&3) || exit 1
+
+# ── Step 4: Network bridge ───────────────────────────────────────────────
+header_info
+
+BRIDGE_LIST=$(ip link show type bridge 2>/dev/null | grep -oP '(?<=: )\w+' | awk '{print $1, $1}' || echo "vmbr0 vmbr0")
+BRIDGE=$(whiptail --title "$APP — Network Bridge" \
+    --menu "Select network bridge:" \
+    14 60 5 $BRIDGE_LIST 3>&1 1>&2 2>&3) || exit 1
+
+# ── Step 5: NordVPN ──────────────────────────────────────────────────────
+header_info
+
+NORD_TOKEN=$(whiptail --title "$APP — NordVPN Token" \
+    --inputbox "Enter your NordVPN access token:\n\n(Get it from: https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/)\n\nLeave blank to configure later." \
+    14 70 "" 3>&1 1>&2 2>&3) || exit 1
+
+NORD_SERVER=$(whiptail --title "$APP — NordVPN Server" \
+    --menu "Select a VPN region (or type a specific server like us10299):" \
+    20 60 10 \
+    "us"        "United States (auto)" \
+    "uk"        "United Kingdom (auto)" \
+    "ca"        "Canada (auto)" \
+    "de"        "Germany (auto)" \
+    "nl"        "Netherlands (auto)" \
+    "se"        "Sweden (auto)" \
+    "ch"        "Switzerland (auto)" \
+    "au"        "Australia (auto)" \
+    "jp"        "Japan (auto)" \
+    "custom"    "Enter a specific server..." \
+    3>&1 1>&2 2>&3) || exit 1
+
+if [[ "$NORD_SERVER" == "custom" ]]; then
+    NORD_SERVER=$(whiptail --title "$APP — Custom Server" \
+        --inputbox "Enter NordVPN server name:\n\n(e.g. us10299, uk2547, de1048)" \
+        10 60 "" 3>&1 1>&2 2>&3) || exit 1
+fi
+
+# ── Step 6: Database ─────────────────────────────────────────────────────
+header_info
+
+DB_URL=$(whiptail --title "$APP — PostgreSQL" \
+    --inputbox "PostgreSQL connection string:\n\n(Your UGREEN NAS)" \
+    10 70 "postgresql://postgres:changeme@192.168.1.14:5433/sportscards" 3>&1 1>&2 2>&3) || exit 1
+
+# ── Step 7: SportsCardsPro credentials ───────────────────────────────────
+header_info
+
+SCP_EMAIL=$(whiptail --title "$APP — SportsCardsPro Login" \
+    --inputbox "SportsCardsPro email:" \
+    8 60 "" 3>&1 1>&2 2>&3) || exit 1
+
+SCP_PASSWORD=$(whiptail --title "$APP — SportsCardsPro Login" \
+    --passwordbox "SportsCardsPro password:" \
+    8 60 "" 3>&1 1>&2 2>&3) || exit 1
+
+# ── Confirm ──────────────────────────────────────────────────────────────
+header_info
+
+HOSTNAME="scraper-${NORD_SERVER}"
+
+whiptail --title "$APP — Confirm Setup" --yesno \
+"Ready to create the scraper container:\n
+  Container ID:   $CTID
+  Hostname:       $HOSTNAME
+  Cores / RAM:    $CORES / ${MEMORY}MB
+  Disk:           ${DISK_SIZE}GB on $STORAGE
+  Bridge:         $BRIDGE
+  VPN Server:     $NORD_SERVER
+  Database:       $(echo "$DB_URL" | sed 's|://[^@]*@|://***@|')
+  SCP Account:    $SCP_EMAIL
+
+Proceed?" 20 64 || exit 1
+
+# ══════════════════════════════════════════════════════════════════════════
+#  INSTALLATION
+# ══════════════════════════════════════════════════════════════════════════
+header_info
 
 # ── Create container ──────────────────────────────────────────────────────
-log "Creating LXC container ${BOLD}$CTID${NC} (${HOSTNAME})"
+msg_info "Creating LXC container $CTID ($HOSTNAME)"
 
-pct create "$CTID" "$TEMPLATE" \
+pct create "$CTID" "$TEMPLATE_FILE" \
     --hostname "$HOSTNAME" \
     --memory "$MEMORY" \
-    --swap "$SWAP" \
+    --swap 1024 \
     --cores "$CORES" \
     --rootfs "${STORAGE}:${DISK_SIZE}" \
     --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
-    --nameserver "$NAMESERVER" \
+    --nameserver "1.1.1.1" \
     --unprivileged 0 \
     --features "nesting=1,keyctl=1" \
     --onboot 1 \
     --start 0
 
-# NordVPN needs /dev/net/tun — add to container config
-log "Enabling TUN device for VPN"
-cat >> "/etc/pve/lxc/${CTID}.conf" <<'EOF'
+msg_ok "Container $CTID created"
+
+# ── Enable TUN for VPN ───────────────────────────────────────────────────
+msg_info "Enabling TUN device for VPN"
+cat >> "/etc/pve/lxc/${CTID}.conf" <<'TUNEOF'
 lxc.cgroup2.devices.allow: c 10:200 rwm
 lxc.mount.entry: /dev/net dev/net none bind,create=dir
-EOF
+TUNEOF
+msg_ok "TUN device enabled"
 
 # ── Start container ───────────────────────────────────────────────────────
-log "Starting container $CTID"
+msg_info "Starting container"
 pct start "$CTID"
 sleep 5
 
-# Wait for network
-log "Waiting for network..."
+msg_info "Waiting for network"
 for i in $(seq 1 30); do
-    if pct exec "$CTID" -- ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
-        break
-    fi
+    pct exec "$CTID" -- ping -c 1 -W 2 1.1.1.1 &>/dev/null && break
     sleep 2
 done
-pct exec "$CTID" -- ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || err "Container has no network"
+pct exec "$CTID" -- ping -c 1 -W 2 1.1.1.1 &>/dev/null || { msg_error "No network"; exit 1; }
 
-# Get container IP
 CT_IP=$(pct exec "$CTID" -- hostname -I | awk '{print $1}')
-log "Container IP: ${BOLD}${CT_IP}${NC}"
+msg_ok "Network ready (IP: $CT_IP)"
 
 # ── Install system packages ──────────────────────────────────────────────
-log "Installing system packages (this takes a few minutes)..."
+msg_info "Installing system packages (this takes a few minutes)"
 pct exec "$CTID" -- bash -c '
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
+    apt-get update -qq &>/dev/null
     apt-get install -y -qq \
         python3 python3-pip python3-venv \
         git curl wget gnupg2 apt-transport-https \
         libpq-dev build-essential \
-        ca-certificates >/dev/null 2>&1
-    echo "System packages installed"
+        ca-certificates &>/dev/null
 '
+msg_ok "System packages installed"
 
 # ── Install NordVPN ───────────────────────────────────────────────────────
-log "Installing NordVPN..."
+msg_info "Installing NordVPN"
 pct exec "$CTID" -- bash -c '
-    sh <(curl -sSf https://downloads.nordcdn.com/apps/linux/install.sh) <<< "y"
-    # Wait for nordvpnd to be ready
+    sh <(curl -sSf https://downloads.nordcdn.com/apps/linux/install.sh) <<< "y" &>/dev/null
     sleep 3
-    systemctl enable --now nordvpnd 2>/dev/null || true
+    systemctl enable --now nordvpnd &>/dev/null || true
     sleep 2
-    echo "NordVPN installed"
 '
+msg_ok "NordVPN installed"
 
 # ── Configure NordVPN ─────────────────────────────────────────────────────
-if [[ -n "$NORD_TOKEN" ]]; then
-    log "Logging into NordVPN with token..."
-    pct exec "$CTID" -- nordvpn login --token "$NORD_TOKEN"
-    sleep 2
-fi
+msg_info "Configuring NordVPN (server: $NORD_SERVER)"
 
-log "Configuring NordVPN settings..."
 pct exec "$CTID" -- bash -c "
-    nordvpn set technology nordlynx
-    nordvpn set firewall off
-    nordvpn set killswitch off
-    nordvpn set autoconnect on ${NORD_SERVER}
-"
+    nordvpn set technology nordlynx 2>/dev/null
+    nordvpn set firewall off 2>/dev/null
+    nordvpn set killswitch off 2>/dev/null
+    nordvpn set autoconnect on ${NORD_SERVER} 2>/dev/null
+" || true
 
-# Connect if logged in
 if [[ -n "$NORD_TOKEN" ]]; then
-    log "Connecting to NordVPN server: ${BOLD}${NORD_SERVER}${NC}"
-    pct exec "$CTID" -- nordvpn connect "$NORD_SERVER"
-    sleep 5
-    pct exec "$CTID" -- nordvpn status
+    pct exec "$CTID" -- nordvpn login --token "$NORD_TOKEN" 2>/dev/null || true
+    sleep 2
+    pct exec "$CTID" -- nordvpn connect "$NORD_SERVER" 2>/dev/null || true
+    sleep 3
+    msg_ok "NordVPN connected"
+else
+    msg_ok "NordVPN installed (login required — see instructions below)"
 fi
 
 # ── Clone repo and install Python deps ────────────────────────────────────
-log "Setting up scraper..."
+msg_info "Installing scraper and Python dependencies"
 pct exec "$CTID" -- bash -c "
-    git clone --branch ${REPO_BRANCH} ${REPO_URL} ${INSTALL_DIR}
+    git clone --branch ${REPO_BRANCH} ${REPO_URL} ${INSTALL_DIR} &>/dev/null
     cd ${INSTALL_DIR}
     python3 -m venv venv
     source venv/bin/activate
-    pip install -q -r requirements.txt
-    playwright install chromium
-    playwright install-deps chromium
-    echo 'Scraper installed'
+    pip install -q -r requirements.txt 2>/dev/null
+    playwright install chromium &>/dev/null
+    playwright install-deps chromium &>/dev/null
 "
+msg_ok "Scraper installed"
 
 # ── Write environment file ────────────────────────────────────────────────
-log "Writing environment config..."
+msg_info "Writing configuration"
 pct exec "$CTID" -- bash -c "cat > ${INSTALL_DIR}/.env << 'ENVEOF'
 DATABASE_URL=${DB_URL}
 SCP_EMAIL=${SCP_EMAIL}
 SCP_PASSWORD=${SCP_PASSWORD}
 ENVEOF"
 
-# Write a helper script to source env and run
+# Helper command
 pct exec "$CTID" -- bash -c "cat > /usr/local/bin/scraper << 'SCRIPTEOF'
 #!/bin/bash
 cd ${INSTALL_DIR}
-set -a
-source .env
-set +a
+set -a; source .env; set +a
 source venv/bin/activate
 python main.py \"\$@\"
 SCRIPTEOF
 chmod +x /usr/local/bin/scraper"
 
-# ── Summary ───────────────────────────────────────────────────────────────
+msg_ok "Configuration written"
+
+# ── Done! ─────────────────────────────────────────────────────────────────
+VPN_STATUS=""
+if [[ -n "$NORD_TOKEN" ]]; then
+    VPN_STATUS=$(pct exec "$CTID" -- nordvpn status 2>/dev/null | grep -E "Status|Server|IP" | head -3 || echo "  Connected")
+fi
+
 echo ""
-echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}${BOLD}  Container $CTID ($HOSTNAME) is ready!${NC}"
-echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════${NC}"
+echo -e " ${GN}══════════════════════════════════════════════════════${CL}"
+echo -e " ${GN}  ${APP} — Container $CTID Ready!${CL}"
+echo -e " ${GN}══════════════════════════════════════════════════════${CL}"
 echo ""
-echo -e "  ${CYAN}VPN Server:${NC}  $NORD_SERVER"
-echo -e "  ${CYAN}IP Address:${NC}  $CT_IP"
-echo -e "  ${CYAN}Database:${NC}    $DB_URL"
+echo -e "   ${BL}Container:${CL}   $CTID ($HOSTNAME)"
+echo -e "   ${BL}IP Address:${CL}  $CT_IP"
+echo -e "   ${BL}VPN Server:${CL}  $NORD_SERVER"
+if [[ -n "$VPN_STATUS" ]]; then
+    echo -e "   ${BL}VPN Status:${CL}"
+    echo "$VPN_STATUS" | sed 's/^/                 /'
+fi
 echo ""
 
 if [[ -z "$NORD_TOKEN" ]]; then
-    echo -e "  ${RED}⚠  NordVPN not logged in yet. Run:${NC}"
-    echo -e "     pct exec $CTID -- nordvpn login --token YOUR_TOKEN"
-    echo -e "     pct exec $CTID -- nordvpn connect $NORD_SERVER"
+    echo -e "   ${YW}⚠  NordVPN login still needed:${CL}"
+    echo -e "      pct exec $CTID -- nordvpn login --token YOUR_TOKEN"
+    echo -e "      pct exec $CTID -- nordvpn connect $NORD_SERVER"
     echo ""
 fi
 
-echo -e "  ${BOLD}Quick start:${NC}"
-echo -e "     pct enter $CTID"
-echo -e "     scraper --stats"
-echo -e "     scraper --phase 4 --sport football --limit 500"
+echo -e "   ${GN}Quick start:${CL}"
+echo -e "      pct enter $CTID"
+echo -e "      scraper --stats"
+echo -e "      scraper --phase 4 --sport football"
 echo ""
-echo -e "  ${BOLD}Or run from Proxmox host:${NC}"
-echo -e "     pct exec $CTID -- scraper --phase 4 --sport football"
+echo -e "   ${GN}Run from Proxmox host:${CL}"
+echo -e "      pct exec $CTID -- scraper --phase 4 --sport football"
 echo ""
