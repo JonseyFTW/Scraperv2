@@ -146,14 +146,23 @@ if [[ "$NORD_SERVER" == "custom" ]]; then
         10 60 "" 3>&1 1>&2 2>&3) || exit 1
 fi
 
-# ── Step 6: Database ─────────────────────────────────────────────────────
+# ── Step 6: Shared storage (images + CSVs) ───────────────────────────────
+header_info
+
+NAS_SHARE=$(whiptail --title "$APP — Shared Image Storage" \
+    --inputbox "NFS/SMB share path on your NAS for images + CSVs:\n\n(This is where ALL containers save images so your GPU\nmachine can access them for embedding generation)\n\nNFS example: 192.168.1.14:/Data/scraper" \
+    14 70 "192.168.1.14:/Data/scraper" 3>&1 1>&2 2>&3) || exit 1
+
+SHARE_MOUNT="/mnt/scraper-data"
+
+# ── Step 7: Database ─────────────────────────────────────────────────────
 header_info
 
 DB_URL=$(whiptail --title "$APP — PostgreSQL" \
     --inputbox "PostgreSQL connection string:\n\n(Your UGREEN NAS)" \
     10 70 "postgresql://postgres:changeme@192.168.1.14:5433/sportscards" 3>&1 1>&2 2>&3) || exit 1
 
-# ── Step 7: SportsCardsPro credentials ───────────────────────────────────
+# ── Step 8: SportsCardsPro credentials ───────────────────────────────────
 header_info
 
 SCP_EMAIL=$(whiptail --title "$APP — SportsCardsPro Login" \
@@ -177,10 +186,11 @@ whiptail --title "$APP — Confirm Setup" --yesno \
   Disk:           ${DISK_SIZE}GB on $STORAGE
   Bridge:         $BRIDGE
   VPN Server:     $NORD_SERVER
+  Shared Storage: $NAS_SHARE → $SHARE_MOUNT
   Database:       $(echo "$DB_URL" | sed 's|://[^@]*@|://***@|')
   SCP Account:    $SCP_EMAIL
 
-Proceed?" 20 64 || exit 1
+Proceed?" 22 68 || exit 1
 
 # ══════════════════════════════════════════════════════════════════════════
 #  INSTALLATION
@@ -227,6 +237,33 @@ pct exec "$CTID" -- ping -c 1 -W 2 1.1.1.1 &>/dev/null || { msg_error "No networ
 
 CT_IP=$(pct exec "$CTID" -- hostname -I | awk '{print $1}')
 msg_ok "Network ready (IP: $CT_IP)"
+
+# ── Mount shared NAS storage ─────────────────────────────────────────────
+msg_info "Mounting shared storage ($NAS_SHARE)"
+pct exec "$CTID" -- bash -c "
+    apt-get install -y -qq nfs-common &>/dev/null
+    mkdir -p ${SHARE_MOUNT}
+    echo '${NAS_SHARE} ${SHARE_MOUNT} nfs defaults,_netdev 0 0' >> /etc/fstab
+    mount ${SHARE_MOUNT}
+"
+if pct exec "$CTID" -- mountpoint -q "$SHARE_MOUNT" 2>/dev/null; then
+    msg_ok "Shared storage mounted at $SHARE_MOUNT"
+else
+    msg_error "NFS mount failed — trying SMB/CIFS instead"
+    pct exec "$CTID" -- bash -c "
+        apt-get install -y -qq cifs-utils &>/dev/null
+        # Remove failed NFS entry
+        sed -i '\|${NAS_SHARE}|d' /etc/fstab
+        # Try SMB mount (guest/no password)
+        echo '//${NAS_SHARE#*:} ${SHARE_MOUNT} cifs guest,_netdev,uid=0,gid=0 0 0' >> /etc/fstab
+        mount ${SHARE_MOUNT}
+    " 2>/dev/null
+    if pct exec "$CTID" -- mountpoint -q "$SHARE_MOUNT" 2>/dev/null; then
+        msg_ok "Shared storage mounted via SMB at $SHARE_MOUNT"
+    else
+        msg_error "Could not mount shared storage — you may need to mount manually"
+    fi
+fi
 
 # ── Install system packages ──────────────────────────────────────────────
 msg_info "Installing system packages (this takes a few minutes)"
@@ -288,6 +325,7 @@ msg_ok "Scraper installed"
 msg_info "Writing configuration"
 pct exec "$CTID" -- bash -c "cat > ${INSTALL_DIR}/.env << 'ENVEOF'
 DATABASE_URL=${DB_URL}
+SCP_DATA_DIR=${SHARE_MOUNT}
 SCP_EMAIL=${SCP_EMAIL}
 SCP_PASSWORD=${SCP_PASSWORD}
 ENVEOF"
@@ -334,6 +372,7 @@ echo ""
 echo -e "   ${BL}Container:${CL}   $CTID ($HOSTNAME)"
 echo -e "   ${BL}IP Address:${CL}  $CT_IP"
 echo -e "   ${BL}VPN Server:${CL}  $NORD_SERVER"
+echo -e "   ${BL}Images:${CL}      $NAS_SHARE → $SHARE_MOUNT"
 if [[ -n "$VPN_STATUS" ]]; then
     echo -e "   ${BL}VPN Status:${CL}"
     echo "$VPN_STATUS" | sed 's/^/                 /'
