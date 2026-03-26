@@ -492,8 +492,8 @@ async def scrape_card_images(page: Page, limit: int = 0):
     This bypasses Cloudflare since the browser context already has CF cookies.
     Processes ~10-25 cards/sec depending on rate limiting.
     """
-    FETCH_BATCH = 5           # parallel fetches per batch (avoid rate limit)
-    BATCH_DELAY = 1.5         # seconds between batches
+    FETCH_BATCH = 4           # parallel fetches per batch (avoid rate limit)
+    BATCH_DELAY = 3         # seconds between batches
     DB_BATCH    = 500         # cards per DB fetch
     total_ok    = 0
     total_no_image = 0
