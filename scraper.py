@@ -16,6 +16,8 @@ import re
 import random
 import glob
 import json
+import subprocess
+import shutil
 from urllib.parse import urljoin, urlparse
 from pathlib import Path
 
@@ -51,6 +53,67 @@ except ImportError:
         except ImportError:
             async def stealth_async(page):
                 pass  # No stealth available
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VPN rotation
+# ═══════════════════════════════════════════════════════════════════════════
+
+_vpn_available = shutil.which("nordvpn") is not None
+_cf_block_count = 0  # Track consecutive CF blocks to trigger rotation
+
+async def rotate_vpn():
+    """Disconnect and reconnect NordVPN to get a fresh IP."""
+    if not _vpn_available:
+        return False
+    try:
+        console.print("  [cyan]Rotating VPN to fresh IP...[/cyan]")
+        # Disconnect first
+        proc = await asyncio.create_subprocess_exec(
+            "nordvpn", "disconnect",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.wait()
+        await asyncio.sleep(2)
+
+        # Reconnect to a random server
+        proc = await asyncio.create_subprocess_exec(
+            "nordvpn", "connect",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        output = stdout.decode().strip()
+
+        if proc.returncode == 0:
+            # Extract server name from output if possible
+            server = ""
+            for line in output.splitlines():
+                if "connected" in line.lower() or "server" in line.lower():
+                    server = line.strip()
+                    break
+            console.print(f"  [green]VPN rotated: {server or 'connected'}[/green]")
+            await asyncio.sleep(3)  # Let the connection stabilize
+            return True
+        else:
+            console.print(f"  [yellow]VPN reconnect returned {proc.returncode}[/yellow]")
+            return False
+    except Exception as e:
+        console.print(f"  [dim]VPN rotation failed: {e}[/dim]")
+        return False
+
+
+async def maybe_rotate_vpn(force: bool = False):
+    """Rotate VPN after repeated CF blocks. Returns True if rotated."""
+    global _cf_block_count
+    if force:
+        _cf_block_count = 0
+        return await rotate_vpn()
+    _cf_block_count += 1
+    # Rotate after 3 consecutive CF blocks
+    if _cf_block_count >= 3:
+        _cf_block_count = 0
+        return await rotate_vpn()
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -256,6 +319,7 @@ async def _solve_cloudflare(page: Page):
 
 
 async def safe_goto(page: Page, url: str, wait_for_cf: bool = False) -> bool:
+    global _cf_block_count
     for attempt in range(config.MAX_RETRIES):
         try:
             resp = await page.goto(url, timeout=config.PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
@@ -270,13 +334,24 @@ async def safe_goto(page: Page, url: str, wait_for_cf: bool = False) -> bool:
                     await page.wait_for_load_state("domcontentloaded", timeout=15000)
                 except:
                     pass
+                # Check if challenge was solved
+                content = await page.content()
+                if "challenge-platform" in content or "Just a moment" in content:
+                    # Still blocked — try VPN rotation
+                    rotated = await maybe_rotate_vpn()
+                    if rotated:
+                        continue  # Retry with new IP
 
             if resp and resp.status in (200, 301, 302):
+                _cf_block_count = 0  # Reset on success
                 return True
             elif resp and resp.status == 403:
                 console.print(f"  [red]403 on attempt {attempt+1}[/red]")
-                await asyncio.sleep(config.RETRY_DELAY * (attempt + 1))
+                rotated = await maybe_rotate_vpn()
+                if not rotated:
+                    await asyncio.sleep(config.RETRY_DELAY * (attempt + 1))
             else:
+                _cf_block_count = 0
                 return True
         except Exception as e:
             console.print(f"  [red]Error attempt {attempt+1}: {e}[/red]")
@@ -737,8 +812,12 @@ async def scrape_card_images(page: Page, limit: int = 0):
                 cf_hits = sum(1 for r in results if isinstance(r, dict) and r.get("reason") in ("cf_blocked", "cf_challenge"))
                 if cf_hits > 0:
                     console.print(f"  [yellow]Cloudflare blocked {cf_hits}/{len(batch)} — refreshing session...[/yellow]")
+                    # Try rotating VPN if we keep getting blocked
+                    rotated = await maybe_rotate_vpn()
+                    if rotated:
+                        await asyncio.sleep(random.uniform(5, 10))
                     await safe_goto(page, f"{config.BASE_URL}/category/football-cards", wait_for_cf=True)
-                    await asyncio.sleep(random.uniform(10, 20))  # Longer cooldown after CF block
+                    await asyncio.sleep(random.uniform(10, 20))
 
                 for card, result in zip(batch, results):
                     pid = card["product_id"]
