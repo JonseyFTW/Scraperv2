@@ -35,11 +35,14 @@ console = Console()
 def pick_random_card() -> dict:
     """Pick a random downloaded card that has an image on disk."""
     conn = db.get_connection()
-    rows = conn.execute("""
+    cur = conn.cursor(cursor_factory=__import__('psycopg2').extras.RealDictCursor)
+    cur.execute("""
         SELECT * FROM cards
         WHERE status = 'downloaded' AND image_path IS NOT NULL
         ORDER BY RANDOM() LIMIT 10
-    """).fetchall()
+    """)
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
 
     for r in rows:

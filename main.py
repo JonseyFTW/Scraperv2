@@ -18,6 +18,7 @@ Usage:
 Environment variables:
     SCP_EMAIL       Your SportsCardsPro login email
     SCP_PASSWORD    Your SportsCardsPro password
+    DATABASE_URL    PostgreSQL connection string (default: postgresql://postgres:postgres@localhost:5432/sportscards)
 """
 import argparse
 import asyncio

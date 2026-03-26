@@ -30,12 +30,18 @@ LOGIN_EMAIL = os.environ.get("SCP_EMAIL", "")
 LOGIN_PASSWORD = os.environ.get("SCP_PASSWORD", "")
 LOGIN_URL = f"{BASE_URL}/login"
 
+# ── Database ──────────────────────────────────────────────────────────────
+# PostgreSQL connection string. Set via env var or edit directly.
+#   Example: postgresql://user:pass@192.168.1.14:5432/sportscards
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:changeme@192.168.1.14:5433/sportscards")
+
 # ── Paths ─────────────────────────────────────────────────────────────────
+# Set SCP_DATA_DIR env var to use a shared/network drive, e.g.:
+#   set SCP_DATA_DIR=\\192.168.1.14\Data\scraper
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(PROJECT_DIR, "data")
+DATA_DIR = os.environ.get("SCP_DATA_DIR") or os.path.join(PROJECT_DIR, "data")
 CSV_DIR = os.path.join(DATA_DIR, "csvs")
-IMAGE_DIR = os.path.join(PROJECT_DIR, "images")
-DB_PATH = os.path.join(DATA_DIR, "sportscards.db")
+IMAGE_DIR = os.path.join(DATA_DIR, "images")
 CHROMA_DIR = os.path.join(DATA_DIR, "chromadb")
 
 # ── Scraping behavior ─────────────────────────────────────────────────────

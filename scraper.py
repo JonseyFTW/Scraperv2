@@ -30,7 +30,10 @@ except ImportError:
     async def stealth_async(page):
         await _stealth_instance.apply_stealth_async(page)
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, MofNCompleteColumn
+from rich.live import Live
+from rich.table import Table
+from rich.panel import Panel
 
 import config
 import database as db
@@ -812,11 +815,30 @@ async def download_images(limit: int = 0):
     """Download all card images. No browser needed — pure HTTP."""
     console.print(f"\n[bold]Phase 5: Downloading card images[/bold]\n")
 
-    total = 0
+    # Get total count for progress bar
+    conn = db.get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM cards WHERE status='image_found' AND image_url IS NOT NULL")
+    all_pending = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    total_to_download = min(all_pending, limit) if limit > 0 else all_pending
+
+    if total_to_download == 0:
+        console.print("  [yellow]No images to download.[/yellow]")
+        return
+
+    console.print(f"  Found [cyan]{total_to_download:,}[/cyan] images to download "
+                  f"([dim]{config.IMAGE_CONCURRENT_DOWNLOADS} concurrent[/dim])\n")
+
+    downloaded = 0
+    skipped = 0  # already cached locally
+    failed = 0
     sem = asyncio.Semaphore(config.IMAGE_CONCURRENT_DOWNLOADS)
 
-    # Use proxy if set in environment
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    # Shared state for live display
+    progress_state = {"current_file": "", "current_set": ""}
+
     connector = aiohttp.TCPConnector(ssl=False)
 
     async with aiohttp.ClientSession(
@@ -826,28 +848,89 @@ async def download_images(limit: int = 0):
         trust_env=True,
     ) as session:
 
-        while True:
-            cards = db.get_cards_needing_download(200)
-            if not cards:
-                break
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=40),
+            MofNCompleteColumn(),
+            TextColumn("[dim]|[/dim]"),
+            TimeRemainingColumn(),
+            console=console,
+        )
+        task = progress.add_task("Downloading", total=total_to_download)
 
-            tasks = []
-            for card in cards:
-                if limit > 0 and total + len(tasks) >= limit:
+        def make_status_table():
+            tbl = Table.grid(padding=(0, 2))
+            tbl.add_row(
+                f"  [green]✓ {downloaded:,}[/green] downloaded",
+                f"[yellow]⊘ {skipped:,}[/yellow] cached",
+                f"[red]✗ {failed:,}[/red] failed",
+            )
+            tbl.add_row(
+                f"  [dim]Set: {progress_state['current_set'][:50]}[/dim]",
+                f"[dim]File: {progress_state['current_file'][:50]}[/dim]",
+                "",
+            )
+            return tbl
+
+        with Live(progress, console=console, refresh_per_second=8) as live:
+            def refresh_display():
+                from rich.console import Group
+                live.update(Group(progress, make_status_table()))
+
+            while True:
+                cards = db.get_cards_needing_download(200)
+                if not cards:
                     break
-                tasks.append(download_one_image(session, sem, card))
 
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            total += sum(1 for r in results if r is True)
+                tasks = []
+                processed = downloaded + skipped + failed
+                for card in cards:
+                    if limit > 0 and processed + len(tasks) >= limit:
+                        break
+                    tasks.append(download_one_image(
+                        session, sem, card, progress, task,
+                        progress_state, refresh_display
+                    ))
 
-            if limit > 0 and total >= limit:
-                break
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in results:
+                    if r == "downloaded":
+                        downloaded += 1
+                    elif r == "cached":
+                        skipped += 1
+                    else:
+                        failed += 1
+                refresh_display()
 
-    console.print(f"\n  Downloaded [green]{total}[/green] images")
-    db.log_event("phase5_complete", f"Downloaded {total} images")
+                if limit > 0 and (downloaded + skipped + failed) >= limit:
+                    break
+
+    # Final summary
+    console.print()
+    summary = Table.grid(padding=(0, 2))
+    summary.add_row("[bold]Phase 5 Complete[/bold]")
+    summary.add_row(
+        f"  [green]✓ {downloaded:,}[/green] downloaded",
+        f"[yellow]⊘ {skipped:,}[/yellow] already cached",
+        f"[red]✗ {failed:,}[/red] failed",
+    )
+    total = downloaded + skipped + failed
+    summary.add_row(f"  [bold]{total:,}[/bold] total processed")
+    console.print(Panel(summary, border_style="green" if failed == 0 else "yellow"))
+    db.log_event("phase5_complete", f"Downloaded {downloaded}, cached {skipped}, failed {failed}")
 
 
-async def download_one_image(session: aiohttp.ClientSession, sem: asyncio.Semaphore, card: dict) -> bool:
+async def download_one_image(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    card: dict,
+    progress: Progress,
+    task,
+    state: dict,
+    refresh_fn,
+) -> str:
+    """Returns 'downloaded', 'cached', or 'failed'."""
     async with sem:
         try:
             set_dir = os.path.join(config.IMAGE_DIR, card["set_slug"])
@@ -857,9 +940,14 @@ async def download_one_image(session: aiohttp.ClientSession, sem: asyncio.Semaph
             ext = _get_ext(card["image_url"])
             filepath = os.path.join(set_dir, f"{safe_name}{ext}")
 
+            state["current_set"] = card.get("set_slug", "")
+            state["current_file"] = f"{safe_name}{ext}"
+            refresh_fn()
+
             if os.path.exists(filepath):
                 db.mark_card_downloaded(card["product_id"], filepath)
-                return True
+                progress.advance(task)
+                return "cached"
 
             async with session.get(card["image_url"]) as resp:
                 if resp.status == 200:
@@ -867,13 +955,16 @@ async def download_one_image(session: aiohttp.ClientSession, sem: asyncio.Semaph
                     async with aiofiles.open(filepath, "wb") as f:
                         await f.write(data)
                     db.mark_card_downloaded(card["product_id"], filepath)
-                    return True
+                    progress.advance(task)
+                    return "downloaded"
                 else:
                     db.mark_card_error(card["product_id"], f"HTTP {resp.status}")
-                    return False
+                    progress.advance(task)
+                    return "failed"
         except Exception as e:
             db.mark_card_error(card["product_id"], str(e)[:200])
-            return False
+            progress.advance(task)
+            return "failed"
 
 
 def _get_ext(url: str) -> str:
