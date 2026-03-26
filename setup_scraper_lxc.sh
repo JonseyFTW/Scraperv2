@@ -330,31 +330,36 @@ SCP_EMAIL=${SCP_EMAIL}
 SCP_PASSWORD=${SCP_PASSWORD}
 ENVEOF"
 
-# Helper command with update support
-pct exec "$CTID" -- bash -c "cat > /usr/local/bin/scraper << 'SCRIPTEOF'
+# Helper command with update support — write to temp file then push
+# (avoids bash history expansion issues with #!/bin/bash inside pct exec)
+cat > /tmp/scraper_helper_${CTID}.sh << HELPEREOF
 #!/bin/bash
-INSTALL_DIR=\"${INSTALL_DIR}\"
-cd \"\$INSTALL_DIR\"
+INSTALL_DIR="${INSTALL_DIR}"
+cd "\$INSTALL_DIR"
 set -a; source .env; set +a
 source venv/bin/activate
 
-if [[ \"\${1:-}\" == \"update\" ]]; then
-    echo \"Pulling latest changes...\"
+if [[ "\${1:-}" == "update" ]]; then
+    echo "Pulling latest changes..."
     git pull origin ${REPO_BRANCH}
-    echo \"Updating dependencies...\"
+    echo "Updating dependencies..."
     pip install -q -r requirements.txt
-    echo \"Done! Scraper is up to date.\"
+    echo "Done! Scraper is up to date."
     exit 0
 fi
 
-if [[ \"\${1:-}\" == \"vpn\" ]]; then
+if [[ "\${1:-}" == "vpn" ]]; then
     nordvpn status
     exit 0
 fi
 
-python main.py \"\$@\"
-SCRIPTEOF
-chmod +x /usr/local/bin/scraper"
+python main.py "\$@"
+HELPEREOF
+
+pct push "$CTID" /tmp/scraper_helper_${CTID}.sh /usr/local/bin/scraper
+pct exec "$CTID" -- chmod +x /usr/local/bin/scraper
+pct exec "$CTID" -- ln -sf /usr/local/bin/scraper /usr/bin/scraper
+rm -f /tmp/scraper_helper_${CTID}.sh
 
 msg_ok "Configuration written"
 

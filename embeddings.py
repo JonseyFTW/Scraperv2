@@ -129,6 +129,9 @@ def get_collection():
     return _chroma_collection
 
 
+_skipped_ids = set()  # Cards where image file doesn't exist on disk
+
+
 def get_cards_needing_embeddings(limit: int = 500) -> list[dict]:
     """Get downloaded cards that don't have embeddings yet."""
     collection = get_collection()
@@ -151,8 +154,9 @@ def get_cards_needing_embeddings(limit: int = 500) -> list[dict]:
     cur.close()
     conn.close()
 
-    # Filter out cards already in ChromaDB
-    cards = [dict(r) for r in rows if str(r["product_id"]) not in existing_ids]
+    # Filter out cards already in ChromaDB or previously skipped (missing file)
+    skip = existing_ids | _skipped_ids
+    cards = [dict(r) for r in rows if str(r["product_id"]) not in skip]
 
     return cards[:limit]
 
@@ -205,6 +209,8 @@ def generate_embeddings(limit: int = 0):
                             "loose_price": float(card["loose_price"] or 0),
                         })
                         total += 1
+                else:
+                    _skipped_ids.add(str(card["product_id"]))
 
                 progress.advance(task)
 
@@ -224,6 +230,8 @@ def generate_embeddings(limit: int = 0):
             break
 
     console.print(f"\n[green]Generated {total} embeddings ({collection.count()} total in ChromaDB)[/green]")
+    if _skipped_ids:
+        console.print(f"[yellow]Skipped {len(_skipped_ids)} cards (image file not found on disk)[/yellow]")
 
 
 def _display_results(results: dict, title: str):
