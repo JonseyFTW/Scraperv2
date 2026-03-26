@@ -816,9 +816,12 @@ async def download_images(limit: int = 0):
     console.print(f"\n[bold]Phase 5: Downloading card images[/bold]\n")
 
     # Get total count for progress bar
-    all_pending = db.get_connection().execute(
-        "SELECT COUNT(*) as c FROM cards WHERE status='image_found' AND image_url IS NOT NULL"
-    ).fetchone()["c"]
+    conn = db.get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM cards WHERE status='image_found' AND image_url IS NOT NULL")
+    all_pending = cur.fetchone()[0]
+    cur.close()
+    conn.close()
     total_to_download = min(all_pending, limit) if limit > 0 else all_pending
 
     if total_to_download == 0:

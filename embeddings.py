@@ -141,11 +141,14 @@ def get_cards_needing_embeddings(limit: int = 500) -> list[dict]:
         existing_ids = set(all_existing["ids"])
 
     conn = db.get_connection()
-    rows = conn.execute("""
+    cur = conn.cursor(cursor_factory=__import__('psycopg2').extras.RealDictCursor)
+    cur.execute("""
         SELECT * FROM cards
         WHERE status = 'downloaded' AND image_path IS NOT NULL
         ORDER BY id
-    """).fetchall()
+    """)
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
 
     # Filter out cards already in ChromaDB
@@ -302,7 +305,10 @@ def show_embedding_stats():
     total_embs = collection.count()
 
     conn = db.get_connection()
-    total_cards = conn.execute("SELECT COUNT(*) as c FROM cards WHERE status='downloaded'").fetchone()["c"]
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM cards WHERE status='downloaded'")
+    total_cards = cur.fetchone()[0]
+    cur.close()
     conn.close()
 
     console.print(f"\n  Downloaded cards: [cyan]{total_cards}[/cyan]")
@@ -318,22 +324,27 @@ def migrate_from_sqlite():
     import numpy as np
 
     conn = db.get_connection()
+    cur = conn.cursor(cursor_factory=__import__('psycopg2').extras.RealDictCursor)
 
     # Check if the old embeddings table exists
-    table_exists = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'"
-    ).fetchone()
+    cur.execute(
+        "SELECT to_regclass('public.embeddings') AS name"
+    )
+    table_exists = cur.fetchone()["name"]
 
     if not table_exists:
-        console.print("[yellow]No SQLite embeddings table found — nothing to migrate.[/yellow]")
+        console.print("[yellow]No embeddings table found — nothing to migrate.[/yellow]")
+        cur.close()
         conn.close()
         return
 
-    rows = conn.execute("""
+    cur.execute("""
         SELECT e.card_slug, e.vector, c.product_name, c.set_slug, c.image_path, c.loose_price
         FROM embeddings e
         LEFT JOIN cards c ON c.product_id = e.card_slug
-    """).fetchall()
+    """)
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
 
     if not rows:
