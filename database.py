@@ -206,7 +206,7 @@ def get_cards_needing_images(limit: int = 500) -> list[dict]:
         WHERE id IN (
             SELECT id FROM cards
             WHERE status='pending'
-            ORDER BY set_slug, id
+            ORDER BY set_slug DESC, id
             LIMIT %s
             FOR UPDATE SKIP LOCKED
         )
@@ -228,7 +228,7 @@ def get_errored_cards(limit: int = 500) -> list[dict]:
         WHERE id IN (
             SELECT id FROM cards
             WHERE status='error'
-            ORDER BY set_slug, id
+            ORDER BY set_slug DESC, id
             LIMIT %s
             FOR UPDATE SKIP LOCKED
         )
