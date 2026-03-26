@@ -33,7 +33,7 @@ LOGIN_URL = f"{BASE_URL}/login"
 # ── Database ──────────────────────────────────────────────────────────────
 # PostgreSQL connection string. Set via env var or edit directly.
 #   Example: postgresql://user:pass@192.168.1.14:5432/sportscards
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/sportscards")
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:changeme@192.168.1.14:5433/sportscards")
 
 # ── Paths ─────────────────────────────────────────────────────────────────
 # Set SCP_DATA_DIR env var to use a shared/network drive, e.g.:
