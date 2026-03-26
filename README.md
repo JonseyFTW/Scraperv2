@@ -138,29 +138,29 @@ python embeddings.py stats           # Show embedding coverage
 
 ## Migrating Embeddings to Railway
 
-Once embeddings are generated locally, sync them to your production ChromaDB on Railway:
+Once embeddings are generated locally, sync them to your production ChromaDB on Railway.
+Railway uses an Auth Proxy in front of ChromaDB — pass the API key with `--token`.
 
 ```bash
 # Preview what would be migrated
-python migrate_chroma.py --target http://your-railway-chroma:8000 --dry-run
+python migrate_chroma.py --target https://auth-proxy-alpha.up.railway.app --token YOUR_API_KEY --dry-run
 
 # Run the migration
-python migrate_chroma.py --target http://your-railway-chroma:8000
-
-# With auth token (if your Railway ChromaDB requires it)
-python migrate_chroma.py --target http://your-railway-chroma:8000 --token your_token
+python migrate_chroma.py --target https://auth-proxy-alpha.up.railway.app --token YOUR_API_KEY
 
 # Custom batch size
-python migrate_chroma.py --target http://your-railway-chroma:8000 --batch-size 500
+python migrate_chroma.py --target https://auth-proxy-alpha.up.railway.app --token YOUR_API_KEY --batch-size 500
 ```
 
 You can also set env vars instead of flags:
 
 ```bash
-export CHROMA_TARGET_URL=http://your-railway-chroma:8000
-export CHROMA_TARGET_TOKEN=your_token
+export CHROMA_TARGET_URL=https://auth-proxy-alpha.up.railway.app
+export CHROMA_TARGET_TOKEN=YOUR_API_KEY
 python migrate_chroma.py
 ```
+
+The API key is found in Railway under: ChromaDB project → Auth Proxy service → Variables → `API_KEY`.
 
 The migration is **incremental** — it skips embeddings already present on the remote, so you can run it repeatedly as you scrape new cards.
 

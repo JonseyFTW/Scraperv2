@@ -57,7 +57,13 @@ def show_stats():
     table.add_section()
     table.add_row("Cards (total)", str(stats["total_cards"]))
     table.add_row("  Pending image scrape", str(stats["cards_pending"]))
+    processing = stats.get("cards_processing", 0)
+    if processing:
+        table.add_row("  Processing (claimed)", str(processing))
     table.add_row("  Image URL found", str(stats["cards_image_found"]))
+    downloading = stats.get("cards_downloading", 0)
+    if downloading:
+        table.add_row("  Downloading (claimed)", str(downloading))
     table.add_row("  Downloaded", str(stats["cards_downloaded"]))
     table.add_row("  No image available", str(stats["cards_no_image"]))
     table.add_row("  Errors", str(stats["cards_error"]))
@@ -70,9 +76,9 @@ def show_stats():
         table.add_row("Image completion", f"{pct:.1f}%")
 
     # Per-sport breakdown
-    sport_keys = [k for k in stats if k.startswith("cards_") and k not in (
-        "cards_pending", "cards_image_found", "cards_downloaded", "cards_no_image", "cards_error"
-    )]
+    status_keys = {"cards_pending", "cards_processing", "cards_image_found",
+                   "cards_downloading", "cards_downloaded", "cards_no_image", "cards_error"}
+    sport_keys = [k for k in stats if k.startswith("cards_") and k not in status_keys]
     if sport_keys:
         table.add_section()
         for k in sorted(sport_keys):
