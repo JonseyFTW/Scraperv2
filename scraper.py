@@ -58,7 +58,17 @@ async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
 
     launch_kwargs = dict(
         headless=config.HEADLESS,
-        args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--ignore-certificate-errors"],
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--ignore-certificate-errors",
+            "--disable-dev-shm-usage",
+            "--disable-infobars",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--window-size=1920,1080",
+        ],
     )
     if chromium_path:
         launch_kwargs["executable_path"] = chromium_path
@@ -77,14 +87,57 @@ async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
         launch_kwargs["proxy"] = proxy_config
 
     browser = await playwright.chromium.launch(**launch_kwargs)
+
+    # Realistic browser context with WebGL and platform spoofing
+    ua = random.choice(config.USER_AGENTS)
     context = await browser.new_context(
-        user_agent=random.choice(config.USER_AGENTS),
+        user_agent=ua,
         viewport={"width": 1920, "height": 1080},
+        screen={"width": 1920, "height": 1080},
         locale="en-US",
         timezone_id="America/Chicago",
         accept_downloads=True,  # Required for CSV downloads
         ignore_https_errors=True,
+        color_scheme="light",
+        java_script_enabled=True,
+        has_touch=False,
+        is_mobile=False,
     )
+
+    # Override navigator properties to look more human
+    await context.add_init_script("""
+        // Hide webdriver flag
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+        // Realistic plugins array (Chrome normally has these)
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5]
+        });
+
+        // Realistic languages
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en']
+        });
+
+        // Fix chrome object (headless Chrome is missing this)
+        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+
+        // Fix permissions query
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) =>
+            parameters.name === 'notifications'
+                ? Promise.resolve({ state: Notification.permission })
+                : originalQuery(parameters);
+
+        // Spoof WebGL renderer
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Intel Inc.';
+            if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+            return getParameter.apply(this, arguments);
+        };
+    """)
+
     return browser, context
 
 
