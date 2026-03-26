@@ -31,10 +31,12 @@ LOGIN_PASSWORD = os.environ.get("SCP_PASSWORD", "")
 LOGIN_URL = f"{BASE_URL}/login"
 
 # ── Paths ─────────────────────────────────────────────────────────────────
+# Set SCP_DATA_DIR env var to use a shared/network drive, e.g.:
+#   set SCP_DATA_DIR=\\192.168.1.14\Data\scraper
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(PROJECT_DIR, "data")
+DATA_DIR = os.environ.get("SCP_DATA_DIR") or os.path.join(PROJECT_DIR, "data")
 CSV_DIR = os.path.join(DATA_DIR, "csvs")
-IMAGE_DIR = os.path.join(PROJECT_DIR, "images")
+IMAGE_DIR = os.path.join(DATA_DIR, "images")
 DB_PATH = os.path.join(DATA_DIR, "sportscards.db")
 CHROMA_DIR = os.path.join(DATA_DIR, "chromadb")
 
