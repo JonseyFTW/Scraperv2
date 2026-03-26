@@ -94,6 +94,47 @@ async def new_stealth_page(context: BrowserContext) -> Page:
     return page
 
 
+async def _solve_cloudflare(page: Page):
+    """Try to click the Cloudflare Turnstile 'Verify you are human' checkbox."""
+    for attempt in range(3):
+        try:
+            # Turnstile checkbox lives inside an iframe
+            cf_frame = None
+            for frame in page.frames:
+                if "challenges.cloudflare.com" in (frame.url or ""):
+                    cf_frame = frame
+                    break
+
+            if cf_frame:
+                # Wait for the checkbox to appear and click it
+                checkbox = cf_frame.locator("input[type='checkbox']")
+                if await checkbox.count() > 0:
+                    await checkbox.first.click()
+                    console.print("  [green]Clicked Turnstile checkbox[/green]")
+                else:
+                    # Some Turnstile versions use a label/div instead
+                    label = cf_frame.locator("label, .cb-lb")
+                    if await label.count() > 0:
+                        await label.first.click()
+                        console.print("  [green]Clicked Turnstile label[/green]")
+
+            # Wait for the challenge to resolve
+            await asyncio.sleep(config.CLOUDFLARE_WAIT)
+
+            # Check if challenge is gone
+            content = await page.content()
+            if "challenge-platform" not in content and "Just a moment" not in content:
+                console.print("  [green]Cloudflare challenge passed![/green]")
+                return
+        except Exception as e:
+            console.print(f"  [dim]Turnstile attempt {attempt+1}: {e}[/dim]")
+            await asyncio.sleep(3)
+
+    console.print("  [yellow]Could not auto-solve — solve manually if in headed mode[/yellow]")
+    # Give extra time for manual solving in headed mode
+    await asyncio.sleep(15)
+
+
 async def safe_goto(page: Page, url: str, wait_for_cf: bool = False) -> bool:
     for attempt in range(config.MAX_RETRIES):
         try:
@@ -103,8 +144,8 @@ async def safe_goto(page: Page, url: str, wait_for_cf: bool = False) -> bool:
 
             content = await page.content()
             if "challenge-platform" in content or "Just a moment" in content:
-                console.print("  [yellow]Cloudflare challenge, waiting...[/yellow]")
-                await asyncio.sleep(config.CLOUDFLARE_WAIT)
+                console.print("  [yellow]Cloudflare challenge, attempting to solve...[/yellow]")
+                await _solve_cloudflare(page)
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=15000)
                 except:
