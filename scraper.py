@@ -589,8 +589,10 @@ async def scrape_card_images(page: Page, limit: int = 0):
     This bypasses Cloudflare since the browser context already has CF cookies.
     Processes ~10-25 cards/sec depending on rate limiting.
     """
-    FETCH_BATCH = 4           # parallel fetches per batch (avoid rate limit)
-    BATCH_DELAY = 3         # seconds between batches
+    FETCH_BATCH = 2           # parallel fetches per batch (lower = less suspicious)
+    BATCH_DELAY_MIN = 4       # min seconds between batches
+    BATCH_DELAY_MAX = 8       # max seconds between batches
+    CF_REFRESH_EVERY = 25     # re-validate CF cookies every N batches
     DB_BATCH    = 500         # cards per DB fetch
     total_ok    = 0
     total_no_image = 0
@@ -598,8 +600,10 @@ async def scrape_card_images(page: Page, limit: int = 0):
 
     console.print(f"\n[bold]Phase 4: Scraping image URLs via in-browser fetch ({FETCH_BATCH}x parallel)[/bold]\n")
 
-    # Navigate to any SCP page first to establish CF cookies
+    # Navigate to a real SCP page to establish CF cookies + warm up
+    console.print("  [cyan]Warming up browser session...[/cyan]")
     await safe_goto(page, f"{config.BASE_URL}/login", wait_for_cf=True)
+    await asyncio.sleep(random.uniform(3, 6))  # Human-like pause after page load
 
     while True:
         cards = db.get_cards_needing_images(DB_BATCH)
@@ -622,12 +626,20 @@ async def scrape_card_images(page: Page, limit: int = 0):
         ) as progress:
             ptask = progress.add_task("Images", total=len(cards))
 
+            batch_count = 0
             for i in range(0, len(cards), FETCH_BATCH):
                 batch = cards[i:i + FETCH_BATCH]
                 urls = [c["full_url"] for c in batch]
                 pids = [str(c["product_id"]) for c in batch]
+                batch_count += 1
 
-                progress.update(ptask, description=f"Img: batch {i//FETCH_BATCH+1}")
+                # Periodically refresh CF cookies by navigating to a real page
+                if batch_count % CF_REFRESH_EVERY == 0:
+                    progress.update(ptask, description="Refreshing session...")
+                    await safe_goto(page, f"{config.BASE_URL}/category/football-cards", wait_for_cf=True)
+                    await asyncio.sleep(random.uniform(3, 6))
+
+                progress.update(ptask, description=f"Img: batch {batch_count}")
 
                 try:
                     results = await page.evaluate("""async (urls) => {
@@ -635,11 +647,15 @@ async def scrape_card_images(page: Page, limit: int = 0):
                         return Promise.all(urls.map(async (url) => {
                             try {
                                 const resp = await fetch(url);
+                                if (resp.status === 403) return {hash: null, reason: 'cf_blocked'};
                                 if (resp.status !== 200) return {hash: null, reason: 'http_' + resp.status};
                                 const html = await resp.text();
+                                // Detect CF challenge in response body
+                                if (html.includes('challenge-platform') || html.includes('Just a moment')) {
+                                    return {hash: null, reason: 'cf_challenge'};
+                                }
                                 const match = html.match(re);
                                 if (match) return {hash: match[1], reason: null};
-                                // Check if page loaded but has no card image
                                 if (html.includes('pricecharting.com') || html.includes('sportscardspro.com')) {
                                     return {hash: null, reason: 'no_image_on_page'};
                                 }
@@ -649,6 +665,13 @@ async def scrape_card_images(page: Page, limit: int = 0):
                     }""", urls)
                 except Exception:
                     results = [{"hash": None, "reason": "evaluate_error"}] * len(batch)
+
+                # If we got CF blocked, pause and refresh the session
+                cf_hits = sum(1 for r in results if isinstance(r, dict) and r.get("reason") in ("cf_blocked", "cf_challenge"))
+                if cf_hits > 0:
+                    console.print(f"  [yellow]Cloudflare blocked {cf_hits}/{len(batch)} — refreshing session...[/yellow]")
+                    await safe_goto(page, f"{config.BASE_URL}/category/football-cards", wait_for_cf=True)
+                    await asyncio.sleep(random.uniform(10, 20))  # Longer cooldown after CF block
 
                 for card, result in zip(batch, results):
                     pid = card["product_id"]
@@ -669,7 +692,7 @@ async def scrape_card_images(page: Page, limit: int = 0):
                         total_error += 1
 
                 progress.advance(ptask, len(batch))
-                await asyncio.sleep(BATCH_DELAY)
+                await asyncio.sleep(random.uniform(BATCH_DELAY_MIN, BATCH_DELAY_MAX))
 
         console.print(f"  Batch done -- OK: [green]{total_ok}[/green], No image: [yellow]{total_no_image}[/yellow], Errors: [red]{total_error}[/red]")
 

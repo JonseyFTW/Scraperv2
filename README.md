@@ -164,6 +164,52 @@ The API key is found in Railway under: ChromaDB project → Auth Proxy service �
 
 The migration is **incremental** — it skips embeddings already present on the remote, so you can run it repeatedly as you scrape new cards.
 
+## LXC Container Management
+
+### Creating a new LXC scraper container
+
+Run the interactive setup wizard from the Proxmox host shell:
+
+```bash
+bash setup_scraper_lxc.sh
+```
+
+This walks you through CTID, CPU/RAM, NordVPN, database credentials, and NFS mount configuration.
+
+### Updating a container
+
+Pull the latest scraper code from git:
+
+```bash
+# From Proxmox host
+pct exec <CTID> -- scraper update
+
+# Or from inside the container
+scraper update
+```
+
+### Running the scraper
+
+```bash
+# From Proxmox host
+pct exec <CTID> -- scraper --phase 5 --sport football
+
+# From inside the container
+scraper --phase 5 --sport football
+```
+
+Multiple containers can run simultaneously — PostgreSQL row-level locking (`FOR UPDATE SKIP LOCKED`) ensures no two workers process the same cards.
+
+### Other container commands
+
+```bash
+scraper vpn          # Show NordVPN connection status
+scraper --stats      # Show scrape progress
+scraper --reset-errors  # Reset failed cards for retry
+```
+
+> **Note:** Phase 4 (image URL scraping) requires a browser and should be run from your Windows PC with `--headed`. LXC containers are best for Phase 5 (HTTP image downloads) which doesn't need a browser.
+
 ## URL Patterns
 
 The site follows consistent URL patterns:
