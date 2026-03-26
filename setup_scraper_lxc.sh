@@ -150,8 +150,8 @@ fi
 header_info
 
 NAS_SHARE=$(whiptail --title "$APP — Shared Image Storage" \
-    --inputbox "NFS/SMB share path on your NAS for images + CSVs:\n\n(This is where ALL containers save images so your GPU\nmachine can access them for embedding generation)\n\nNFS example: 192.168.1.14:/Data/scraper" \
-    14 70 "192.168.1.14:/Data/scraper" 3>&1 1>&2 2>&3) || exit 1
+    --inputbox "NFS/SMB share path on your NAS for images + CSVs:\n\n(This is where ALL containers save images so your GPU\nmachine can access them for embedding generation)\n\nNFS example: 192.168.1.14:/volume1/Data/scraper" \
+    14 70 "192.168.1.14:/volume1/Data/scraper" 3>&1 1>&2 2>&3) || exit 1
 
 SHARE_MOUNT="/mnt/scraper-data"
 
