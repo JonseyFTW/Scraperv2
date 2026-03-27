@@ -1316,6 +1316,99 @@ def _get_ext(url: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Phase 4b: Multi-source image search (fallback for SCP misses)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def scrape_card_images_multi_source(limit: int = 0, sources: list[str] | None = None):
+    """
+    Try alternative image sources for cards that SportsCardPro missed.
+    Checks: Wayback Machine, TCDB, COMC, eBay Browse API (in that order).
+
+    Targets cards with status 'no_image' or 'error' from Phase 4.
+    """
+    from image_sources import MultiSourceImageFinder
+
+    total_remaining = db.count_multi_source_candidates()
+    if total_remaining == 0:
+        console.print("[green]No cards needing multi-source image search.[/green]")
+        return
+
+    if limit > 0:
+        total_remaining = min(total_remaining, limit)
+
+    finder = MultiSourceImageFinder(sources=sources)
+    source_names = ", ".join(name for name, _ in finder.sources)
+
+    console.print(f"\n[bold]Phase 4b: Multi-source image search[/bold]")
+    console.print(f"  Sources: [cyan]{source_names}[/cyan]")
+    console.print(f"  [dim]{total_remaining:,} cards to search[/dim]\n")
+
+    DB_BATCH = 100
+    CONCURRENCY = 5
+    total_found = 0
+    total_not_found = 0
+    total_processed = 0
+    phase_start = time.time()
+
+    async with aiohttp.ClientSession(headers={
+        "User-Agent": config.USER_AGENTS[0],
+    }) as session:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Multi-source search", total=total_remaining)
+
+            while True:
+                cards = db.get_cards_for_multi_source(DB_BATCH)
+                if not cards:
+                    break
+
+                results = await finder.find_images_batch(session, cards, concurrency=CONCURRENCY)
+
+                for card, result in zip(cards, results):
+                    pid = card["product_id"]
+                    if result.image_url:
+                        db.update_card_image_source(pid, result.image_url, result.source)
+                        total_found += 1
+                    else:
+                        # Mark as no_image again — all sources exhausted
+                        db.mark_card_no_image(pid)
+                        total_not_found += 1
+
+                    total_processed += 1
+                    progress.advance(task)
+
+                    if limit > 0 and total_processed >= limit:
+                        break
+
+                if limit > 0 and total_processed >= limit:
+                    break
+
+    elapsed = time.time() - phase_start
+    console.print()
+    summary = Table.grid(padding=(0, 2))
+    summary.add_row("[bold]Phase 4b Complete — Multi-Source Results[/bold]")
+    summary.add_row(
+        f"  [green]✓ {total_found:,}[/green] found via alt sources",
+        f"[yellow]⊘ {total_not_found:,}[/yellow] not found anywhere",
+    )
+    summary.add_row(
+        f"  [bold]{total_processed:,}[/bold] total processed",
+        f"[dim]in {_format_eta(elapsed)}[/dim]",
+    )
+    console.print(Panel(summary, border_style="green" if total_found > 0 else "yellow"))
+
+    # Print per-source breakdown
+    console.print(f"\n  [dim]{finder.stats.summary()}[/dim]")
+    db.log_event("phase4b_complete", f"Found {total_found}, not found {total_not_found}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Full pipeline
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1355,6 +1448,9 @@ async def run_full_pipeline(sport: str = None, limit: int = 0):
     # Phase 4: Scrape image URLs via lightweight HTTP (no browser needed!)
     # Uses /offers?product={id} endpoint: ~38 KB vs ~289 KB, 20x concurrent
     await scrape_card_images(limit=limit)
+
+    # Phase 4b: Try alternative sources for cards SCP missed
+    await scrape_card_images_multi_source(limit=limit)
 
     # Phase 5: Download images (no browser)
     await download_images(limit)

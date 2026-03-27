@@ -56,6 +56,16 @@ RETRY_DELAY = 10.0
 IMAGE_DOWNLOAD_TIMEOUT = 15
 IMAGE_CONCURRENT_DOWNLOADS = 25  # Parallel image downloads (CDN, no CF)
 
+# ── Multi-source image search ───────────────────────────────────────────
+# Alternative sources tried when SportsCardPro has no image or is blocked.
+# Sources are tried in order; first one to find an image wins.
+MULTI_SOURCE_CONCURRENCY = 5      # Parallel card lookups across sources
+MULTI_SOURCE_DELAY = 0.5          # Delay between trying different sources
+
+# eBay Browse API credentials (optional — for eBay image source)
+EBAY_CLIENT_ID = os.environ.get("EBAY_CLIENT_ID", "")
+EBAY_CLIENT_SECRET = os.environ.get("EBAY_CLIENT_SECRET", "")
+
 # ── Browser ───────────────────────────────────────────────────────────────
 HEADLESS = True
 USER_AGENTS = [

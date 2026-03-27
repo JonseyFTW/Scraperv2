@@ -337,6 +337,55 @@ def mark_card_error(product_id: str, msg: str):
     conn.close()
 
 
+# ── Multi-source retry ────────────────────────────────────────────────────
+
+def get_cards_for_multi_source(limit: int = 500) -> list[dict]:
+    """Claim cards with no_image or error status for multi-source retry.
+    These are cards where SportsCardPro didn't have an image or failed."""
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        UPDATE cards SET status='processing', worker_id=%s
+        WHERE id IN (
+            SELECT id FROM cards
+            WHERE status IN ('no_image', 'error')
+            ORDER BY set_slug DESC, id
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *
+    """, (WORKER_ID, limit))
+    rows = cur.fetchall()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def count_multi_source_candidates() -> int:
+    """Count cards eligible for multi-source retry (no_image + error)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT count(*) FROM cards WHERE status IN ('no_image', 'error')")
+    count = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return count
+
+
+def update_card_image_source(product_id: str, image_url: str, source: str):
+    """Update a card with an image URL found via multi-source search."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE cards SET image_url=%s, status='image_found',
+        error_msg=%s WHERE product_id=%s
+    """, (image_url, f"found_via:{source}", product_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
 # ── Stats ─────────────────────────────────────────────────────────────────
 
 def get_stats() -> dict:

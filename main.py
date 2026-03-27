@@ -9,16 +9,20 @@ Usage:
     python main.py --phase 2                    # Download CSVs only
     python main.py --phase 3                    # Parse CSVs only (no browser)
     python main.py --phase 4                    # Scrape card pages for images
+    python main.py --phase 4b                   # Multi-source image search (alt sources)
     python main.py --phase 5                    # Download images only (no browser)
     python main.py --stats                      # Show progress
     python main.py --reset-errors               # Retry failed items
     python main.py --headed                     # Show browser window
     python main.py --limit 100                  # Process max N cards (phase 4/5)
+    python main.py --sources wayback,tcdb       # Pick which alt sources to use
 
 Environment variables:
-    SCP_EMAIL       Your SportsCardsPro login email
-    SCP_PASSWORD    Your SportsCardsPro password
-    DATABASE_URL    PostgreSQL connection string (default: postgresql://postgres:postgres@localhost:5432/sportscards)
+    SCP_EMAIL           Your SportsCardsPro login email
+    SCP_PASSWORD        Your SportsCardsPro password
+    DATABASE_URL        PostgreSQL connection string
+    EBAY_CLIENT_ID      eBay developer app ID (for eBay image source)
+    EBAY_CLIENT_SECRET  eBay developer secret (for eBay image source)
 """
 import argparse
 import asyncio
@@ -88,7 +92,7 @@ def show_stats():
     console.print(table)
 
 
-async def run_phase(phase: int, sport: str = None, limit: int = 0):
+async def run_phase(phase, sport: str = None, limit: int = 0, sources: list[str] | None = None):
     import database as db
     import scraper
 
@@ -102,6 +106,11 @@ async def run_phase(phase: int, sport: str = None, limit: int = 0):
     if phase == 5:
         # No browser needed
         await scraper.download_images(limit)
+        return
+
+    if phase == "4b":
+        # Multi-source image search — no browser needed
+        await scraper.scrape_card_images_multi_source(limit=limit, sources=sources)
         return
 
     from playwright.async_api import async_playwright
@@ -131,13 +140,15 @@ async def run_phase(phase: int, sport: str = None, limit: int = 0):
 
 def main():
     parser = argparse.ArgumentParser(description="SportsCardPro Scraper v2")
-    parser.add_argument("--phase", type=int, choices=[1, 2, 3, 4, 5],
-                        help="1=discover sets, 2=download CSVs, 3=parse CSVs, 4=scrape images, 5=download images")
+    parser.add_argument("--phase", type=str, choices=["1", "2", "3", "4", "4b", "5"],
+                        help="1=discover sets, 2=download CSVs, 3=parse CSVs, 4=scrape images, 4b=multi-source search, 5=download images")
     parser.add_argument("--sport", type=str,
                         choices=["baseball", "basketball", "football", "hockey",
                                  "racing", "soccer", "wrestling", "ufc"],
                         help="Limit to one sport")
     parser.add_argument("--limit", type=int, default=0, help="Max cards to process")
+    parser.add_argument("--sources", type=str, default=None,
+                        help="Comma-separated list of alt sources for phase 4b (wayback,tcdb,comc,ebay)")
     parser.add_argument("--stats", action="store_true", help="Show progress")
     parser.add_argument("--reset-errors", action="store_true", help="Reset errors to retry")
     parser.add_argument("--reset-no-image", action="store_true", help="Reset 'no image' cards to retry")
@@ -187,8 +198,10 @@ def main():
         cfg.HEADLESS = False
 
     if args.phase:
+        phase = args.phase if args.phase == "4b" else int(args.phase)
+        sources = args.sources.split(",") if args.sources else None
         console.print(f"Running phase {args.phase}")
-        asyncio.run(run_phase(args.phase, args.sport, args.limit))
+        asyncio.run(run_phase(phase, args.sport, args.limit, sources=sources))
     else:
         import scraper
         asyncio.run(scraper.run_full_pipeline(args.sport, args.limit))
