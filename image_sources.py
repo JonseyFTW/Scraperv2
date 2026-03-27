@@ -26,10 +26,12 @@ from dataclasses import dataclass, field
 from urllib.parse import quote, quote_plus, urljoin
 
 import aiohttp
+from rich.console import Console
 
 import config
 
 log = logging.getLogger(__name__)
+console = Console()
 
 # ── Shared helpers ────────────────────────────────────────────────────────
 
@@ -106,7 +108,7 @@ async def search_wayback(session: aiohttp.ClientSession, card: dict) -> SourceRe
         # Convert to raw mode: /web/TIMESTAMP/URL -> /web/TIMESTAMPid_/URL
         archive_url = re.sub(r'/web/(\d+)/', r'/web/\1id_/', archive_url)
 
-        async with session.get(archive_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.get(archive_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status != 200:
                 return SourceResult(source="wayback", error=f"archive fetch HTTP {resp.status}")
             html = await resp.text()
@@ -174,7 +176,7 @@ async def search_tcdb(session: aiohttp.ClientSession, card: dict) -> SourceResul
             "https://www.tcdb.com/Search.cfm/fu/1",
             params=params,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=15),
+            timeout=aiohttp.ClientTimeout(total=8),
             allow_redirects=True,
         ) as resp:
             if resp.status != 200:
@@ -216,7 +218,7 @@ async def _fetch_tcdb_card_page(session: aiohttp.ClientSession, url: str) -> Sou
         async with session.get(
             url,
             headers={**HEADERS, "Referer": "https://www.tcdb.com/"},
-            timeout=aiohttp.ClientTimeout(total=15),
+            timeout=aiohttp.ClientTimeout(total=8),
             allow_redirects=True,
         ) as resp:
             if resp.status != 200:
@@ -270,7 +272,7 @@ async def search_comc(session: aiohttp.ClientSession, card: dict) -> SourceResul
             search_url,
             params=params,
             headers={**HEADERS, "Referer": "https://www.comc.com/"},
-            timeout=aiohttp.ClientTimeout(total=15),
+            timeout=aiohttp.ClientTimeout(total=8),
             allow_redirects=True,
         ) as resp:
             if resp.status != 200:
@@ -309,7 +311,7 @@ async def _fetch_comc_card_page(session: aiohttp.ClientSession, url: str) -> Sou
         async with session.get(
             url,
             headers={**HEADERS, "Referer": "https://www.comc.com/"},
-            timeout=aiohttp.ClientTimeout(total=15),
+            timeout=aiohttp.ClientTimeout(total=8),
             allow_redirects=True,
         ) as resp:
             if resp.status != 200:
@@ -508,18 +510,23 @@ class MultiSourceImageFinder:
         Returns the first successful SourceResult, or the last failure.
         """
         last_result = SourceResult(source="none", error="no sources configured")
+        card_name = card.get("product_name", "?")[:50]
 
         for source_name, search_fn in self.sources:
-            result = await search_fn(session, card)
+            try:
+                result = await asyncio.wait_for(search_fn(session, card), timeout=12)
+            except asyncio.TimeoutError:
+                result = SourceResult(source=source_name, error="overall timeout")
 
             if result.image_url:
                 self.stats.found[source_name] = self.stats.found.get(source_name, 0) + 1
                 self.stats.total_found += 1
-                log.debug("Found image via %s for %s", source_name, card.get("product_name", "?"))
+                console.print(f"  [green]✓[/green] {source_name}: {card_name}")
                 return result
 
             if result.error:
                 self.stats.errors[source_name] = self.stats.errors.get(source_name, 0) + 1
+                console.print(f"  [dim]✗ {source_name}: {result.error[:60]}[/dim]")
             else:
                 self.stats.missed[source_name] = self.stats.missed.get(source_name, 0) + 1
 
