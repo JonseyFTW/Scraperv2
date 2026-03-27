@@ -611,6 +611,37 @@ async def _cycle_vpn():
         await asyncio.sleep(2)
         subprocess.run(["nordvpn", "connect"], capture_output=True, timeout=30)
         await asyncio.sleep(5)
+
+        # Ensure local network (192.168.1.0/24) stays reachable after VPN connects
+        # NordVPN can route everything through the tunnel, breaking DB access
+        try:
+            # Find the default gateway for local network
+            route_check = subprocess.run(
+                ["ip", "route", "show", "192.168.1.0/24"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if not route_check.stdout.strip():
+                # No local route — add one via the container's gateway
+                gw_result = subprocess.run(
+                    ["ip", "route", "show", "default"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                # Parse gateway from before VPN, or use common .1 gateway
+                gateway = "192.168.1.1"
+                for line in gw_result.stdout.split("\n"):
+                    if "192.168" in line and "via" in line:
+                        parts = line.split()
+                        gw_idx = parts.index("via") + 1
+                        gateway = parts[gw_idx]
+                        break
+                subprocess.run(
+                    ["ip", "route", "add", "192.168.1.0/24", "via", gateway],
+                    capture_output=True, timeout=5,
+                )
+                console.print(f"[green]  Added local route via {gateway}[/green]")
+        except Exception:
+            pass
+
         # Check new IP
         result = subprocess.run(["nordvpn", "status"], capture_output=True, text=True, timeout=10)
         for line in result.stdout.split("\n"):
