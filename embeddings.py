@@ -232,11 +232,26 @@ def generate_embeddings(limit: int = 0):
     # Ensure data is flushed to disk so other tools (migrate_chroma.py) can see it
     global _chroma_client, _chroma_collection
     final_count = collection.count()
+
+    # Force WAL checkpoint so all data is in the main sqlite file
     if _chroma_client is not None:
-        del _chroma_collection
-        del _chroma_client
-        _chroma_collection = None
-        _chroma_client = None
+        try:
+            import sqlite3
+            import glob
+            # Release ChromaDB's hold first
+            del _chroma_collection
+            del _chroma_client
+            _chroma_collection = None
+            _chroma_client = None
+
+            # Now checkpoint the WAL
+            for db_file in glob.glob(f"{config.CHROMA_DIR}/**/chroma.sqlite3", recursive=True):
+                conn = sqlite3.connect(db_file)
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.close()
+                console.print(f"[dim]WAL checkpointed: {db_file}[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]WAL checkpoint warning: {e}[/yellow]")
 
     console.print(f"\n[green]Generated {total} embeddings ({final_count} total in ChromaDB)[/green]")
     if _skipped_ids:
