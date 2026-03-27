@@ -174,7 +174,7 @@ class AdaptiveRateLimiter:
 
     def should_rotate_vpn(self) -> bool:
         """Check if too many 403s suggest IP is burned and VPN should cycle"""
-        if self.consecutive_403 >= 10:
+        if self.consecutive_403 >= 50:
             self.consecutive_403 = 0
             return True
         return False
