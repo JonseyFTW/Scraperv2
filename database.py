@@ -1,10 +1,16 @@
 """
 SportsCardPro Scraper v2 - Database Layer (PostgreSQL)
 """
+import os
+import socket
+
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timezone
 from config import DATABASE_URL
+
+# Worker identity — uses hostname so each LXC container is distinct
+WORKER_ID = os.environ.get("WORKER_ID", socket.gethostname())
 
 
 def get_connection():
@@ -55,10 +61,19 @@ def init_db():
             details     TEXT
         );
     """)
+    # Add worker_id column if missing (tracks which container processed each card)
+    cur.execute("""
+        DO $$ BEGIN
+            ALTER TABLE cards ADD COLUMN worker_id TEXT;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$;
+    """)
+
     # Create indexes (IF NOT EXISTS supported in PG 9.5+)
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_pid ON cards(product_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_set ON cards(set_slug)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_worker ON cards(worker_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_sets_csv ON sets(csv_status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_sets_img ON sets(img_status)")
     conn.commit()
@@ -202,7 +217,7 @@ def get_cards_needing_images(limit: int = 500) -> list[dict]:
     conn = get_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
-        UPDATE cards SET status='processing'
+        UPDATE cards SET status='processing', worker_id=%s
         WHERE id IN (
             SELECT id FROM cards
             WHERE status='pending'
@@ -211,7 +226,7 @@ def get_cards_needing_images(limit: int = 500) -> list[dict]:
             FOR UPDATE SKIP LOCKED
         )
         RETURNING *
-    """, (limit,))
+    """, (WORKER_ID, limit))
     rows = cur.fetchall()
     conn.commit()
     cur.close()
@@ -235,7 +250,7 @@ def get_errored_cards(limit: int = 500) -> list[dict]:
     conn = get_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
-        UPDATE cards SET status='processing'
+        UPDATE cards SET status='processing', worker_id=%s
         WHERE id IN (
             SELECT id FROM cards
             WHERE status='error'
@@ -244,7 +259,7 @@ def get_errored_cards(limit: int = 500) -> list[dict]:
             FOR UPDATE SKIP LOCKED
         )
         RETURNING *
-    """, (limit,))
+    """, (WORKER_ID, limit))
     rows = cur.fetchall()
     conn.commit()
     cur.close()
@@ -257,7 +272,7 @@ def get_cards_needing_download(limit: int = 500) -> list[dict]:
     conn = get_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
-        UPDATE cards SET status='downloading'
+        UPDATE cards SET status='downloading', worker_id=%s
         WHERE id IN (
             SELECT id FROM cards
             WHERE status='image_found' AND image_url IS NOT NULL
@@ -266,7 +281,7 @@ def get_cards_needing_download(limit: int = 500) -> list[dict]:
             FOR UPDATE SKIP LOCKED
         )
         RETURNING *
-    """, (limit,))
+    """, (WORKER_ID, limit))
     rows = cur.fetchall()
     conn.commit()
     cur.close()
@@ -346,6 +361,31 @@ def get_stats() -> dict:
     cur.close()
     conn.close()
     return s
+
+
+def get_worker_stats() -> list[dict]:
+    """Get card counts per worker/container."""
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT
+            COALESCE(worker_id, 'unassigned') AS worker,
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS processing,
+            SUM(CASE WHEN status = 'image_found' THEN 1 ELSE 0 END) AS image_found,
+            SUM(CASE WHEN status = 'downloading' THEN 1 ELSE 0 END) AS downloading,
+            SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded,
+            SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors,
+            SUM(CASE WHEN status = 'no_image' THEN 1 ELSE 0 END) AS no_image
+        FROM cards
+        WHERE worker_id IS NOT NULL
+        GROUP BY worker_id
+        ORDER BY total DESC
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return rows
 
 
 def reset_errors():
