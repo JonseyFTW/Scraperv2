@@ -184,16 +184,6 @@ class AdaptiveRateLimiter:
 # Session Management with curl_cffi
 # ═══════════════════════════════════════════════════════════════════════════
 
-class SessionManager:
-    """Manage multiple curl_cffi sessions with rotation"""
-    
-    def __init__(self):
-        self.sessions = []
-        self.current_index = 0
-        self.rate_limiter = AdaptiveRateLimiter()
-        self.browsers = _get_supported_browsers()
-
-
 # Cache browser detection globally — only probe once per process
 _supported_browsers_cache = None
 
@@ -223,7 +213,17 @@ def _get_supported_browsers() -> list:
     console.print(f"[dim]Supported browsers: {', '.join(supported)}[/dim]")
     _supported_browsers_cache = supported
     return supported
-        
+
+
+class SessionManager:
+    """Manage multiple curl_cffi sessions with rotation"""
+
+    def __init__(self):
+        self.sessions = []
+        self.current_index = 0
+        self.rate_limiter = AdaptiveRateLimiter()
+        self.browsers = _get_supported_browsers()
+
     async def create_session(self) -> AsyncSession:
         """Create a new session with random browser fingerprint"""
         browser = random.choice(self.browsers)
