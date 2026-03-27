@@ -622,13 +622,19 @@ async def apply_cdn_pattern(pattern: str, cdn_engine: CDNPatternEngine, limit: i
     console.print(f"[bold green]Phase 4 complete: {total_processed} image URLs generated with ZERO requests![/bold green]")
 
 
+import shutil
+
+_has_nordvpn = shutil.which("nordvpn") is not None
+
+
 async def _cycle_vpn():
     """Disconnect and reconnect NordVPN to get a fresh IP. Only works on Linux/LXC."""
+    if not _has_nordvpn:
+        return False
     import subprocess
     import platform
     if platform.system() != "Linux":
-        console.print("[yellow]VPN cycling only available on Linux containers[/yellow]")
-        return
+        return False
     try:
         console.print("[cyan]Cycling VPN for fresh IP...[/cyan]")
         subprocess.run(["nordvpn", "disconnect"], capture_output=True, timeout=10)
@@ -671,8 +677,10 @@ async def _cycle_vpn():
         for line in result.stdout.split("\n"):
             if "IP" in line or "Server" in line:
                 console.print(f"[green]  {line.strip()}[/green]")
+        return True
     except Exception as e:
         console.print(f"[yellow]VPN cycle failed: {e}[/yellow]")
+        return False
 
 
 async def scrape_with_curl_cffi(limit: int):
@@ -742,10 +750,16 @@ async def scrape_with_curl_cffi(limit: int):
                 if needs_rotation or session_mgr.rate_limiter.should_rotate_session():
                     session = await session_mgr.get_session(rotate=True)
 
-                # Cycle VPN if IP is burned (10+ consecutive 403s)
+                # Cycle VPN if IP is burned (50+ consecutive 403s)
                 if session_mgr.rate_limiter.should_rotate_vpn():
-                    await _cycle_vpn()
-                    session = await session_mgr.get_session(rotate=True)
+                    cycled = await _cycle_vpn()
+                    if cycled:
+                        session = await session_mgr.get_session(rotate=True)
+                    else:
+                        # No VPN available — long backoff to let blocks expire
+                        console.print("[yellow]No VPN available, waiting 60s for blocks to clear...[/yellow]")
+                        await asyncio.sleep(60)
+                        session = await session_mgr.get_session(rotate=True)
 
                 progress.advance(task, len(batch))
                 await session_mgr.rate_limiter.wait()
