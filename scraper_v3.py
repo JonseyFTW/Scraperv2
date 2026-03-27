@@ -139,6 +139,7 @@ class AdaptiveRateLimiter:
         self.max_delay = 10.0
         self.success_count = 0
         self.error_count = 0
+        self.consecutive_403 = 0
         self.last_403 = 0
         
     async def wait(self):
@@ -148,6 +149,7 @@ class AdaptiveRateLimiter:
     def on_success(self):
         """Reduce delay after successful requests"""
         self.success_count += 1
+        self.consecutive_403 = 0
         if self.success_count > 10:
             self.current_delay = max(self.base_delay, self.current_delay * 0.9)
             self.success_count = 0
@@ -156,6 +158,7 @@ class AdaptiveRateLimiter:
         """Increase delay after errors"""
         self.error_count += 1
         if status_code == 403:
+            self.consecutive_403 += 1
             self.last_403 = time.time()
             self.current_delay = min(self.max_delay, self.current_delay * 2)
         elif status_code == 429:
@@ -163,11 +166,18 @@ class AdaptiveRateLimiter:
         else:
             self.current_delay = min(self.max_delay, self.current_delay * 1.2)
         self.success_count = 0
-        
+
     def should_rotate_session(self) -> bool:
         """Check if we should rotate to a new session"""
-        return (self.error_count > 3 or 
+        return (self.error_count > 3 or
                 (self.last_403 and time.time() - self.last_403 < 300))
+
+    def should_rotate_vpn(self) -> bool:
+        """Check if too many 403s suggest IP is burned and VPN should cycle"""
+        if self.consecutive_403 >= 10:
+            self.consecutive_403 = 0
+            return True
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -588,6 +598,28 @@ async def apply_cdn_pattern(pattern: str, cdn_engine: CDNPatternEngine, limit: i
     console.print(f"[bold green]Phase 4 complete: {total_processed} image URLs generated with ZERO requests![/bold green]")
 
 
+async def _cycle_vpn():
+    """Disconnect and reconnect NordVPN to get a fresh IP. Only works on Linux/LXC."""
+    import subprocess
+    import platform
+    if platform.system() != "Linux":
+        console.print("[yellow]VPN cycling only available on Linux containers[/yellow]")
+        return
+    try:
+        console.print("[cyan]Cycling VPN for fresh IP...[/cyan]")
+        subprocess.run(["nordvpn", "disconnect"], capture_output=True, timeout=10)
+        await asyncio.sleep(2)
+        subprocess.run(["nordvpn", "connect"], capture_output=True, timeout=30)
+        await asyncio.sleep(5)
+        # Check new IP
+        result = subprocess.run(["nordvpn", "status"], capture_output=True, text=True, timeout=10)
+        for line in result.stdout.split("\n"):
+            if "IP" in line or "Server" in line:
+                console.print(f"[green]  {line.strip()}[/green]")
+    except Exception as e:
+        console.print(f"[yellow]VPN cycle failed: {e}[/yellow]")
+
+
 async def scrape_with_curl_cffi(limit: int):
     """Fallback scraping using curl_cffi for fast parallel requests"""
     console.print("[yellow]Using curl_cffi for image URL scraping[/yellow]")
@@ -649,6 +681,11 @@ async def scrape_with_curl_cffi(limit: int):
 
                 # Rotate session if we're getting blocked
                 if needs_rotation or session_mgr.rate_limiter.should_rotate_session():
+                    session = await session_mgr.get_session(rotate=True)
+
+                # Cycle VPN if IP is burned (10+ consecutive 403s)
+                if session_mgr.rate_limiter.should_rotate_vpn():
+                    await _cycle_vpn()
                     session = await session_mgr.get_session(rotate=True)
 
                 progress.advance(task, len(batch))
