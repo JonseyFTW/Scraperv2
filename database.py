@@ -3,28 +3,64 @@ SportsCardPro Scraper v2 - Database Layer (PostgreSQL)
 """
 import os
 import socket
+import threading
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from datetime import datetime, timezone
 from config import DATABASE_URL
 
 # Worker identity — uses hostname so each LXC container is distinct
 WORKER_ID = os.environ.get("WORKER_ID", socket.gethostname())
 
+# ── Connection pool ──────────────────────────────────────────────────────
+# ThreadedConnectionPool is thread-safe; min 2 connections, max 10.
+_pool = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool():
+    global _pool
+    if _pool is None or _pool.closed:
+        with _pool_lock:
+            if _pool is None or _pool.closed:
+                _pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=2,
+                    maxconn=10,
+                    dsn=DATABASE_URL,
+                    connect_timeout=10,
+                )
+    return _pool
+
 
 def get_connection(retries=3):
+    """Get a connection from the pool (falls back to direct connect on pool error)."""
     for attempt in range(retries):
         try:
-            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            pool = _get_pool()
+            conn = pool.getconn()
             conn.autocommit = False
             return conn
-        except psycopg2.OperationalError:
+        except (psycopg2.OperationalError, psycopg2.pool.PoolError):
             if attempt < retries - 1:
                 import time
                 time.sleep(2 ** attempt)
             else:
                 raise
+
+
+def put_connection(conn):
+    """Return a connection to the pool instead of closing it."""
+    try:
+        pool = _get_pool()
+        pool.putconn(conn)
+    except Exception:
+        # If pool is broken, just close it directly
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def init_db():
@@ -86,7 +122,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_sets_img ON sets(img_status)")
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 def log_event(event: str, details: str = None):
@@ -98,7 +134,7 @@ def log_event(event: str, details: str = None):
     )
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 # ── Set operations ────────────────────────────────────────────────────────
@@ -113,7 +149,7 @@ def upsert_set(slug: str, name: str, sport: str, url: str):
     """, (slug, name, sport, url))
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 def bulk_upsert_sets(sets_data: list[tuple]):
@@ -127,7 +163,7 @@ def bulk_upsert_sets(sets_data: list[tuple]):
     """, sets_data)
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 def get_sets_needing_csv(sport: str = None) -> list[dict]:
@@ -143,7 +179,7 @@ def get_sets_needing_csv(sport: str = None) -> list[dict]:
         )
     rows = cur.fetchall()
     cur.close()
-    conn.close()
+    put_connection(conn)
     return [dict(r) for r in rows]
 
 
@@ -153,7 +189,7 @@ def get_sets_needing_parse() -> list[dict]:
     cur.execute("SELECT * FROM sets WHERE csv_status='downloaded' ORDER BY slug")
     rows = cur.fetchall()
     cur.close()
-    conn.close()
+    put_connection(conn)
     return [dict(r) for r in rows]
 
 
@@ -165,7 +201,7 @@ def mark_set_csv_downloaded(slug: str, csv_path: str):
     """, (csv_path, datetime.now(timezone.utc).isoformat(), slug))
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 def mark_set_csv_parsed(slug: str, card_count: int):
@@ -176,7 +212,7 @@ def mark_set_csv_parsed(slug: str, card_count: int):
     """, (card_count, datetime.now(timezone.utc).isoformat(), slug))
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 def mark_set_csv_error(slug: str):
@@ -185,7 +221,7 @@ def mark_set_csv_error(slug: str):
     cur.execute("UPDATE sets SET csv_status='error' WHERE slug=%s", (slug,))
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 def mark_set_images_scraped(slug: str):
@@ -196,7 +232,7 @@ def mark_set_images_scraped(slug: str):
     """, (datetime.now(timezone.utc).isoformat(), slug))
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 # ── Card operations ───────────────────────────────────────────────────────
@@ -216,7 +252,7 @@ def bulk_insert_cards(cards: list[dict]):
     """, cards)
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 def get_cards_needing_images(limit: int = 500) -> list[dict]:
@@ -238,7 +274,7 @@ def get_cards_needing_images(limit: int = 500) -> list[dict]:
     rows = cur.fetchall()
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
     return [dict(r) for r in rows]
 
 
@@ -249,7 +285,7 @@ def count_pending_images() -> int:
     cur.execute("SELECT count(*) FROM cards WHERE status = 'pending'")
     count = cur.fetchone()[0]
     cur.close()
-    conn.close()
+    put_connection(conn)
     return count
 
 
@@ -271,7 +307,7 @@ def get_errored_cards(limit: int = 500) -> list[dict]:
     rows = cur.fetchall()
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
     return [dict(r) for r in rows]
 
 
@@ -293,7 +329,7 @@ def get_cards_needing_download(limit: int = 500) -> list[dict]:
     rows = cur.fetchall()
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
     return [dict(r) for r in rows]
 
 
@@ -305,7 +341,7 @@ def update_card_image_url(product_id: str, image_url: str):
     """, (image_url, product_id))
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 def mark_card_downloaded(product_id: str, image_path: str):
@@ -316,7 +352,7 @@ def mark_card_downloaded(product_id: str, image_path: str):
     """, (image_path, product_id))
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 def mark_card_no_image(product_id: str):
@@ -325,7 +361,7 @@ def mark_card_no_image(product_id: str):
     cur.execute("UPDATE cards SET status='no_image' WHERE product_id=%s", (product_id,))
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 def mark_card_error(product_id: str, msg: str):
@@ -334,7 +370,7 @@ def mark_card_error(product_id: str, msg: str):
     cur.execute("UPDATE cards SET status='error', error_msg=%s WHERE product_id=%s", (msg, product_id))
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────
@@ -367,7 +403,7 @@ def get_stats() -> dict:
         s[f"cards_{sp['sport']}"] = cur.fetchone()["c"]
 
     cur.close()
-    conn.close()
+    put_connection(conn)
     return s
 
 
@@ -392,7 +428,7 @@ def get_worker_stats() -> list[dict]:
     """)
     rows = [dict(r) for r in cur.fetchall()]
     cur.close()
-    conn.close()
+    put_connection(conn)
     return rows
 
 
@@ -406,7 +442,7 @@ def reset_errors():
     cur.execute("UPDATE cards SET status='image_found' WHERE status='downloading'")
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
 
 
 def reset_no_image():
@@ -418,7 +454,7 @@ def reset_no_image():
     cur.execute("UPDATE cards SET status='pending' WHERE status='no_image'")
     conn.commit()
     cur.close()
-    conn.close()
+    put_connection(conn)
     return count
 
 
@@ -439,5 +475,5 @@ def get_image_failure_stats() -> dict:
     if no_img:
         stats["no_image (confirmed)"] = no_img
     cur.close()
-    conn.close()
+    put_connection(conn)
     return stats
