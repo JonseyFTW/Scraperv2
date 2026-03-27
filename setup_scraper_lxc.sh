@@ -146,14 +146,23 @@ if [[ "$NORD_SERVER" == "custom" ]]; then
         10 60 "" 3>&1 1>&2 2>&3) || exit 1
 fi
 
-# ── Step 6: Database ─────────────────────────────────────────────────────
+# ── Step 6: Shared storage (images + CSVs) ───────────────────────────────
+header_info
+
+NAS_SHARE=$(whiptail --title "$APP — Shared Image Storage" \
+    --inputbox "NFS/SMB share path on your NAS for images + CSVs:\n\n(This is where ALL containers save images so your GPU\nmachine can access them for embedding generation)\n\nNFS example: 192.168.1.14:/volume1/Data/scraper" \
+    14 70 "192.168.1.14:/volume1/Data/scraper" 3>&1 1>&2 2>&3) || exit 1
+
+SHARE_MOUNT="/mnt/scraper-data"
+
+# ── Step 7: Database ─────────────────────────────────────────────────────
 header_info
 
 DB_URL=$(whiptail --title "$APP — PostgreSQL" \
     --inputbox "PostgreSQL connection string:\n\n(Your UGREEN NAS)" \
     10 70 "postgresql://postgres:changeme@192.168.1.14:5433/sportscards" 3>&1 1>&2 2>&3) || exit 1
 
-# ── Step 7: SportsCardsPro credentials ───────────────────────────────────
+# ── Step 8: SportsCardsPro credentials ───────────────────────────────────
 header_info
 
 SCP_EMAIL=$(whiptail --title "$APP — SportsCardsPro Login" \
@@ -177,10 +186,11 @@ whiptail --title "$APP — Confirm Setup" --yesno \
   Disk:           ${DISK_SIZE}GB on $STORAGE
   Bridge:         $BRIDGE
   VPN Server:     $NORD_SERVER
+  Shared Storage: $NAS_SHARE → $SHARE_MOUNT
   Database:       $(echo "$DB_URL" | sed 's|://[^@]*@|://***@|')
   SCP Account:    $SCP_EMAIL
 
-Proceed?" 20 64 || exit 1
+Proceed?" 22 68 || exit 1
 
 # ══════════════════════════════════════════════════════════════════════════
 #  INSTALLATION
@@ -228,6 +238,33 @@ pct exec "$CTID" -- ping -c 1 -W 2 1.1.1.1 &>/dev/null || { msg_error "No networ
 CT_IP=$(pct exec "$CTID" -- hostname -I | awk '{print $1}')
 msg_ok "Network ready (IP: $CT_IP)"
 
+# ── Mount shared NAS storage ─────────────────────────────────────────────
+msg_info "Mounting shared storage ($NAS_SHARE)"
+pct exec "$CTID" -- bash -c "
+    apt-get install -y -qq nfs-common &>/dev/null
+    mkdir -p ${SHARE_MOUNT}
+    echo '${NAS_SHARE} ${SHARE_MOUNT} nfs defaults,_netdev 0 0' >> /etc/fstab
+    mount ${SHARE_MOUNT}
+"
+if pct exec "$CTID" -- mountpoint -q "$SHARE_MOUNT" 2>/dev/null; then
+    msg_ok "Shared storage mounted at $SHARE_MOUNT"
+else
+    msg_error "NFS mount failed — trying SMB/CIFS instead"
+    pct exec "$CTID" -- bash -c "
+        apt-get install -y -qq cifs-utils &>/dev/null
+        # Remove failed NFS entry
+        sed -i '\|${NAS_SHARE}|d' /etc/fstab
+        # Try SMB mount (guest/no password)
+        echo '//${NAS_SHARE#*:} ${SHARE_MOUNT} cifs guest,_netdev,uid=0,gid=0 0 0' >> /etc/fstab
+        mount ${SHARE_MOUNT}
+    " 2>/dev/null
+    if pct exec "$CTID" -- mountpoint -q "$SHARE_MOUNT" 2>/dev/null; then
+        msg_ok "Shared storage mounted via SMB at $SHARE_MOUNT"
+    else
+        msg_error "Could not mount shared storage — you may need to mount manually"
+    fi
+fi
+
 # ── Install system packages ──────────────────────────────────────────────
 msg_info "Installing system packages (this takes a few minutes)"
 pct exec "$CTID" -- bash -c '
@@ -237,7 +274,12 @@ pct exec "$CTID" -- bash -c '
         python3 python3-pip python3-venv \
         git curl wget gnupg2 apt-transport-https \
         libpq-dev build-essential \
-        ca-certificates &>/dev/null
+        ca-certificates \
+        libgtk-3-0 libdbus-glib-1-2 libasound2t64 \
+        libxcomposite1 libxdamage1 libxrandr2 \
+        libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+        libdrm2 libgbm1 libpango-1.0-0 libcairo2 \
+        libnspr4 libnss3 xvfb &>/dev/null
 '
 msg_ok "System packages installed"
 
@@ -279,6 +321,9 @@ pct exec "$CTID" -- bash -c "
     python3 -m venv venv
     source venv/bin/activate
     pip install -q -r requirements.txt 2>/dev/null
+    # Camoufox (anti-detect Firefox) — primary browser for CF bypass
+    python -m camoufox fetch 2>/dev/null || true
+    # Playwright chromium as fallback
     playwright install chromium &>/dev/null
     playwright install-deps chromium &>/dev/null
 "
@@ -288,19 +333,46 @@ msg_ok "Scraper installed"
 msg_info "Writing configuration"
 pct exec "$CTID" -- bash -c "cat > ${INSTALL_DIR}/.env << 'ENVEOF'
 DATABASE_URL=${DB_URL}
+SCP_DATA_DIR=${SHARE_MOUNT}
 SCP_EMAIL=${SCP_EMAIL}
 SCP_PASSWORD=${SCP_PASSWORD}
 ENVEOF"
 
-# Helper command
-pct exec "$CTID" -- bash -c "cat > /usr/local/bin/scraper << 'SCRIPTEOF'
+# Helper command with update support — write to temp file then push
+# (avoids bash history expansion issues with #!/bin/bash inside pct exec)
+cat > /tmp/scraper_helper_${CTID}.sh << HELPEREOF
 #!/bin/bash
-cd ${INSTALL_DIR}
+INSTALL_DIR="${INSTALL_DIR}"
+cd "\$INSTALL_DIR"
 set -a; source .env; set +a
 source venv/bin/activate
-python main.py \"\$@\"
-SCRIPTEOF
-chmod +x /usr/local/bin/scraper"
+
+if [[ "\${1:-}" == "update" ]]; then
+    echo "Pulling latest changes..."
+    git pull origin ${REPO_BRANCH}
+    echo "Updating dependencies..."
+    pip install -q -r requirements.txt
+    # Fetch Camoufox browser binary if camoufox is installed
+    if python -c "import camoufox" 2>/dev/null; then
+        echo "Fetching Camoufox browser..."
+        python -m camoufox fetch 2>/dev/null || true
+    fi
+    echo "Done! Scraper is up to date."
+    exit 0
+fi
+
+if [[ "\${1:-}" == "vpn" ]]; then
+    nordvpn status
+    exit 0
+fi
+
+python main.py "\$@"
+HELPEREOF
+
+pct push "$CTID" /tmp/scraper_helper_${CTID}.sh /usr/local/bin/scraper
+pct exec "$CTID" -- chmod +x /usr/local/bin/scraper
+pct exec "$CTID" -- ln -sf /usr/local/bin/scraper /usr/bin/scraper
+rm -f /tmp/scraper_helper_${CTID}.sh
 
 msg_ok "Configuration written"
 
@@ -318,6 +390,7 @@ echo ""
 echo -e "   ${BL}Container:${CL}   $CTID ($HOSTNAME)"
 echo -e "   ${BL}IP Address:${CL}  $CT_IP"
 echo -e "   ${BL}VPN Server:${CL}  $NORD_SERVER"
+echo -e "   ${BL}Images:${CL}      $NAS_SHARE → $SHARE_MOUNT"
 if [[ -n "$VPN_STATUS" ]]; then
     echo -e "   ${BL}VPN Status:${CL}"
     echo "$VPN_STATUS" | sed 's/^/                 /'

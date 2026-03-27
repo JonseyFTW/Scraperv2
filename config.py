@@ -54,7 +54,7 @@ PAGE_LOAD_TIMEOUT = 30000      # Playwright timeout in ms
 MAX_RETRIES = 3
 RETRY_DELAY = 10.0
 IMAGE_DOWNLOAD_TIMEOUT = 15
-IMAGE_CONCURRENT_DOWNLOADS = 5  # Parallel image downloads
+IMAGE_CONCURRENT_DOWNLOADS = 25  # Parallel image downloads (CDN, no CF)
 
 # ── Browser ───────────────────────────────────────────────────────────────
 HEADLESS = True

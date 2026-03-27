@@ -197,38 +197,78 @@ def bulk_insert_cards(cards: list[dict]):
 
 
 def get_cards_needing_images(limit: int = 500) -> list[dict]:
+    """Atomically claim a batch of pending cards for image scraping.
+    Uses FOR UPDATE SKIP LOCKED so multiple workers never get the same rows."""
     conn = get_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
-        SELECT * FROM cards WHERE status='pending' ORDER BY set_slug, id LIMIT %s
+        UPDATE cards SET status='processing'
+        WHERE id IN (
+            SELECT id FROM cards
+            WHERE status='pending'
+            ORDER BY set_slug DESC, id
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *
     """, (limit,))
     rows = cur.fetchall()
+    conn.commit()
     cur.close()
     conn.close()
     return [dict(r) for r in rows]
 
 
+def count_pending_images() -> int:
+    """Count how many cards still need image scraping (pending status)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT count(*) FROM cards WHERE status = 'pending'")
+    count = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return count
+
+
 def get_errored_cards(limit: int = 500) -> list[dict]:
-    """Get cards that errored during image scraping (rate-limited/blocked)."""
+    """Claim errored cards for retry. Uses SKIP LOCKED for concurrency."""
     conn = get_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
-        SELECT * FROM cards WHERE status='error' ORDER BY set_slug, id LIMIT %s
+        UPDATE cards SET status='processing'
+        WHERE id IN (
+            SELECT id FROM cards
+            WHERE status='error'
+            ORDER BY set_slug DESC, id
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *
     """, (limit,))
     rows = cur.fetchall()
+    conn.commit()
     cur.close()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def get_cards_needing_download(limit: int = 500) -> list[dict]:
+    """Claim cards for image download. Uses SKIP LOCKED for concurrency."""
     conn = get_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
-        SELECT * FROM cards WHERE status='image_found' AND image_url IS NOT NULL
-        ORDER BY id LIMIT %s
+        UPDATE cards SET status='downloading'
+        WHERE id IN (
+            SELECT id FROM cards
+            WHERE status='image_found' AND image_url IS NOT NULL
+            ORDER BY id
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *
     """, (limit,))
     rows = cur.fetchall()
+    conn.commit()
     cur.close()
     conn.close()
     return [dict(r) for r in rows]
@@ -289,7 +329,7 @@ def get_stats() -> dict:
 
     cur.execute("SELECT COUNT(*) AS c FROM cards")
     s["total_cards"] = cur.fetchone()["c"]
-    for st in ("pending", "image_found", "downloaded", "no_image", "error"):
+    for st in ("pending", "processing", "image_found", "downloading", "downloaded", "no_image", "error"):
         cur.execute("SELECT COUNT(*) AS c FROM cards WHERE status=%s", (st,))
         s[f"cards_{st}"] = cur.fetchone()["c"]
 
@@ -313,6 +353,9 @@ def reset_errors():
     cur = conn.cursor()
     cur.execute("UPDATE sets SET csv_status='pending' WHERE csv_status='error'")
     cur.execute("UPDATE cards SET status='pending', error_msg=NULL WHERE status='error'")
+    # Also reset any stuck processing/downloading cards (from crashed workers)
+    cur.execute("UPDATE cards SET status='pending' WHERE status='processing'")
+    cur.execute("UPDATE cards SET status='image_found' WHERE status='downloading'")
     conn.commit()
     cur.close()
     conn.close()

@@ -16,19 +16,15 @@ import re
 import random
 import glob
 import json
+import subprocess
+import shutil
+import time
 from urllib.parse import urljoin, urlparse
 from pathlib import Path
 
 import aiohttp
 import aiofiles
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
-try:
-    from playwright_stealth import stealth_async  # v1.x
-except ImportError:
-    from playwright_stealth import Stealth  # v2.x
-    _stealth_instance = Stealth()
-    async def stealth_async(page):
-        await _stealth_instance.apply_stealth_async(page)
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, MofNCompleteColumn
 from rich.live import Live
@@ -40,33 +36,114 @@ import database as db
 
 console = Console()
 
+# Try Camoufox first (best CF bypass), fall back to playwright-stealth
+_USE_CAMOUFOX = False
+try:
+    from camoufox.async_api import AsyncCamoufox
+    _USE_CAMOUFOX = True
+except ImportError:
+    AsyncCamoufox = None
+    try:
+        from playwright_stealth import stealth_async
+    except ImportError:
+        try:
+            from playwright_stealth import Stealth
+            _stealth_instance = Stealth()
+            async def stealth_async(page):
+                await _stealth_instance.apply_stealth_async(page)
+        except ImportError:
+            async def stealth_async(page):
+                pass  # No stealth available
+
+
+def _format_eta(seconds: float) -> str:
+    """Format seconds into a human-readable ETA like '3 days 12 hours 7 minutes'."""
+    if seconds <= 0:
+        return "done"
+    parts = []
+    days = int(seconds // 86400)
+    if days > 0:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    hours = int((seconds % 86400) // 3600)
+    if hours > 0:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    minutes = int((seconds % 3600) // 60)
+    if minutes > 0 or not parts:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    return " ".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VPN rotation
+# ═══════════════════════════════════════════════════════════════════════════
+
+_vpn_available = shutil.which("nordvpn") is not None
+_cf_block_count = 0  # Track consecutive CF blocks to trigger rotation
+
+async def rotate_vpn():
+    """Disconnect and reconnect NordVPN to get a fresh IP."""
+    if not _vpn_available:
+        return False
+    try:
+        console.print("  [cyan]Rotating VPN to fresh IP...[/cyan]")
+        # Disconnect first
+        proc = await asyncio.create_subprocess_exec(
+            "nordvpn", "disconnect",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.wait()
+        await asyncio.sleep(2)
+
+        # Reconnect to a random server
+        proc = await asyncio.create_subprocess_exec(
+            "nordvpn", "connect",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        output = stdout.decode().strip()
+
+        if proc.returncode == 0:
+            # Extract server name from output if possible
+            server = ""
+            for line in output.splitlines():
+                if "connected" in line.lower() or "server" in line.lower():
+                    server = line.strip()
+                    break
+            console.print(f"  [green]VPN rotated: {server or 'connected'}[/green]")
+            await asyncio.sleep(3)  # Let the connection stabilize
+            return True
+        else:
+            console.print(f"  [yellow]VPN reconnect returned {proc.returncode}[/yellow]")
+            return False
+    except Exception as e:
+        console.print(f"  [dim]VPN rotation failed: {e}[/dim]")
+        return False
+
+
+async def maybe_rotate_vpn(force: bool = False):
+    """Rotate VPN after repeated CF blocks. Returns True if rotated."""
+    global _cf_block_count
+    if force:
+        _cf_block_count = 0
+        return await rotate_vpn()
+    _cf_block_count += 1
+    # Rotate after 3 consecutive CF blocks
+    if _cf_block_count >= 3:
+        _cf_block_count = 0
+        return await rotate_vpn()
+    return False
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Browser helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
-    # Find the installed chromium executable (version may differ from pip package)
-    chromium_path = None
-    import pathlib
-    pw_cache = pathlib.Path.home() / ".cache" / "ms-playwright"
-    for d in sorted(pw_cache.glob("chromium-*"), reverse=True):
-        candidate = d / "chrome-linux" / "chrome"
-        if candidate.exists():
-            chromium_path = str(candidate)
-            break
+    """Create a stealth browser. Uses Camoufox if available, else Playwright + stealth."""
 
-    launch_kwargs = dict(
-        headless=config.HEADLESS,
-        args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--ignore-certificate-errors"],
-    )
-    if chromium_path:
-        launch_kwargs["executable_path"] = chromium_path
-
-    # Configure proxy if environment proxy is set
     proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    proxy_config = None
     if proxy_url:
-        # Parse proxy URL to extract username/password if present
         from urllib.parse import urlparse as _urlparse
         parsed = _urlparse(proxy_url)
         proxy_config = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
@@ -74,27 +151,193 @@ async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
             proxy_config["username"] = parsed.username
         if parsed.password:
             proxy_config["password"] = parsed.password
+
+    if _USE_CAMOUFOX:
+        return await _create_camoufox_browser(playwright, proxy_config)
+    else:
+        return await _create_playwright_browser(playwright, proxy_config)
+
+
+async def _create_camoufox_browser(playwright, proxy_config) -> tuple[Browser, BrowserContext]:
+    """Launch Camoufox — anti-detect Firefox with C++ level fingerprint spoofing."""
+    from camoufox import AsyncNewBrowser
+
+    # On headless Linux (LXC), use virtual display; on Windows/headed use normal mode
+    if config.HEADLESS:
+        headless_mode = "virtual"  # Xvfb-backed, looks headed to CF
+    else:
+        headless_mode = False
+
+    launch_opts = dict(
+        headless=headless_mode,
+        humanize=True,  # Human-like mouse movements
+        os=("windows", "macos", "linux"),  # Random OS fingerprint
+    )
+    if proxy_config:
+        launch_opts["proxy"] = proxy_config
+
+    browser = await AsyncNewBrowser(playwright, **launch_opts)
+    console.print("  [dim]Using Camoufox (anti-detect Firefox)[/dim]")
+
+    context = browser.contexts[0] if browser.contexts else await browser.new_context()
+    return browser, context
+
+
+async def _create_playwright_browser(playwright, proxy_config) -> tuple[Browser, BrowserContext]:
+    """Fallback: Playwright Chromium with stealth patches."""
+    chrome_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--ignore-certificate-errors",
+        "--disable-dev-shm-usage",
+        "--disable-infobars",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--window-size=1920,1080",
+    ]
+
+    launch_kwargs = dict(headless=config.HEADLESS, args=chrome_args)
+    if proxy_config:
         launch_kwargs["proxy"] = proxy_config
 
-    browser = await playwright.chromium.launch(**launch_kwargs)
+    # Try system Chrome first, fall back to bundled Chromium
+    try:
+        browser = await playwright.chromium.launch(channel="chrome", **launch_kwargs)
+        console.print("  [dim]Using system Chrome + stealth patches[/dim]")
+    except Exception:
+        import pathlib
+        chromium_path = None
+        pw_cache = pathlib.Path.home() / ".cache" / "ms-playwright"
+        for d in sorted(pw_cache.glob("chromium-*"), reverse=True):
+            candidate = d / "chrome-linux" / "chrome"
+            if candidate.exists():
+                chromium_path = str(candidate)
+                break
+        if chromium_path:
+            launch_kwargs["executable_path"] = chromium_path
+        browser = await playwright.chromium.launch(**launch_kwargs)
+        console.print("  [dim]Using bundled Chromium + stealth (install camoufox for better CF bypass)[/dim]")
+
+    ua = random.choice(config.USER_AGENTS)
     context = await browser.new_context(
-        user_agent=random.choice(config.USER_AGENTS),
+        user_agent=ua,
         viewport={"width": 1920, "height": 1080},
+        screen={"width": 1920, "height": 1080},
         locale="en-US",
         timezone_id="America/Chicago",
-        accept_downloads=True,  # Required for CSV downloads
+        accept_downloads=True,
         ignore_https_errors=True,
+        color_scheme="light",
+        java_script_enabled=True,
+        has_touch=False,
+        is_mobile=False,
     )
+
+    # JS-level anti-detection (backup — less effective than Camoufox C++ hooks)
+    await context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        if (!window.chrome) {
+            window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+        }
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Intel Inc.';
+            if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+            return getParameter.apply(this, arguments);
+        };
+        delete navigator.__proto__.webdriver;
+    """)
+
     return browser, context
 
 
 async def new_stealth_page(context: BrowserContext) -> Page:
     page = await context.new_page()
-    await stealth_async(page)
+    if not _USE_CAMOUFOX:
+        await stealth_async(page)
     return page
 
 
+async def _solve_cloudflare(page: Page):
+    """Try to solve the Cloudflare Turnstile challenge automatically."""
+    for attempt in range(5):
+        try:
+            # First check if challenge is already gone
+            content = await page.content()
+            if "challenge-platform" not in content and "Just a moment" not in content:
+                console.print("  [green]Cloudflare challenge passed![/green]")
+                return
+
+            # Find the Turnstile iframe
+            cf_frame = None
+            for frame in page.frames:
+                if "challenges.cloudflare.com" in (frame.url or ""):
+                    cf_frame = frame
+                    break
+
+            if cf_frame:
+                # Wait a moment for the widget to fully render
+                await asyncio.sleep(random.uniform(1.5, 3.0))
+
+                # Try multiple click strategies
+                clicked = False
+
+                # Strategy 1: input checkbox
+                checkbox = cf_frame.locator("input[type='checkbox']")
+                if await checkbox.count() > 0:
+                    await checkbox.first.click(delay=random.uniform(50, 150))
+                    clicked = True
+
+                # Strategy 2: label element
+                if not clicked:
+                    label = cf_frame.locator("label, .cb-lb, .ctp-checkbox-label")
+                    if await label.count() > 0:
+                        await label.first.click(delay=random.uniform(50, 150))
+                        clicked = True
+
+                # Strategy 3: any clickable body element (Turnstile managed challenge)
+                if not clicked:
+                    body = cf_frame.locator("body")
+                    if await body.count() > 0:
+                        # Click center of the iframe body
+                        bbox = await body.bounding_box()
+                        if bbox:
+                            await page.mouse.click(
+                                bbox["x"] + bbox["width"] / 2,
+                                bbox["y"] + bbox["height"] / 2,
+                                delay=random.uniform(50, 150),
+                            )
+                            clicked = True
+
+                if clicked:
+                    console.print(f"  [cyan]Clicked Turnstile (attempt {attempt+1})[/cyan]")
+            else:
+                # No iframe found — might be a JS challenge, just wait
+                console.print(f"  [dim]No Turnstile iframe found, waiting... (attempt {attempt+1})[/dim]")
+
+            # Wait for the challenge to resolve
+            await asyncio.sleep(config.CLOUDFLARE_WAIT + random.uniform(0, 3))
+
+            # Re-check
+            content = await page.content()
+            if "challenge-platform" not in content and "Just a moment" not in content:
+                console.print("  [green]Cloudflare challenge passed![/green]")
+                return
+
+        except Exception as e:
+            console.print(f"  [dim]Turnstile attempt {attempt+1}: {e}[/dim]")
+            await asyncio.sleep(random.uniform(2, 5))
+
+    console.print("  [yellow]Could not auto-solve CF after 5 attempts[/yellow]")
+    if not config.HEADLESS:
+        console.print("  [yellow]Waiting 30s for manual solve in headed mode...[/yellow]")
+        await asyncio.sleep(30)
+
+
 async def safe_goto(page: Page, url: str, wait_for_cf: bool = False) -> bool:
+    global _cf_block_count
     for attempt in range(config.MAX_RETRIES):
         try:
             resp = await page.goto(url, timeout=config.PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
@@ -103,19 +346,30 @@ async def safe_goto(page: Page, url: str, wait_for_cf: bool = False) -> bool:
 
             content = await page.content()
             if "challenge-platform" in content or "Just a moment" in content:
-                console.print("  [yellow]Cloudflare challenge, waiting...[/yellow]")
-                await asyncio.sleep(config.CLOUDFLARE_WAIT)
+                console.print("  [yellow]Cloudflare challenge, attempting to solve...[/yellow]")
+                await _solve_cloudflare(page)
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=15000)
                 except:
                     pass
+                # Check if challenge was solved
+                content = await page.content()
+                if "challenge-platform" in content or "Just a moment" in content:
+                    # Still blocked — try VPN rotation
+                    rotated = await maybe_rotate_vpn()
+                    if rotated:
+                        continue  # Retry with new IP
 
             if resp and resp.status in (200, 301, 302):
+                _cf_block_count = 0  # Reset on success
                 return True
             elif resp and resp.status == 403:
                 console.print(f"  [red]403 on attempt {attempt+1}[/red]")
-                await asyncio.sleep(config.RETRY_DELAY * (attempt + 1))
+                rotated = await maybe_rotate_vpn()
+                if not rotated:
+                    await asyncio.sleep(config.RETRY_DELAY * (attempt + 1))
             else:
+                _cf_block_count = 0
                 return True
         except Exception as e:
             console.print(f"  [red]Error attempt {attempt+1}: {e}[/red]")
@@ -495,17 +749,37 @@ async def scrape_card_images(page: Page, limit: int = 0):
     This bypasses Cloudflare since the browser context already has CF cookies.
     Processes ~10-25 cards/sec depending on rate limiting.
     """
-    FETCH_BATCH = 4           # parallel fetches per batch (avoid rate limit)
-    BATCH_DELAY = 3         # seconds between batches
+    # Adaptive speed settings — starts fast, throttles on CF blocks
+    FETCH_BATCH = 6           # parallel fetches per batch
+    BATCH_DELAY_MIN = 1.5     # min seconds between batches (when things are good)
+    BATCH_DELAY_MAX = 3.0     # max seconds between batches
+    CF_REFRESH_EVERY = 50     # re-validate CF cookies every N batches
     DB_BATCH    = 500         # cards per DB fetch
     total_ok    = 0
     total_no_image = 0
     total_error = 0
 
-    console.print(f"\n[bold]Phase 4: Scraping image URLs via in-browser fetch ({FETCH_BATCH}x parallel)[/bold]\n")
+    # Adaptive throttle — increases on CF blocks, decreases on success
+    throttle_multiplier = 1.0  # 1.0 = normal, higher = slower
+    consecutive_ok_batches = 0
 
-    # Navigate to any SCP page first to establish CF cookies
+    # Get total remaining count for ETA calculation
+    total_remaining = db.count_pending_images()
+    if limit > 0:
+        total_remaining = min(total_remaining, limit)
+
+    console.print(f"\n[bold]Phase 4: Scraping image URLs via in-browser fetch ({FETCH_BATCH}x parallel)[/bold]")
+    console.print(f"  [dim]{total_remaining:,} cards remaining[/dim]\n")
+
+    # Navigate to a real SCP page to establish CF cookies + warm up
+    console.print("  [cyan]Warming up browser session...[/cyan]")
     await safe_goto(page, f"{config.BASE_URL}/login", wait_for_cf=True)
+    await asyncio.sleep(random.uniform(3, 6))  # Human-like pause after page load
+
+    phase4_start = time.time()
+    total_processed = 0
+    last_eta_print = 0  # timestamp of last ETA display
+    ETA_INTERVAL = 120  # show ETA every 2 minutes
 
     while True:
         cards = db.get_cards_needing_images(DB_BATCH)
@@ -528,12 +802,20 @@ async def scrape_card_images(page: Page, limit: int = 0):
         ) as progress:
             ptask = progress.add_task("Images", total=len(cards))
 
+            batch_count = 0
             for i in range(0, len(cards), FETCH_BATCH):
                 batch = cards[i:i + FETCH_BATCH]
                 urls = [c["full_url"] for c in batch]
                 pids = [str(c["product_id"]) for c in batch]
+                batch_count += 1
 
-                progress.update(ptask, description=f"Img: batch {i//FETCH_BATCH+1}")
+                # Periodically refresh CF cookies by navigating to a real page
+                if batch_count % CF_REFRESH_EVERY == 0:
+                    progress.update(ptask, description="Refreshing session...")
+                    await safe_goto(page, f"{config.BASE_URL}/category/football-cards", wait_for_cf=True)
+                    await asyncio.sleep(random.uniform(3, 6))
+
+                progress.update(ptask, description=f"Img: batch {batch_count}")
 
                 try:
                     results = await page.evaluate("""async (urls) => {
@@ -541,11 +823,15 @@ async def scrape_card_images(page: Page, limit: int = 0):
                         return Promise.all(urls.map(async (url) => {
                             try {
                                 const resp = await fetch(url);
+                                if (resp.status === 403) return {hash: null, reason: 'cf_blocked'};
                                 if (resp.status !== 200) return {hash: null, reason: 'http_' + resp.status};
                                 const html = await resp.text();
+                                // Detect CF challenge in response body
+                                if (html.includes('challenge-platform') || html.includes('Just a moment')) {
+                                    return {hash: null, reason: 'cf_challenge'};
+                                }
                                 const match = html.match(re);
                                 if (match) return {hash: match[1], reason: null};
-                                // Check if page loaded but has no card image
                                 if (html.includes('pricecharting.com') || html.includes('sportscardspro.com')) {
                                     return {hash: null, reason: 'no_image_on_page'};
                                 }
@@ -555,6 +841,26 @@ async def scrape_card_images(page: Page, limit: int = 0):
                     }""", urls)
                 except Exception:
                     results = [{"hash": None, "reason": "evaluate_error"}] * len(batch)
+
+                # Adaptive throttle based on CF blocks
+                cf_hits = sum(1 for r in results if isinstance(r, dict) and r.get("reason") in ("cf_blocked", "cf_challenge"))
+                if cf_hits > 0:
+                    consecutive_ok_batches = 0
+                    throttle_multiplier = min(throttle_multiplier * 2.0, 8.0)  # Double delay, cap at 8x
+                    console.print(f"  [yellow]CF blocked {cf_hits}/{len(batch)} — throttle {throttle_multiplier:.0f}x, refreshing...[/yellow]")
+                    rotated = await maybe_rotate_vpn()
+                    if rotated:
+                        await asyncio.sleep(random.uniform(5, 10))
+                        throttle_multiplier = 1.0  # Reset after VPN rotation
+                    await safe_goto(page, f"{config.BASE_URL}/category/football-cards", wait_for_cf=True)
+                    await asyncio.sleep(random.uniform(8, 15) * throttle_multiplier)
+                else:
+                    consecutive_ok_batches += 1
+                    # Speed back up after 5 consecutive clean batches
+                    if consecutive_ok_batches >= 5 and throttle_multiplier > 1.0:
+                        throttle_multiplier = max(throttle_multiplier * 0.5, 1.0)
+                        if throttle_multiplier <= 1.0:
+                            console.print(f"  [green]Throttle cleared — back to full speed[/green]")
 
                 for card, result in zip(batch, results):
                     pid = card["product_id"]
@@ -575,7 +881,28 @@ async def scrape_card_images(page: Page, limit: int = 0):
                         total_error += 1
 
                 progress.advance(ptask, len(batch))
-                await asyncio.sleep(BATCH_DELAY)
+                total_processed += len(batch)
+
+                # Show ETA every 2 minutes
+                now = time.time()
+                if now - last_eta_print >= ETA_INTERVAL and total_processed > 0:
+                    elapsed = now - phase4_start
+                    cards_per_sec = total_processed / elapsed
+                    cards_left = total_remaining - total_processed
+                    if cards_per_sec > 0 and cards_left > 0:
+                        eta_seconds = cards_left / cards_per_sec
+                        eta_str = _format_eta(eta_seconds)
+                        console.print(
+                            f"  [cyan]ETA: ~{eta_str}[/cyan] — "
+                            f"[green]{total_ok:,}[/green] found, "
+                            f"[red]{total_error:,}[/red] errors, "
+                            f"{cards_per_sec:.1f} cards/sec, "
+                            f"{cards_left:,} remaining"
+                        )
+                    last_eta_print = now
+
+                delay = random.uniform(BATCH_DELAY_MIN, BATCH_DELAY_MAX) * throttle_multiplier
+                await asyncio.sleep(delay)
 
         console.print(f"  Batch done -- OK: [green]{total_ok}[/green], No image: [yellow]{total_no_image}[/yellow], Errors: [red]{total_error}[/red]")
 
@@ -598,7 +925,9 @@ async def scrape_card_images(page: Page, limit: int = 0):
     else:
         remaining_errors = 0
 
+    elapsed = time.time() - phase4_start
     console.print(f"\n  Final: [green]{total_ok}[/green] image URLs, [yellow]{total_no_image}[/yellow] no image, [red]{remaining_errors}[/red] remaining errors")
+    console.print(f"  [dim]Completed in {_format_eta(elapsed)}[/dim]")
     db.log_event("phase4_complete", f"Found {total_ok} image URLs, {total_no_image} no image, {remaining_errors} remaining errors")
 
 
@@ -835,6 +1164,7 @@ async def download_images(limit: int = 0):
     skipped = 0  # already cached locally
     failed = 0
     sem = asyncio.Semaphore(config.IMAGE_CONCURRENT_DOWNLOADS)
+    phase5_start = time.time()
 
     # Shared state for live display
     progress_state = {"current_file": "", "current_set": ""}
@@ -861,6 +1191,15 @@ async def download_images(limit: int = 0):
 
         def make_status_table():
             tbl = Table.grid(padding=(0, 2))
+            total_done = downloaded + skipped + failed
+            elapsed = time.time() - phase5_start
+            # ETA calculation
+            eta_str = ""
+            if total_done > 0 and elapsed > 5:
+                rate = total_done / elapsed
+                remaining = total_to_download - total_done
+                if rate > 0 and remaining > 0:
+                    eta_str = f"  [cyan]ETA: ~{_format_eta(remaining / rate)}[/cyan] ({rate:.1f}/sec)"
             tbl.add_row(
                 f"  [green]✓ {downloaded:,}[/green] downloaded",
                 f"[yellow]⊘ {skipped:,}[/yellow] cached",
@@ -869,7 +1208,7 @@ async def download_images(limit: int = 0):
             tbl.add_row(
                 f"  [dim]Set: {progress_state['current_set'][:50]}[/dim]",
                 f"[dim]File: {progress_state['current_file'][:50]}[/dim]",
-                "",
+                eta_str,
             )
             return tbl
 
@@ -879,7 +1218,7 @@ async def download_images(limit: int = 0):
                 live.update(Group(progress, make_status_table()))
 
             while True:
-                cards = db.get_cards_needing_download(200)
+                cards = db.get_cards_needing_download(500)
                 if not cards:
                     break
 
@@ -907,6 +1246,7 @@ async def download_images(limit: int = 0):
                     break
 
     # Final summary
+    elapsed = time.time() - phase5_start
     console.print()
     summary = Table.grid(padding=(0, 2))
     summary.add_row("[bold]Phase 5 Complete[/bold]")
@@ -916,7 +1256,10 @@ async def download_images(limit: int = 0):
         f"[red]✗ {failed:,}[/red] failed",
     )
     total = downloaded + skipped + failed
-    summary.add_row(f"  [bold]{total:,}[/bold] total processed")
+    summary.add_row(
+        f"  [bold]{total:,}[/bold] total processed",
+        f"[dim]in {_format_eta(elapsed)}[/dim]",
+    )
     console.print(Panel(summary, border_style="green" if failed == 0 else "yellow"))
     db.log_event("phase5_complete", f"Downloaded {downloaded}, cached {skipped}, failed {failed}")
 
@@ -1000,8 +1343,14 @@ async def run_full_pipeline(sport: str = None, limit: int = 0):
             parse_csvs()
 
         finally:
-            await context.close()
-            await browser.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
     # Phase 4: Scrape image URLs via lightweight HTTP (no browser needed!)
     # Uses /offers?product={id} endpoint: ~38 KB vs ~289 KB, 20x concurrent
