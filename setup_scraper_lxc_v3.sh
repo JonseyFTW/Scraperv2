@@ -404,6 +404,10 @@ case \"\${1:-}\" in
     queue)
         python task_queue.py stats
         ;;
+    workers)
+        shift
+        python lxc_stats.py \"\$@\"
+        ;;
     v2)
         shift
         python main.py \"\$@\"
