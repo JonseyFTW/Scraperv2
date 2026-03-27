@@ -603,11 +603,17 @@ async def scrape_with_curl_cffi(limit: int):
                         db.mark_card_error(card['product_id'], str(result))
                         total_error += 1
                         session_mgr.rate_limiter.on_error()
-                    elif result:
-                        db.update_card_image_url(card['product_id'], result)
+                    elif isinstance(result, FetchResult) and result.image_url:
+                        db.update_card_image_url(card['product_id'], result.image_url)
                         total_ok += 1
                         session_mgr.rate_limiter.on_success()
+                    elif isinstance(result, FetchResult) and result.error:
+                        # Retryable — HTTP errors, timeouts, Cloudflare blocks
+                        db.mark_card_error(card['product_id'], result.error)
+                        total_error += 1
+                        session_mgr.rate_limiter.on_error()
                     else:
+                        # Page loaded fine but genuinely no image on it
                         db.mark_card_no_image(card['product_id'])
                         total_no_image += 1
                         
@@ -618,23 +624,37 @@ async def scrape_with_curl_cffi(limit: int):
     console.print(f"Complete: {total_ok} found, {total_no_image} no image, {total_error} errors")
 
 
-async def fetch_image_url(session: AsyncSession, card: dict) -> Optional[str]:
-    """Fetch image URL from a card page using curl_cffi"""
+class FetchResult:
+    """Result of fetch_image_url — distinguishes success, no-image, and errors."""
+    __slots__ = ('image_url', 'error', 'no_image')
+    def __init__(self, image_url=None, error=None, no_image=False):
+        self.image_url = image_url
+        self.error = error
+        self.no_image = no_image
+
+
+async def fetch_image_url(session: AsyncSession, card: dict) -> FetchResult:
+    """Fetch image URL from a card page using curl_cffi.
+    Returns FetchResult to distinguish between no-image vs errors."""
+    url = card.get('full_url', '')
     try:
-        resp = await session.get(card['full_url'], timeout=10)
+        resp = await session.get(url, timeout=10)
         if resp.status_code != 200:
-            return None
-            
+            return FetchResult(error=f"HTTP {resp.status_code} for {url}")
+
         # Extract image URL from HTML
         pattern = r'https://storage\.googleapis\.com/images\.pricecharting\.com/([^/\s"\'<>]+)/\d+'
         match = re.search(pattern, resp.text)
-        
+
         if match:
-            return f"https://storage.googleapis.com/images.pricecharting.com/{match.group(1)}/1600.jpg"
-        return None
-        
-    except Exception:
-        return None
+            image_url = f"https://storage.googleapis.com/images.pricecharting.com/{match.group(1)}/1600.jpg"
+            return FetchResult(image_url=image_url)
+
+        # Page loaded OK but genuinely no image on it
+        return FetchResult(no_image=True)
+
+    except Exception as e:
+        return FetchResult(error=f"{e} for {url}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
