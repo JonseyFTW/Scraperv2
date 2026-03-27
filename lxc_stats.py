@@ -78,8 +78,18 @@ def calc_rates(workers, totals):
     global _prev_snapshot
     now = time.time()
 
-    # Count completed cards (downloaded + image_found + error + no_image = done processing)
-    done_now = (totals.get("downloaded", 0) or 0) + (totals.get("errors", 0) or 0)
+    # Count all cards that have been processed (anything no longer pending)
+    done_now = (
+        (totals.get("downloaded", 0) or 0) +
+        (totals.get("errors", 0) or 0) +
+        (totals.get("card_statuses", {}).get("image_found", 0) if isinstance(totals.get("card_statuses"), dict) else 0) +
+        (totals.get("card_statuses", {}).get("no_image", 0) if isinstance(totals.get("card_statuses"), dict) else 0)
+    )
+    # Fallback: use total - pending - processing as "processed" count
+    total_cards = totals.get("total", 0) or 0
+    pending = (totals.get("pending", 0) or 0)
+    processing = (totals.get("processing", 0) or 0)
+    done_now = total_cards - pending - processing
 
     # Per-worker done counts
     worker_done = {}
