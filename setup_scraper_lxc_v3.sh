@@ -161,9 +161,13 @@ DB_URL=$(whiptail --title "$APP — PostgreSQL" \
 # ── Step 7: Redis (New for v3) ───────────────────────────────────────────
 header_info
 
-USE_REDIS=$(whiptail --title "$APP — Redis Task Queue" \
+if whiptail --title "$APP — Redis Task Queue" \
     --yesno "Enable Redis for distributed task queue?\n\n✓ Allows multiple workers\n✓ Better job management\n✓ Automatic retries\n\nYou can also use an external Redis server." \
-    14 60 3>&1 1>&2 2>&3) && echo "yes" || echo "no"
+    14 60; then
+    USE_REDIS="yes"
+else
+    USE_REDIS="no"
+fi
 
 REDIS_URL="redis://localhost:6379"
 if [[ "$USE_REDIS" == "yes" ]]; then
@@ -195,9 +199,13 @@ SCP_PASSWORD=$(whiptail --title "$APP — SportsCardsPro Login" \
 # ── Step 9: NFS Data Share ────────────────────────────────────────────────
 header_info
 
-USE_NFS=$(whiptail --title "$APP — NFS Data Share" \
+if whiptail --title "$APP — NFS Data Share" \
     --yesno "Mount a shared NFS data directory?\n\n✓ Share images/CSVs/ChromaDB across containers\n✓ Avoids duplicate downloads\n✓ Centralizes data on your NAS\n\nRecommended if you have a NAS at 192.168.1.14" \
-    14 60 3>&1 1>&2 2>&3) && echo "yes" || echo "no"
+    14 60; then
+    USE_NFS="yes"
+else
+    USE_NFS="no"
+fi
 
 NFS_SERVER=""
 NFS_EXPORT=""
@@ -219,9 +227,13 @@ fi
 # ── Step 10: Optimization settings ───────────────────────────────────────
 header_info
 
-ENABLE_CDN=$(whiptail --title "$APP — CDN Pattern Discovery" \
+if whiptail --title "$APP — CDN Pattern Discovery" \
     --yesno "Enable CDN pattern discovery?\n\n✓ Eliminates Phase 4 entirely!\n✓ Generates image URLs without requests\n✓ 600K+ URLs in seconds vs 30+ hours\n\nHighly recommended!" \
-    14 60 3>&1 1>&2 2>&3) && echo "yes" || echo "no"
+    14 60; then
+    ENABLE_CDN="yes"
+else
+    ENABLE_CDN="no"
+fi
 
 # ── Confirm ──────────────────────────────────────────────────────────────
 header_info
