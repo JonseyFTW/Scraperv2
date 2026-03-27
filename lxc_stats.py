@@ -29,6 +29,9 @@ DATABASE_URL = os.environ.get(
     "postgresql://postgres:changeme@192.168.1.14:5433/sportscards",
 )
 
+# Track previous snapshot for rate calculation
+_prev_snapshot = {"time": None, "done": None, "per_worker": {}}
+
 
 def get_worker_stats():
     """Get card counts grouped by worker/container."""
@@ -70,9 +73,68 @@ def get_worker_stats():
     return workers, totals
 
 
-def display_stats():
+def calc_rates(workers, totals):
+    """Calculate cards/sec and ETA based on previous snapshot."""
+    global _prev_snapshot
+    now = time.time()
+
+    # Count completed cards (downloaded + image_found + error + no_image = done processing)
+    done_now = (totals.get("downloaded", 0) or 0) + (totals.get("errors", 0) or 0)
+
+    # Per-worker done counts
+    worker_done = {}
+    for w in workers:
+        name = w["worker"]
+        worker_done[name] = (w["downloaded"] or 0) + (w["image_found"] or 0) + (w["errors"] or 0) + (w["no_image"] or 0)
+
+    overall_rate = None
+    worker_rates = {}
+    eta_str = None
+
+    if _prev_snapshot["time"] is not None:
+        elapsed = now - _prev_snapshot["time"]
+        if elapsed > 0:
+            delta = done_now - _prev_snapshot["done"]
+            overall_rate = delta / elapsed
+
+            # Per-worker rates
+            for name, done in worker_done.items():
+                prev_done = _prev_snapshot["per_worker"].get(name, 0)
+                w_delta = done - prev_done
+                worker_rates[name] = w_delta / elapsed
+
+            # ETA based on pending + processing
+            remaining = (totals.get("pending", 0) or 0) + (totals.get("processing", 0) or 0)
+            if overall_rate > 0:
+                eta_seconds = remaining / overall_rate
+                eta_str = format_duration(eta_seconds)
+
+    # Save snapshot
+    _prev_snapshot = {"time": now, "done": done_now, "per_worker": worker_done}
+
+    return overall_rate, worker_rates, eta_str
+
+
+def format_duration(seconds):
+    """Format seconds into human-readable duration."""
+    if seconds < 0:
+        return "-"
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    mins = int((seconds % 3600) // 60)
+    if days > 0:
+        return f"{days}d {hours}h {mins}m"
+    elif hours > 0:
+        return f"{hours}h {mins}m"
+    elif mins > 0:
+        return f"{mins}m"
+    return "<1m"
+
+
+def display_stats(show_rates=True):
     """Show per-container card stats."""
     workers, totals = get_worker_stats()
+    overall_rate, worker_rates, eta_str = calc_rates(workers, totals)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # Worker table
@@ -89,6 +151,7 @@ def display_stats():
     table.add_column("Image Found", justify="right", min_width=11)
     table.add_column("Errors", justify="right", style="red", min_width=8)
     table.add_column("No Image", justify="right", style="dim", min_width=8)
+    table.add_column("Cards/s", justify="right", style="magenta", min_width=8)
 
     for w in workers:
         name = w["worker"]
@@ -102,6 +165,10 @@ def display_stats():
         if active > 0:
             name_text.append("  ACTIVE", style="bold green")
 
+        # Per-worker rate
+        rate = worker_rates.get(name)
+        rate_str = f"{rate:.1f}" if rate is not None else "-"
+
         table.add_row(
             name_text,
             f"{w['total']:,}",
@@ -111,10 +178,12 @@ def display_stats():
             f"{w['image_found'] or 0:,}",
             f"{w['errors'] or 0:,}",
             f"{w['no_image'] or 0:,}",
+            rate_str,
         )
 
     # Totals row
     table.add_section()
+    overall_rate_str = f"{overall_rate:.1f}" if overall_rate is not None else "-"
     table.add_row(
         Text("TOTAL", style="bold"),
         f"{totals['total']:,}",
@@ -124,6 +193,7 @@ def display_stats():
         "",
         f"{totals['errors'] or 0:,}",
         "",
+        overall_rate_str,
     )
 
     console.print(table)
@@ -142,22 +212,36 @@ def display_stats():
     )
     total_workers = sum(1 for w in workers if w["worker"] != "unassigned")
 
-    console.print(
+    summary = (
         f"\n  Workers: [green]{active_workers}[/green]/{total_workers} active  |  "
         f"Pending: [yellow]{pending:,}[/yellow]  |  "
         f"In-flight: [blue]{processing + downloading:,}[/blue]  |  "
         f"Done: [green]{done:,}[/green] ({pct:.1f}%)"
     )
 
+    if overall_rate is not None:
+        summary += f"  |  Rate: [magenta]{overall_rate:.1f} cards/s[/magenta]"
+    if eta_str:
+        summary += f"  |  ETA: [cyan]{eta_str}[/cyan]"
+
+    console.print(summary)
+
 
 def monitor_mode(interval=10):
     """Live monitoring with periodic refresh."""
     console.print("[bold]Live monitor[/bold] — Ctrl+C to stop\n")
+
+    # First snapshot (no rate yet)
+    console.clear()
+    display_stats()
+    console.print(f"\n[dim]Calculating rate... refreshing in {interval}s[/dim]")
+    time.sleep(interval)
+
     try:
         while True:
             console.clear()
             display_stats()
-            console.print(f"\n[dim]Refreshing every {interval}s...[/dim]")
+            console.print(f"\n[dim]Refreshing every {interval}s... (Ctrl+C to stop)[/dim]")
             time.sleep(interval)
     except KeyboardInterrupt:
         console.print("\n[yellow]Stopped.[/yellow]")
