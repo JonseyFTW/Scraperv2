@@ -656,13 +656,13 @@ async def scrape_with_curl_cffi(limit: int):
     console.print("[yellow]Using curl_cffi for image URL scraping[/yellow]")
     
     session_mgr = SessionManager()
-    batch_size = 10
+    batch_size = 20
     total_ok = 0
     total_no_image = 0
     total_error = 0
     
     while True:
-        cards = db.get_cards_needing_images(100)
+        cards = db.get_cards_needing_images(500)
         if not cards or (limit > 0 and total_ok >= limit):
             break
             
