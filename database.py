@@ -373,6 +373,27 @@ def count_multi_source_candidates() -> int:
     return count
 
 
+def reset_multi_source_cards() -> int:
+    """Reset all cards found via multi-source back to 'no_image' so Phase 4 can retry.
+    Also clears image_url and image_path for these cards."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE cards SET status='no_image', image_url=NULL, image_path=NULL, error_msg=NULL
+        WHERE error_msg LIKE 'found_via:%'
+    """)
+    count = cur.rowcount
+    # Also reset any that were downloaded from multi-source
+    cur.execute("""
+        UPDATE cards SET status='no_image', image_url=NULL, image_path=NULL, error_msg=NULL
+        WHERE status IN ('image_found', 'downloaded') AND error_msg LIKE 'found_via:%'
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+    return count
+
+
 def update_card_image_source(product_id: str, image_url: str, source: str):
     """Update a card with an image URL found via multi-source search."""
     conn = get_connection()

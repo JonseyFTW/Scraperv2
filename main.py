@@ -153,6 +153,7 @@ def main():
     parser.add_argument("--reset-errors", action="store_true", help="Reset errors to retry")
     parser.add_argument("--reset-no-image", action="store_true", help="Reset 'no image' cards to retry")
     parser.add_argument("--failures", action="store_true", help="Show image failure breakdown")
+    parser.add_argument("--reset-multi-source", action="store_true", help="Undo all multi-source image assignments")
     parser.add_argument("--headed", action="store_true", help="Show browser window")
 
     args = parser.parse_args()
@@ -175,6 +176,15 @@ def main():
         db.init_db()
         count = db.reset_no_image()
         console.print(f"[green]Reset {count} 'no image' cards back to pending for retry.[/green]")
+        show_stats()
+        return
+
+    if args.reset_multi_source:
+        import database as db
+        db.init_db()
+        count = db.reset_multi_source_cards()
+        console.print(f"[green]Reset {count} multi-source cards back to 'no_image'.[/green]")
+        console.print("[dim]Image URLs and paths cleared. Phase 4 can now retry these cards.[/dim]")
         show_stats()
         return
 
