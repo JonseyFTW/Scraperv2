@@ -46,8 +46,8 @@ IMG_DIR = IMAGE_DIR  # Alias for compatibility
 CHROMA_DIR = os.path.join(DATA_DIR, "chromadb")
 
 # ── Scraping behavior ─────────────────────────────────────────────────────
-REQUEST_DELAY_MIN = 0.5        # Min seconds between page loads (per batch of 10)
-REQUEST_DELAY_MAX = 2.0        # Max seconds between page loads
+REQUEST_DELAY_MIN = 1.0        # Min seconds between page loads (per batch of 10)
+REQUEST_DELAY_MAX = 3.0        # Max seconds between page loads
 CSV_DOWNLOAD_DELAY = 5.0       # Delay between CSV downloads (rate limited)
 CLOUDFLARE_WAIT = 8.0          # Seconds to wait for CF challenge
 PAGE_LOAD_TIMEOUT = 30000      # Playwright timeout in ms
