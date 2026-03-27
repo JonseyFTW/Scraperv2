@@ -24,8 +24,8 @@ CROSS="${RD}✗${CL}"
 
 APP="SportsCardPro Scraper v3"
 REPO_URL="https://github.com/JonseyFTW/Scraperv2.git"
-REPO_BRANCH="refactor"  # Update to your v3 branch
-INSTALL_DIR="/opt/scraperv3"
+REPO_BRANCH="main"
+INSTALL_DIR="/opt/scraperv2"
 
 header_info() {
     clear
@@ -217,7 +217,7 @@ if [[ "$USE_NFS" == "yes" ]]; then
 
     NFS_EXPORT=$(whiptail --title "$APP — NFS Export Path" \
         --inputbox "NFS export path on the server:\n\n(e.g. /volume1/Data/scraper or /share/scraper)" \
-        10 60 "/Data/scraper" 3>&1 1>&2 2>&3) || exit 1
+        10 60 "/volume1/Data/scraper" 3>&1 1>&2 2>&3) || exit 1
 
     NFS_MOUNT=$(whiptail --title "$APP — Mount Point" \
         --inputbox "Mount point inside the container:" \
