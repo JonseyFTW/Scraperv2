@@ -84,33 +84,43 @@ class CDNPatternEngine:
         return candidates
     
     async def test_cdn_patterns(self, sample_cards: List[Dict]) -> Optional[str]:
-        """Test various CDN patterns with sample cards to find working pattern"""
-        console.print("[cyan]Testing CDN patterns to eliminate Phase 4...[/cyan]")
-        
+        """Test various CDN patterns with sample cards to find working pattern.
+        Gives up quickly (15s max) since these patterns rarely work."""
+        console.print("[cyan]Testing CDN patterns (quick check, max 15s)...[/cyan]")
+
+        try:
+            return await asyncio.wait_for(
+                self._test_cdn_patterns_inner(sample_cards[:3]),
+                timeout=15,
+            )
+        except asyncio.TimeoutError:
+            console.print("[yellow]CDN pattern test timed out, falling back to scraping[/yellow]")
+            return None
+
+    async def _test_cdn_patterns_inner(self, sample_cards: List[Dict]) -> Optional[str]:
         browser = _get_supported_browsers()[0]
         async with AsyncSession(impersonate=browser) as session:
-            for card in sample_cards[:10]:  # Test with 10 cards
+            for card in sample_cards:
                 product_id = card['product_id']
                 set_slug = card.get('set_slug', '')
-                
+
                 # Test direct product_id pattern
                 test_urls = [
                     f"https://cdn.sportscardspro.com/images/cards/{product_id}.jpg",
                     f"https://storage.googleapis.com/images.pricecharting.com/{product_id}/1600.jpg",
                 ]
-                
+
                 # Test hash-based patterns
                 hashes = self.generate_hash(product_id, set_slug)
                 for h in hashes:
                     test_urls.append(f"https://storage.googleapis.com/images.pricecharting.com/{h}/1600.jpg")
                     test_urls.append(f"https://cdn.sportscardspro.com/images/{h}/1600.jpg")
-                
+
                 for url in test_urls:
                     try:
-                        resp = await session.head(url, timeout=5)
+                        resp = await session.head(url, timeout=3)
                         if resp.status_code == 200:
-                            console.print(f"[green]✓ Found working pattern: {url}[/green]")
-                            # Extract pattern
+                            console.print(f"[green]Found working CDN pattern: {url}[/green]")
                             if '{product_id}' in url or product_id in url:
                                 pattern = url.replace(product_id, '{product_id}')
                             else:
@@ -121,10 +131,10 @@ class CDNPatternEngine:
                                         break
                             self.discovered_patterns['pattern'] = pattern
                             return pattern
-                    except:
+                    except Exception:
                         continue
-                        
-        console.print("[yellow]No direct CDN pattern found, will need Phase 4[/yellow]")
+
+        console.print("[yellow]No direct CDN pattern found, will scrape normally[/yellow]")
         return None
 
 
