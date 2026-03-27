@@ -136,7 +136,7 @@ class AdaptiveRateLimiter:
     def __init__(self):
         self.base_delay = config.REQUEST_DELAY_MIN
         self.current_delay = self.base_delay
-        self.max_delay = 30.0
+        self.max_delay = 10.0
         self.success_count = 0
         self.error_count = 0
         self.last_403 = 0
