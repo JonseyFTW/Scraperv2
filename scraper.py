@@ -1326,6 +1326,7 @@ async def scrape_card_images_multi_source(limit: int = 0, sources: list[str] | N
 
     Targets cards with status 'no_image' or 'error' from Phase 4.
     """
+    from curl_cffi.requests import AsyncSession
     from image_sources import MultiSourceImageFinder
 
     total_remaining = db.count_multi_source_candidates()
@@ -1341,6 +1342,7 @@ async def scrape_card_images_multi_source(limit: int = 0, sources: list[str] | N
 
     console.print(f"\n[bold]Phase 4b: Multi-source image search[/bold]")
     console.print(f"  Sources: [cyan]{source_names}[/cyan]")
+    console.print(f"  Using: [cyan]curl_cffi (Chrome TLS fingerprint)[/cyan]")
     console.print(f"  [dim]{total_remaining:,} cards to search[/dim]\n")
 
     DB_BATCH = 100
@@ -1350,9 +1352,7 @@ async def scrape_card_images_multi_source(limit: int = 0, sources: list[str] | N
     total_processed = 0
     phase_start = time.time()
 
-    async with aiohttp.ClientSession(headers={
-        "User-Agent": config.USER_AGENTS[0],
-    }) as session:
+    async with AsyncSession() as session:
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
