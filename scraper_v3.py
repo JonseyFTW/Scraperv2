@@ -168,9 +168,9 @@ class AdaptiveRateLimiter:
         self.success_count = 0
 
     def should_rotate_session(self) -> bool:
-        """Check if we should rotate to a new session"""
-        return (self.error_count > 3 or
-                (self.last_403 and time.time() - self.last_403 < 300))
+        """Check if we should rotate to a new session.
+        Only triggers on accumulated errors, NOT on a stale last_403 timestamp."""
+        return self.error_count > 3
 
     def should_rotate_vpn(self) -> bool:
         """Check if too many 403s suggest IP is burned and VPN should cycle"""
@@ -253,6 +253,11 @@ class SessionManager:
         Old sessions are NOT closed immediately to avoid killing in-flight requests.
         They get replaced and garbage collected instead."""
         if rotate or not self.sessions or self.rate_limiter.should_rotate_session():
+            # Cooldown: don't rotate more than once every 5 seconds
+            now = time.time()
+            if hasattr(self, '_last_rotation') and now - self._last_rotation < 5 and self.sessions:
+                return self.sessions[self.current_index % len(self.sessions)]
+
             # Create new session (don't close old one — in-flight requests may still use it)
             session = await self.create_session()
             if not self.sessions:
@@ -262,6 +267,8 @@ class SessionManager:
                 self.sessions[self.current_index % len(self.sessions)] = session
 
             self.rate_limiter.error_count = 0  # Reset error count on rotation
+            self.rate_limiter.last_403 = 0     # Clear 403 timestamp on rotation
+            self._last_rotation = now
             console.print("[cyan]Rotated to new session[/cyan]")
 
         return self.sessions[self.current_index % len(self.sessions)]
