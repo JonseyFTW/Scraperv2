@@ -1,7 +1,20 @@
+# Core scraping tools
+curl-cffi>=0.7.0  # Cloudflare bypass with browser TLS fingerprinting
+scrapling>=0.2.0  # Optional: Advanced Cloudflare handling with Turnstile support
+# camoufox>=0.3.0  # Optional: Anti-fingerprinting Firefox (alternative to scrapling)
+
+# Browser automation (fallback)
 playwright>=1.52.0
 playwright-stealth>=1.0.6
+
+# HTTP and async
 aiohttp>=3.9.0
 aiofiles>=23.0.0
+
+# Database
+psycopg2-binary>=2.9.0
+redis>=5.0.0  # Optional: For task queue
+
+# UI and utilities  
 rich>=13.0.0
 chromadb>=1.0.0
-psycopg2-binary>=2.9.0

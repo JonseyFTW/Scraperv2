@@ -26,8 +26,8 @@ CATEGORY_URLS = {
 # ── Login ─────────────────────────────────────────────────────────────────
 # Retail+ subscription required for CSV downloads.
 # Set these via environment variables or edit directly.
-LOGIN_EMAIL = os.environ.get("SCP_EMAIL", "")
-LOGIN_PASSWORD = os.environ.get("SCP_PASSWORD", "")
+LOGIN_EMAIL = os.environ.get("SCP_EMAIL", "mr.chadnjones@gmail.com")
+LOGIN_PASSWORD = os.environ.get("SCP_PASSWORD", "LE4Ever!")
 LOGIN_URL = f"{BASE_URL}/login"
 
 # ── Database ──────────────────────────────────────────────────────────────
@@ -42,6 +42,7 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("SCP_DATA_DIR") or os.path.join(PROJECT_DIR, "data")
 CSV_DIR = os.path.join(DATA_DIR, "csvs")
 IMAGE_DIR = os.path.join(DATA_DIR, "images")
+IMG_DIR = IMAGE_DIR  # Alias for compatibility
 CHROMA_DIR = os.path.join(DATA_DIR, "chromadb")
 
 # ── Scraping behavior ─────────────────────────────────────────────────────
