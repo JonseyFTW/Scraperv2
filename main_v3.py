@@ -202,6 +202,7 @@ def main():
     parser.add_argument("--cdn-test", action="store_true", help="Test CDN pattern discovery")
     parser.add_argument("--use-v2", action="store_true", help="Use v2 scraper (fallback)")
     parser.add_argument("--reset-errors", action="store_true", help="Reset errors to retry")
+    parser.add_argument("--reset-no-image", action="store_true", help="Reset no_image cards back to pending")
     parser.add_argument("--headed", action="store_true", help="Show browser (when needed)")
     
     args = parser.parse_args()
@@ -224,7 +225,15 @@ def main():
         console.print("[green]Errors reset to pending.[/green]")
         show_stats()
         return
-        
+
+    if args.reset_no_image:
+        import database as db
+        db.init_db()
+        count = db.reset_no_image()
+        console.print(f"[green]Reset {count:,} no_image cards back to pending.[/green]")
+        show_stats()
+        return
+
     if args.headed:
         import config
         config.HEADLESS = False
