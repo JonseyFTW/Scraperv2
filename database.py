@@ -280,6 +280,20 @@ def bulk_insert_cards(cards: list[dict]):
     put_connection(conn)
 
 
+def peek_cards_needing_images(limit: int = 10) -> list[dict]:
+    """Read a sample of pending cards WITHOUT claiming them (no status change)."""
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT * FROM cards WHERE status='pending'
+        ORDER BY set_slug DESC, id LIMIT %s
+    """, (limit,))
+    rows = cur.fetchall()
+    cur.close()
+    put_connection(conn)
+    return [dict(r) for r in rows]
+
+
 def get_cards_needing_images(limit: int = 500) -> list[dict]:
     """Atomically claim a batch of pending cards for image scraping.
     Uses FOR UPDATE SKIP LOCKED so multiple workers never get the same rows."""

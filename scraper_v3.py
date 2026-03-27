@@ -87,7 +87,8 @@ class CDNPatternEngine:
         """Test various CDN patterns with sample cards to find working pattern"""
         console.print("[cyan]Testing CDN patterns to eliminate Phase 4...[/cyan]")
         
-        async with AsyncSession(impersonate="chrome136") as session:
+        browser = _get_supported_browsers()[0]
+        async with AsyncSession(impersonate=browser) as session:
             for card in sample_cards[:10]:  # Test with 10 cards
                 product_id = card['product_id']
                 set_slug = card.get('set_slug', '')
@@ -554,15 +555,15 @@ async def scrape_card_images_v3(limit: int = 0):
     """
     console.print(f"\n[bold]Phase 4: Smart Image URL Discovery[/bold]\n")
     
-    # First, try to discover CDN pattern
-    sample_cards = db.get_cards_needing_images(10)
+    # First, try to discover CDN pattern using a peek (don't claim cards)
+    sample_cards = db.peek_cards_needing_images(10)
     if not sample_cards:
         console.print("[green]No cards needing images![/green]")
         return
-        
+
     cdn_engine = CDNPatternEngine()
     pattern = await cdn_engine.test_cdn_patterns(sample_cards)
-    
+
     if pattern:
         # We found a pattern! Apply it to all cards
         await apply_cdn_pattern(pattern, cdn_engine, limit)
