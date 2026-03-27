@@ -210,27 +210,33 @@ class SessionManager:
     async def get_session(self, rotate: bool = False) -> AsyncSession:
         """Get current session or create new one"""
         if rotate or not self.sessions or self.rate_limiter.should_rotate_session():
-            # Close old session if rotating
+            # Close old session if rotating (ignore errors from curl_cffi)
             if self.sessions and self.current_index < len(self.sessions):
-                await self.sessions[self.current_index].close()
-                
+                try:
+                    await self.sessions[self.current_index].close()
+                except Exception:
+                    pass
+
             # Create new session
             session = await self.create_session()
             if rotate or not self.sessions:
                 self.sessions.append(session)
             else:
                 self.sessions[self.current_index] = session
-                
+
             self.current_index = (self.current_index + 1) % max(1, len(self.sessions))
             self.rate_limiter.error_count = 0  # Reset error count on rotation
             console.print("[cyan]Rotated to new session[/cyan]")
-            
+
         return self.sessions[self.current_index % len(self.sessions)]
-        
+
     async def close_all(self):
         """Close all sessions"""
         for session in self.sessions:
-            await session.close()
+            try:
+                await session.close()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
