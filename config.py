@@ -37,13 +37,23 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:changeme@19
 
 # ── Paths ─────────────────────────────────────────────────────────────────
 # Set SCP_DATA_DIR env var to use a shared/network drive, e.g.:
-#   set SCP_DATA_DIR=\\192.168.1.14\Data\scraper
+#   Linux:   export SCP_DATA_DIR=/mnt/scraper-data
+#   Windows: set SCP_DATA_DIR=Z:\
+#   Windows: set SCP_DATA_DIR=\\192.168.1.14\Data\scraper
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("SCP_DATA_DIR") or os.path.join(PROJECT_DIR, "data")
 CSV_DIR = os.path.join(DATA_DIR, "csvs")
 IMAGE_DIR = os.path.join(DATA_DIR, "images")
 IMG_DIR = IMAGE_DIR  # Alias for compatibility
 CHROMA_DIR = os.path.join(DATA_DIR, "chromadb")
+
+# ── Path mapping (for running embeddings on Windows against Linux DB paths)
+# The DB stores Linux paths from the containers. When running on Windows,
+# we need to translate them.  Set SCP_LINUX_DATA_PREFIX to the Linux data dir
+# used by containers (e.g. /mnt/scraper-data).  The code will replace that
+# prefix with DATA_DIR at runtime.
+#   Example: export SCP_LINUX_DATA_PREFIX=/mnt/scraper-data
+LINUX_DATA_PREFIX = os.environ.get("SCP_LINUX_DATA_PREFIX", "")
 
 # ── Scraping behavior ─────────────────────────────────────────────────────
 REQUEST_DELAY_MIN = 1.0        # Min seconds between page loads (per batch of 10)

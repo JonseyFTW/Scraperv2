@@ -132,6 +132,27 @@ def get_collection():
 _skipped_ids = set()  # Cards where image file doesn't exist on disk
 
 
+def _resolve_image_path(image_path: str) -> str:
+    """Translate a DB image path to the local filesystem.
+    Handles Linux paths stored by containers when running on Windows."""
+    if not image_path:
+        return image_path
+
+    # If the path already exists, no translation needed
+    if os.path.exists(image_path):
+        return image_path
+
+    # Try translating Linux prefix → local DATA_DIR
+    prefix = config.LINUX_DATA_PREFIX
+    if prefix and image_path.startswith(prefix):
+        translated = os.path.join(config.DATA_DIR, image_path[len(prefix):].lstrip("/\\"))
+        return translated
+
+    # Last resort: just use the filename under IMAGE_DIR
+    basename = os.path.basename(image_path)
+    return os.path.join(config.IMAGE_DIR, basename)
+
+
 def get_cards_needing_embeddings(limit: int = 500) -> list[dict]:
     """Get downloaded cards that don't have embeddings yet."""
     collection = get_collection()
@@ -152,7 +173,7 @@ def get_cards_needing_embeddings(limit: int = 500) -> list[dict]:
     """)
     rows = cur.fetchall()
     cur.close()
-    conn.close()
+    db.put_connection(conn)
 
     # Filter out cards already in ChromaDB or previously skipped (missing file)
     skip = existing_ids | _skipped_ids
@@ -197,8 +218,9 @@ def generate_embeddings(limit: int = 0):
             for card in cards:
                 progress.update(task, description=f"Embed: {(card['product_name'] or 'img')[:30]}")
 
-                if card["image_path"] and os.path.exists(card["image_path"]):
-                    vec = _embed_image(card["image_path"])
+                resolved_path = _resolve_image_path(card.get("image_path", ""))
+                if resolved_path and os.path.exists(resolved_path):
+                    vec = _embed_image(resolved_path)
                     if vec is not None:
                         batch_ids.append(str(card["product_id"]))
                         batch_embeddings.append(vec.tolist())
@@ -248,7 +270,7 @@ def generate_embeddings(limit: int = 0):
             if os.path.exists(db_file):
                 conn = sqlite3.connect(db_file)
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                conn.close()
+                db.put_connection(conn)
                 console.print(f"[dim]WAL checkpointed: {db_file}[/dim]")
         except Exception as e:
             console.print(f"[yellow]WAL checkpoint warning: {e}[/yellow]")
@@ -341,7 +363,7 @@ def show_embedding_stats():
     cur.execute("SELECT COUNT(*) FROM cards WHERE status='downloaded'")
     total_cards = cur.fetchone()[0]
     cur.close()
-    conn.close()
+    db.put_connection(conn)
 
     console.print(f"\n  Downloaded cards: [cyan]{total_cards}[/cyan]")
     console.print(f"  Embeddings:       [cyan]{total_embs}[/cyan]")
@@ -367,7 +389,7 @@ def migrate_from_sqlite():
     if not table_exists:
         console.print("[yellow]No embeddings table found — nothing to migrate.[/yellow]")
         cur.close()
-        conn.close()
+        db.put_connection(conn)
         return
 
     cur.execute("""
@@ -377,7 +399,7 @@ def migrate_from_sqlite():
     """)
     rows = cur.fetchall()
     cur.close()
-    conn.close()
+    db.put_connection(conn)
 
     if not rows:
         console.print("[yellow]No embeddings found in SQLite — nothing to migrate.[/yellow]")
