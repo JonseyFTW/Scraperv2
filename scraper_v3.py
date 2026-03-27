@@ -234,23 +234,18 @@ class SessionManager:
         return session
         
     async def get_session(self, rotate: bool = False) -> AsyncSession:
-        """Get current session or create new one"""
+        """Get current session or create new one.
+        Old sessions are NOT closed immediately to avoid killing in-flight requests.
+        They get replaced and garbage collected instead."""
         if rotate or not self.sessions or self.rate_limiter.should_rotate_session():
-            # Close old session if rotating (ignore errors from curl_cffi)
-            if self.sessions and self.current_index < len(self.sessions):
-                try:
-                    await self.sessions[self.current_index].close()
-                except Exception:
-                    pass
-
-            # Create new session
+            # Create new session (don't close old one — in-flight requests may still use it)
             session = await self.create_session()
-            if rotate or not self.sessions:
+            if not self.sessions:
                 self.sessions.append(session)
             else:
-                self.sessions[self.current_index] = session
+                # Replace old session in the list (old one gets GC'd)
+                self.sessions[self.current_index % len(self.sessions)] = session
 
-            self.current_index = (self.current_index + 1) % max(1, len(self.sessions))
             self.rate_limiter.error_count = 0  # Reset error count on rotation
             console.print("[cyan]Rotated to new session[/cyan]")
 
@@ -694,7 +689,11 @@ async def fetch_image_url(session: AsyncSession, card: dict) -> FetchResult:
         return FetchResult(no_image=True)
 
     except Exception as e:
-        return FetchResult(error=f"{e} for {url}")
+        err_str = str(e)
+        # "Session is closed" is retryable, not a real failure
+        if "session is closed" in err_str.lower():
+            return FetchResult(error=f"Session closed (retryable)")
+        return FetchResult(error=f"{e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
