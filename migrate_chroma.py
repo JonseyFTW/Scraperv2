@@ -34,14 +34,26 @@ def get_local_client():
 
 def get_remote_client(target_url: str, token: str = None):
     """Connect to remote ChromaDB over HTTP."""
+    from urllib.parse import urlparse
+    parsed = urlparse(target_url if "://" in target_url else f"https://{target_url}")
+
+    host = parsed.hostname
+    port = parsed.port
+    use_ssl = parsed.scheme == "https"
+
+    # Default ports
+    if port is None:
+        port = 443 if use_ssl else 8000
+
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+        headers["X-Chroma-Token"] = token
 
     return chromadb.HttpClient(
-        host=target_url.rstrip("/").replace("http://", "").replace("https://", "").split(":")[0],
-        port=int(target_url.rstrip("/").split(":")[-1]) if ":" in target_url.split("//")[-1] else 8000,
-        ssl=target_url.startswith("https"),
+        host=host,
+        port=port,
+        ssl=use_ssl,
         headers=headers if headers else None,
     )
 
