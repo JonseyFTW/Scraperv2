@@ -16,19 +16,14 @@ import re
 import random
 import glob
 import json
+import subprocess
+import shutil
 from urllib.parse import urljoin, urlparse
 from pathlib import Path
 
 import aiohttp
 import aiofiles
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
-try:
-    from playwright_stealth import stealth_async  # v1.x
-except ImportError:
-    from playwright_stealth import Stealth  # v2.x
-    _stealth_instance = Stealth()
-    async def stealth_async(page):
-        await _stealth_instance.apply_stealth_async(page)
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, MofNCompleteColumn
 from rich.live import Live
@@ -40,43 +35,97 @@ import database as db
 
 console = Console()
 
+# Try Camoufox first (best CF bypass), fall back to playwright-stealth
+_USE_CAMOUFOX = False
+try:
+    from camoufox.async_api import AsyncCamoufox
+    _USE_CAMOUFOX = True
+except ImportError:
+    AsyncCamoufox = None
+    try:
+        from playwright_stealth import stealth_async
+    except ImportError:
+        try:
+            from playwright_stealth import Stealth
+            _stealth_instance = Stealth()
+            async def stealth_async(page):
+                await _stealth_instance.apply_stealth_async(page)
+        except ImportError:
+            async def stealth_async(page):
+                pass  # No stealth available
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VPN rotation
+# ═══════════════════════════════════════════════════════════════════════════
+
+_vpn_available = shutil.which("nordvpn") is not None
+_cf_block_count = 0  # Track consecutive CF blocks to trigger rotation
+
+async def rotate_vpn():
+    """Disconnect and reconnect NordVPN to get a fresh IP."""
+    if not _vpn_available:
+        return False
+    try:
+        console.print("  [cyan]Rotating VPN to fresh IP...[/cyan]")
+        # Disconnect first
+        proc = await asyncio.create_subprocess_exec(
+            "nordvpn", "disconnect",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.wait()
+        await asyncio.sleep(2)
+
+        # Reconnect to a random server
+        proc = await asyncio.create_subprocess_exec(
+            "nordvpn", "connect",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        output = stdout.decode().strip()
+
+        if proc.returncode == 0:
+            # Extract server name from output if possible
+            server = ""
+            for line in output.splitlines():
+                if "connected" in line.lower() or "server" in line.lower():
+                    server = line.strip()
+                    break
+            console.print(f"  [green]VPN rotated: {server or 'connected'}[/green]")
+            await asyncio.sleep(3)  # Let the connection stabilize
+            return True
+        else:
+            console.print(f"  [yellow]VPN reconnect returned {proc.returncode}[/yellow]")
+            return False
+    except Exception as e:
+        console.print(f"  [dim]VPN rotation failed: {e}[/dim]")
+        return False
+
+
+async def maybe_rotate_vpn(force: bool = False):
+    """Rotate VPN after repeated CF blocks. Returns True if rotated."""
+    global _cf_block_count
+    if force:
+        _cf_block_count = 0
+        return await rotate_vpn()
+    _cf_block_count += 1
+    # Rotate after 3 consecutive CF blocks
+    if _cf_block_count >= 3:
+        _cf_block_count = 0
+        return await rotate_vpn()
+    return False
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Browser helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
-    # Find the installed chromium executable (version may differ from pip package)
-    chromium_path = None
-    import pathlib
-    pw_cache = pathlib.Path.home() / ".cache" / "ms-playwright"
-    for d in sorted(pw_cache.glob("chromium-*"), reverse=True):
-        candidate = d / "chrome-linux" / "chrome"
-        if candidate.exists():
-            chromium_path = str(candidate)
-            break
+    """Create a stealth browser. Uses Camoufox if available, else Playwright + stealth."""
 
-    launch_kwargs = dict(
-        headless=config.HEADLESS,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--ignore-certificate-errors",
-            "--disable-dev-shm-usage",
-            "--disable-infobars",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--window-size=1920,1080",
-        ],
-    )
-    if chromium_path:
-        launch_kwargs["executable_path"] = chromium_path
-
-    # Configure proxy if environment proxy is set
     proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    proxy_config = None
     if proxy_url:
-        # Parse proxy URL to extract username/password if present
         from urllib.parse import urlparse as _urlparse
         parsed = _urlparse(proxy_url)
         proxy_config = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
@@ -84,11 +133,74 @@ async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
             proxy_config["username"] = parsed.username
         if parsed.password:
             proxy_config["password"] = parsed.password
+
+    if _USE_CAMOUFOX:
+        return await _create_camoufox_browser(playwright, proxy_config)
+    else:
+        return await _create_playwright_browser(playwright, proxy_config)
+
+
+async def _create_camoufox_browser(playwright, proxy_config) -> tuple[Browser, BrowserContext]:
+    """Launch Camoufox — anti-detect Firefox with C++ level fingerprint spoofing."""
+    from camoufox import AsyncNewBrowser
+
+    # On headless Linux (LXC), use virtual display; on Windows/headed use normal mode
+    if config.HEADLESS:
+        headless_mode = "virtual"  # Xvfb-backed, looks headed to CF
+    else:
+        headless_mode = False
+
+    launch_opts = dict(
+        headless=headless_mode,
+        humanize=True,  # Human-like mouse movements
+        os=("windows", "macos", "linux"),  # Random OS fingerprint
+    )
+    if proxy_config:
+        launch_opts["proxy"] = proxy_config
+
+    browser = await AsyncNewBrowser(playwright, **launch_opts)
+    console.print("  [dim]Using Camoufox (anti-detect Firefox)[/dim]")
+
+    context = browser.contexts[0] if browser.contexts else await browser.new_context()
+    return browser, context
+
+
+async def _create_playwright_browser(playwright, proxy_config) -> tuple[Browser, BrowserContext]:
+    """Fallback: Playwright Chromium with stealth patches."""
+    chrome_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--ignore-certificate-errors",
+        "--disable-dev-shm-usage",
+        "--disable-infobars",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--window-size=1920,1080",
+    ]
+
+    launch_kwargs = dict(headless=config.HEADLESS, args=chrome_args)
+    if proxy_config:
         launch_kwargs["proxy"] = proxy_config
 
-    browser = await playwright.chromium.launch(**launch_kwargs)
+    # Try system Chrome first, fall back to bundled Chromium
+    try:
+        browser = await playwright.chromium.launch(channel="chrome", **launch_kwargs)
+        console.print("  [dim]Using system Chrome + stealth patches[/dim]")
+    except Exception:
+        import pathlib
+        chromium_path = None
+        pw_cache = pathlib.Path.home() / ".cache" / "ms-playwright"
+        for d in sorted(pw_cache.glob("chromium-*"), reverse=True):
+            candidate = d / "chrome-linux" / "chrome"
+            if candidate.exists():
+                chromium_path = str(candidate)
+                break
+        if chromium_path:
+            launch_kwargs["executable_path"] = chromium_path
+        browser = await playwright.chromium.launch(**launch_kwargs)
+        console.print("  [dim]Using bundled Chromium + stealth (install camoufox for better CF bypass)[/dim]")
 
-    # Realistic browser context with WebGL and platform spoofing
     ua = random.choice(config.USER_AGENTS)
     context = await browser.new_context(
         user_agent=ua,
@@ -96,7 +208,7 @@ async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
         screen={"width": 1920, "height": 1080},
         locale="en-US",
         timezone_id="America/Chicago",
-        accept_downloads=True,  # Required for CSV downloads
+        accept_downloads=True,
         ignore_https_errors=True,
         color_scheme="light",
         java_script_enabled=True,
@@ -104,38 +216,20 @@ async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
         is_mobile=False,
     )
 
-    # Override navigator properties to look more human
+    # JS-level anti-detection (backup — less effective than Camoufox C++ hooks)
     await context.add_init_script("""
-        // Hide webdriver flag
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-        // Realistic plugins array (Chrome normally has these)
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5]
-        });
-
-        // Realistic languages
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en']
-        });
-
-        // Fix chrome object (headless Chrome is missing this)
-        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
-
-        // Fix permissions query
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) =>
-            parameters.name === 'notifications'
-                ? Promise.resolve({ state: Notification.permission })
-                : originalQuery(parameters);
-
-        // Spoof WebGL renderer
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        if (!window.chrome) {
+            window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+        }
         const getParameter = WebGLRenderingContext.prototype.getParameter;
         WebGLRenderingContext.prototype.getParameter = function(parameter) {
             if (parameter === 37445) return 'Intel Inc.';
             if (parameter === 37446) return 'Intel Iris OpenGL Engine';
             return getParameter.apply(this, arguments);
         };
+        delete navigator.__proto__.webdriver;
     """)
 
     return browser, context
@@ -143,15 +237,22 @@ async def create_browser(playwright) -> tuple[Browser, BrowserContext]:
 
 async def new_stealth_page(context: BrowserContext) -> Page:
     page = await context.new_page()
-    await stealth_async(page)
+    if not _USE_CAMOUFOX:
+        await stealth_async(page)
     return page
 
 
 async def _solve_cloudflare(page: Page):
-    """Try to click the Cloudflare Turnstile 'Verify you are human' checkbox."""
-    for attempt in range(3):
+    """Try to solve the Cloudflare Turnstile challenge automatically."""
+    for attempt in range(5):
         try:
-            # Turnstile checkbox lives inside an iframe
+            # First check if challenge is already gone
+            content = await page.content()
+            if "challenge-platform" not in content and "Just a moment" not in content:
+                console.print("  [green]Cloudflare challenge passed![/green]")
+                return
+
+            # Find the Turnstile iframe
             cf_frame = None
             for frame in page.frames:
                 if "challenges.cloudflare.com" in (frame.url or ""):
@@ -159,36 +260,66 @@ async def _solve_cloudflare(page: Page):
                     break
 
             if cf_frame:
-                # Wait for the checkbox to appear and click it
+                # Wait a moment for the widget to fully render
+                await asyncio.sleep(random.uniform(1.5, 3.0))
+
+                # Try multiple click strategies
+                clicked = False
+
+                # Strategy 1: input checkbox
                 checkbox = cf_frame.locator("input[type='checkbox']")
                 if await checkbox.count() > 0:
-                    await checkbox.first.click()
-                    console.print("  [green]Clicked Turnstile checkbox[/green]")
-                else:
-                    # Some Turnstile versions use a label/div instead
-                    label = cf_frame.locator("label, .cb-lb")
+                    await checkbox.first.click(delay=random.uniform(50, 150))
+                    clicked = True
+
+                # Strategy 2: label element
+                if not clicked:
+                    label = cf_frame.locator("label, .cb-lb, .ctp-checkbox-label")
                     if await label.count() > 0:
-                        await label.first.click()
-                        console.print("  [green]Clicked Turnstile label[/green]")
+                        await label.first.click(delay=random.uniform(50, 150))
+                        clicked = True
+
+                # Strategy 3: any clickable body element (Turnstile managed challenge)
+                if not clicked:
+                    body = cf_frame.locator("body")
+                    if await body.count() > 0:
+                        # Click center of the iframe body
+                        bbox = await body.bounding_box()
+                        if bbox:
+                            await page.mouse.click(
+                                bbox["x"] + bbox["width"] / 2,
+                                bbox["y"] + bbox["height"] / 2,
+                                delay=random.uniform(50, 150),
+                            )
+                            clicked = True
+
+                if clicked:
+                    console.print(f"  [cyan]Clicked Turnstile (attempt {attempt+1})[/cyan]")
+            else:
+                # No iframe found — might be a JS challenge, just wait
+                console.print(f"  [dim]No Turnstile iframe found, waiting... (attempt {attempt+1})[/dim]")
 
             # Wait for the challenge to resolve
-            await asyncio.sleep(config.CLOUDFLARE_WAIT)
+            await asyncio.sleep(config.CLOUDFLARE_WAIT + random.uniform(0, 3))
 
-            # Check if challenge is gone
+            # Re-check
             content = await page.content()
             if "challenge-platform" not in content and "Just a moment" not in content:
                 console.print("  [green]Cloudflare challenge passed![/green]")
                 return
+
         except Exception as e:
             console.print(f"  [dim]Turnstile attempt {attempt+1}: {e}[/dim]")
-            await asyncio.sleep(3)
+            await asyncio.sleep(random.uniform(2, 5))
 
-    console.print("  [yellow]Could not auto-solve — solve manually if in headed mode[/yellow]")
-    # Give extra time for manual solving in headed mode
-    await asyncio.sleep(15)
+    console.print("  [yellow]Could not auto-solve CF after 5 attempts[/yellow]")
+    if not config.HEADLESS:
+        console.print("  [yellow]Waiting 30s for manual solve in headed mode...[/yellow]")
+        await asyncio.sleep(30)
 
 
 async def safe_goto(page: Page, url: str, wait_for_cf: bool = False) -> bool:
+    global _cf_block_count
     for attempt in range(config.MAX_RETRIES):
         try:
             resp = await page.goto(url, timeout=config.PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
@@ -203,13 +334,24 @@ async def safe_goto(page: Page, url: str, wait_for_cf: bool = False) -> bool:
                     await page.wait_for_load_state("domcontentloaded", timeout=15000)
                 except:
                     pass
+                # Check if challenge was solved
+                content = await page.content()
+                if "challenge-platform" in content or "Just a moment" in content:
+                    # Still blocked — try VPN rotation
+                    rotated = await maybe_rotate_vpn()
+                    if rotated:
+                        continue  # Retry with new IP
 
             if resp and resp.status in (200, 301, 302):
+                _cf_block_count = 0  # Reset on success
                 return True
             elif resp and resp.status == 403:
                 console.print(f"  [red]403 on attempt {attempt+1}[/red]")
-                await asyncio.sleep(config.RETRY_DELAY * (attempt + 1))
+                rotated = await maybe_rotate_vpn()
+                if not rotated:
+                    await asyncio.sleep(config.RETRY_DELAY * (attempt + 1))
             else:
+                _cf_block_count = 0
                 return True
         except Exception as e:
             console.print(f"  [red]Error attempt {attempt+1}: {e}[/red]")
@@ -670,8 +812,12 @@ async def scrape_card_images(page: Page, limit: int = 0):
                 cf_hits = sum(1 for r in results if isinstance(r, dict) and r.get("reason") in ("cf_blocked", "cf_challenge"))
                 if cf_hits > 0:
                     console.print(f"  [yellow]Cloudflare blocked {cf_hits}/{len(batch)} — refreshing session...[/yellow]")
+                    # Try rotating VPN if we keep getting blocked
+                    rotated = await maybe_rotate_vpn()
+                    if rotated:
+                        await asyncio.sleep(random.uniform(5, 10))
                     await safe_goto(page, f"{config.BASE_URL}/category/football-cards", wait_for_cf=True)
-                    await asyncio.sleep(random.uniform(10, 20))  # Longer cooldown after CF block
+                    await asyncio.sleep(random.uniform(10, 20))
 
                 for card, result in zip(batch, results):
                     pid = card["product_id"]

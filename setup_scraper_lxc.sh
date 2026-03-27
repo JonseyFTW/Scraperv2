@@ -316,6 +316,9 @@ pct exec "$CTID" -- bash -c "
     python3 -m venv venv
     source venv/bin/activate
     pip install -q -r requirements.txt 2>/dev/null
+    # Camoufox (anti-detect Firefox) — primary browser for CF bypass
+    python -m camoufox fetch 2>/dev/null || true
+    # Playwright chromium as fallback
     playwright install chromium &>/dev/null
     playwright install-deps chromium &>/dev/null
 "
@@ -344,6 +347,11 @@ if [[ "\${1:-}" == "update" ]]; then
     git pull origin ${REPO_BRANCH}
     echo "Updating dependencies..."
     pip install -q -r requirements.txt
+    # Fetch Camoufox browser binary if camoufox is installed
+    if python -c "import camoufox" 2>/dev/null; then
+        echo "Fetching Camoufox browser..."
+        python -m camoufox fetch 2>/dev/null || true
+    fi
     echo "Done! Scraper is up to date."
     exit 0
 fi
