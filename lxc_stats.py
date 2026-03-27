@@ -11,7 +11,6 @@ Usage:
 import argparse
 import json
 import os
-import sys
 import time
 from datetime import datetime
 
@@ -78,14 +77,7 @@ def calc_rates(workers, totals):
     global _prev_snapshot
     now = time.time()
 
-    # Count all cards that have been processed (anything no longer pending)
-    done_now = (
-        (totals.get("downloaded", 0) or 0) +
-        (totals.get("errors", 0) or 0) +
-        (totals.get("card_statuses", {}).get("image_found", 0) if isinstance(totals.get("card_statuses"), dict) else 0) +
-        (totals.get("card_statuses", {}).get("no_image", 0) if isinstance(totals.get("card_statuses"), dict) else 0)
-    )
-    # Fallback: use total - pending - processing as "processed" count
+    # Count all processed cards (anything no longer pending/processing)
     total_cards = totals.get("total", 0) or 0
     pending = (totals.get("pending", 0) or 0)
     processing = (totals.get("processing", 0) or 0)
@@ -141,7 +133,7 @@ def format_duration(seconds):
     return "<1m"
 
 
-def display_stats(show_rates=True):
+def display_stats():
     """Show per-container card stats."""
     workers, totals = get_worker_stats()
     overall_rate, worker_rates, eta_str = calc_rates(workers, totals)
