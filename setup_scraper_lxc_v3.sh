@@ -24,8 +24,8 @@ CROSS="${RD}✗${CL}"
 
 APP="SportsCardPro Scraper v3"
 REPO_URL="https://github.com/JonseyFTW/Scraperv2.git"
-REPO_BRANCH="refactor"  # Update to your v3 branch
-INSTALL_DIR="/opt/scraperv3"
+REPO_BRANCH="main"
+INSTALL_DIR="/opt/scraperv2"
 
 header_info() {
     clear
@@ -161,9 +161,13 @@ DB_URL=$(whiptail --title "$APP — PostgreSQL" \
 # ── Step 7: Redis (New for v3) ───────────────────────────────────────────
 header_info
 
-USE_REDIS=$(whiptail --title "$APP — Redis Task Queue" \
+if whiptail --title "$APP — Redis Task Queue" \
     --yesno "Enable Redis for distributed task queue?\n\n✓ Allows multiple workers\n✓ Better job management\n✓ Automatic retries\n\nYou can also use an external Redis server." \
-    14 60 3>&1 1>&2 2>&3) && echo "yes" || echo "no"
+    14 60; then
+    USE_REDIS="yes"
+else
+    USE_REDIS="no"
+fi
 
 REDIS_URL="redis://localhost:6379"
 if [[ "$USE_REDIS" == "yes" ]]; then
@@ -192,12 +196,44 @@ SCP_PASSWORD=$(whiptail --title "$APP — SportsCardsPro Login" \
     --passwordbox "SportsCardsPro password:" \
     8 60 "LE4Ever!" 3>&1 1>&2 2>&3) || exit 1
 
-# ── Step 9: Optimization settings (New for v3) ──────────────────────────
+# ── Step 9: NFS Data Share ────────────────────────────────────────────────
 header_info
 
-ENABLE_CDN=$(whiptail --title "$APP — CDN Pattern Discovery" \
+if whiptail --title "$APP — NFS Data Share" \
+    --yesno "Mount a shared NFS data directory?\n\n✓ Share images/CSVs/ChromaDB across containers\n✓ Avoids duplicate downloads\n✓ Centralizes data on your NAS\n\nRecommended if you have a NAS at 192.168.1.14" \
+    14 60; then
+    USE_NFS="yes"
+else
+    USE_NFS="no"
+fi
+
+NFS_SERVER=""
+NFS_EXPORT=""
+NFS_MOUNT="/mnt/scraper-data"
+if [[ "$USE_NFS" == "yes" ]]; then
+    NFS_SERVER=$(whiptail --title "$APP — NFS Server" \
+        --inputbox "NFS server IP:" \
+        8 60 "192.168.1.14" 3>&1 1>&2 2>&3) || exit 1
+
+    NFS_EXPORT=$(whiptail --title "$APP — NFS Export Path" \
+        --inputbox "NFS export path on the server:\n\n(e.g. /volume1/Data/scraper or /share/scraper)" \
+        10 60 "/volume1/Data/scraper" 3>&1 1>&2 2>&3) || exit 1
+
+    NFS_MOUNT=$(whiptail --title "$APP — Mount Point" \
+        --inputbox "Mount point inside the container:" \
+        8 60 "/mnt/scraper-data" 3>&1 1>&2 2>&3) || exit 1
+fi
+
+# ── Step 10: Optimization settings ───────────────────────────────────────
+header_info
+
+if whiptail --title "$APP — CDN Pattern Discovery" \
     --yesno "Enable CDN pattern discovery?\n\n✓ Eliminates Phase 4 entirely!\n✓ Generates image URLs without requests\n✓ 600K+ URLs in seconds vs 30+ hours\n\nHighly recommended!" \
-    14 60 3>&1 1>&2 2>&3) && echo "yes" || echo "no"
+    14 60; then
+    ENABLE_CDN="yes"
+else
+    ENABLE_CDN="no"
+fi
 
 # ── Confirm ──────────────────────────────────────────────────────────────
 header_info
@@ -214,6 +250,7 @@ whiptail --title "$APP — Confirm Setup" --yesno \
   VPN Server:     $NORD_SERVER
   Database:       $(echo "$DB_URL" | sed 's|://[^@]*@|://***@|')
   Redis:          $([ "$USE_REDIS" = "yes" ] && echo "✓ Enabled" || echo "✗ Disabled")
+  NFS Share:      $([ "$USE_NFS" = "yes" ] && echo "✓ ${NFS_SERVER}:${NFS_EXPORT} → ${NFS_MOUNT}" || echo "✗ Disabled")
   CDN Discovery:  $([ "$ENABLE_CDN" = "yes" ] && echo "✓ Enabled" || echo "✗ Disabled")
   SCP Account:    $SCP_EMAIL
 
@@ -281,6 +318,24 @@ pct exec "$CTID" -- bash -c '
 '
 msg_ok "System packages installed"
 
+# ── Mount NFS share ──────────────────────────────────────────────────────
+if [[ "$USE_NFS" == "yes" ]]; then
+    msg_info "Setting up NFS mount: ${NFS_SERVER}:${NFS_EXPORT} → ${NFS_MOUNT}"
+    pct exec "$CTID" -- bash -c "
+        apt-get install -y -qq nfs-common &>/dev/null
+        mkdir -p ${NFS_MOUNT}
+        # Add to fstab for persistence across reboots
+        echo '${NFS_SERVER}:${NFS_EXPORT} ${NFS_MOUNT} nfs defaults,soft,timeo=150,retrans=3 0 0' >> /etc/fstab
+        mount ${NFS_MOUNT}
+    "
+    # Verify mount
+    if pct exec "$CTID" -- mountpoint -q "$NFS_MOUNT" 2>/dev/null; then
+        msg_ok "NFS mounted at ${NFS_MOUNT}"
+    else
+        msg_error "NFS mount failed — check server/export path. You can fix later with: mount ${NFS_MOUNT}"
+    fi
+fi
+
 # ── Install Redis (if local) ─────────────────────────────────────────────
 if [[ "$USE_REDIS" == "yes" && "$REDIS_LOCATION" == "local" ]]; then
     msg_info "Installing Redis server"
@@ -311,6 +366,7 @@ pct exec "$CTID" -- bash -c "
     nordvpn set technology nordlynx 2>/dev/null
     nordvpn set firewall off 2>/dev/null
     nordvpn set killswitch off 2>/dev/null
+    nordvpn set lan-discovery enabled 2>/dev/null
     nordvpn set autoconnect on ${NORD_SERVER} 2>/dev/null
 " || true
 
@@ -327,6 +383,9 @@ fi
 # ── Clone repo and install Python deps (v3 optimized) ───────────────────
 msg_info "Installing scraper v3 and Python dependencies"
 pct exec "$CTID" -- bash -c "
+    # Save git credentials so 'scraper update' doesn't prompt every time
+    git config --global credential.helper store
+
     # Clone repo
     git clone --branch ${REPO_BRANCH} ${REPO_URL} ${INSTALL_DIR} &>/dev/null
     cd ${INSTALL_DIR}
@@ -364,7 +423,11 @@ msg_ok "Scraper v3 installed"
 
 # ── Write environment file ────────────────────────────────────────────────
 msg_info "Writing configuration"
-pct exec "$CTID" -- bash -c "cat > ${INSTALL_DIR}/.env << 'ENVEOF'
+NFS_ENV=""
+if [[ "$USE_NFS" == "yes" ]]; then
+    NFS_ENV="SCP_DATA_DIR=${NFS_MOUNT}"
+fi
+pct exec "$CTID" -- bash -c "cat > ${INSTALL_DIR}/.env << ENVEOF
 DATABASE_URL=${DB_URL}
 SCP_EMAIL=${SCP_EMAIL}
 SCP_PASSWORD=${SCP_PASSWORD}
@@ -372,6 +435,7 @@ REDIS_URL=${REDIS_URL}
 ENABLE_CDN_DISCOVERY=${ENABLE_CDN}
 USE_REDIS=${USE_REDIS}
 SCRAPER_VERSION=3
+${NFS_ENV}
 ENVEOF"
 
 # Helper commands for v3
@@ -407,6 +471,9 @@ case \"\${1:-}\" in
     workers)
         shift
         python lxc_stats.py \"\$@\"
+        ;;
+    reset-no-image)
+        python main_v3.py --reset-no-image
         ;;
     v2)
         shift

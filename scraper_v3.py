@@ -136,9 +136,10 @@ class AdaptiveRateLimiter:
     def __init__(self):
         self.base_delay = config.REQUEST_DELAY_MIN
         self.current_delay = self.base_delay
-        self.max_delay = 30.0
+        self.max_delay = 10.0
         self.success_count = 0
         self.error_count = 0
+        self.consecutive_403 = 0
         self.last_403 = 0
         
     async def wait(self):
@@ -148,6 +149,7 @@ class AdaptiveRateLimiter:
     def on_success(self):
         """Reduce delay after successful requests"""
         self.success_count += 1
+        self.consecutive_403 = 0
         if self.success_count > 10:
             self.current_delay = max(self.base_delay, self.current_delay * 0.9)
             self.success_count = 0
@@ -156,6 +158,7 @@ class AdaptiveRateLimiter:
         """Increase delay after errors"""
         self.error_count += 1
         if status_code == 403:
+            self.consecutive_403 += 1
             self.last_403 = time.time()
             self.current_delay = min(self.max_delay, self.current_delay * 2)
         elif status_code == 429:
@@ -163,26 +166,64 @@ class AdaptiveRateLimiter:
         else:
             self.current_delay = min(self.max_delay, self.current_delay * 1.2)
         self.success_count = 0
-        
+
     def should_rotate_session(self) -> bool:
         """Check if we should rotate to a new session"""
-        return (self.error_count > 3 or 
+        return (self.error_count > 3 or
                 (self.last_403 and time.time() - self.last_403 < 300))
+
+    def should_rotate_vpn(self) -> bool:
+        """Check if too many 403s suggest IP is burned and VPN should cycle"""
+        if self.consecutive_403 >= 50:
+            self.consecutive_403 = 0
+            return True
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Session Management with curl_cffi
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Cache browser detection globally — only probe once per process
+_supported_browsers_cache = None
+
+def _get_supported_browsers() -> list:
+    """Find which browser impersonations are supported (cached)."""
+    global _supported_browsers_cache
+    if _supported_browsers_cache is not None:
+        return _supported_browsers_cache
+
+    candidates = [
+        "chrome136", "chrome131", "chrome124", "chrome120",
+        "chrome119", "chrome116", "chrome110", "chrome107",
+        "chrome104", "chrome101", "chrome100",
+        "safari17_0", "safari15_5", "safari15_3",
+    ]
+    supported = []
+    from curl_cffi.requests import Session
+    for browser in candidates:
+        try:
+            s = Session(impersonate=browser)
+            s.close()
+            supported.append(browser)
+        except Exception:
+            continue
+    if not supported:
+        supported = ["chrome110"]
+    console.print(f"[dim]Supported browsers: {', '.join(supported)}[/dim]")
+    _supported_browsers_cache = supported
+    return supported
+
+
 class SessionManager:
     """Manage multiple curl_cffi sessions with rotation"""
-    
+
     def __init__(self):
         self.sessions = []
         self.current_index = 0
-        self.browsers = ["chrome136", "chrome135", "firefox120", "safari15_5"]
         self.rate_limiter = AdaptiveRateLimiter()
-        
+        self.browsers = _get_supported_browsers()
+
     async def create_session(self) -> AsyncSession:
         """Create a new session with random browser fingerprint"""
         browser = random.choice(self.browsers)
@@ -208,29 +249,30 @@ class SessionManager:
         return session
         
     async def get_session(self, rotate: bool = False) -> AsyncSession:
-        """Get current session or create new one"""
+        """Get current session or create new one.
+        Old sessions are NOT closed immediately to avoid killing in-flight requests.
+        They get replaced and garbage collected instead."""
         if rotate or not self.sessions or self.rate_limiter.should_rotate_session():
-            # Close old session if rotating
-            if self.sessions and self.current_index < len(self.sessions):
-                await self.sessions[self.current_index].close()
-                
-            # Create new session
+            # Create new session (don't close old one — in-flight requests may still use it)
             session = await self.create_session()
-            if rotate or not self.sessions:
+            if not self.sessions:
                 self.sessions.append(session)
             else:
-                self.sessions[self.current_index] = session
-                
-            self.current_index = (self.current_index + 1) % max(1, len(self.sessions))
+                # Replace old session in the list (old one gets GC'd)
+                self.sessions[self.current_index % len(self.sessions)] = session
+
             self.rate_limiter.error_count = 0  # Reset error count on rotation
             console.print("[cyan]Rotated to new session[/cyan]")
-            
+
         return self.sessions[self.current_index % len(self.sessions)]
-        
+
     async def close_all(self):
         """Close all sessions"""
         for session in self.sessions:
-            await session.close()
+            try:
+                await session.close()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -561,18 +603,71 @@ async def apply_cdn_pattern(pattern: str, cdn_engine: CDNPatternEngine, limit: i
     console.print(f"[bold green]Phase 4 complete: {total_processed} image URLs generated with ZERO requests![/bold green]")
 
 
+async def _cycle_vpn():
+    """Disconnect and reconnect NordVPN to get a fresh IP. Only works on Linux/LXC."""
+    import subprocess
+    import platform
+    if platform.system() != "Linux":
+        console.print("[yellow]VPN cycling only available on Linux containers[/yellow]")
+        return
+    try:
+        console.print("[cyan]Cycling VPN for fresh IP...[/cyan]")
+        subprocess.run(["nordvpn", "disconnect"], capture_output=True, timeout=10)
+        await asyncio.sleep(2)
+        subprocess.run(["nordvpn", "connect"], capture_output=True, timeout=30)
+        await asyncio.sleep(5)
+
+        # Ensure local network (192.168.1.0/24) stays reachable after VPN connects
+        # NordVPN can route everything through the tunnel, breaking DB access
+        try:
+            # Find the default gateway for local network
+            route_check = subprocess.run(
+                ["ip", "route", "show", "192.168.1.0/24"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if not route_check.stdout.strip():
+                # No local route — add one via the container's gateway
+                gw_result = subprocess.run(
+                    ["ip", "route", "show", "default"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                # Parse gateway from before VPN, or use common .1 gateway
+                gateway = "192.168.1.1"
+                for line in gw_result.stdout.split("\n"):
+                    if "192.168" in line and "via" in line:
+                        parts = line.split()
+                        gw_idx = parts.index("via") + 1
+                        gateway = parts[gw_idx]
+                        break
+                subprocess.run(
+                    ["ip", "route", "add", "192.168.1.0/24", "via", gateway],
+                    capture_output=True, timeout=5,
+                )
+                console.print(f"[green]  Added local route via {gateway}[/green]")
+        except Exception:
+            pass
+
+        # Check new IP
+        result = subprocess.run(["nordvpn", "status"], capture_output=True, text=True, timeout=10)
+        for line in result.stdout.split("\n"):
+            if "IP" in line or "Server" in line:
+                console.print(f"[green]  {line.strip()}[/green]")
+    except Exception as e:
+        console.print(f"[yellow]VPN cycle failed: {e}[/yellow]")
+
+
 async def scrape_with_curl_cffi(limit: int):
     """Fallback scraping using curl_cffi for fast parallel requests"""
     console.print("[yellow]Using curl_cffi for image URL scraping[/yellow]")
     
     session_mgr = SessionManager()
-    batch_size = 10
+    batch_size = 20
     total_ok = 0
     total_no_image = 0
     total_error = 0
     
     while True:
-        cards = db.get_cards_needing_images(100)
+        cards = db.get_cards_needing_images(500)
         if not cards or (limit > 0 and total_ok >= limit):
             break
             
@@ -598,19 +693,37 @@ async def scrape_with_curl_cffi(limit: int):
                     
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 
+                needs_rotation = False
                 for card, result in zip(batch, results):
                     if isinstance(result, Exception):
                         db.mark_card_error(card['product_id'], str(result))
                         total_error += 1
                         session_mgr.rate_limiter.on_error()
-                    elif result:
-                        db.update_card_image_url(card['product_id'], result)
+                    elif isinstance(result, FetchResult) and result.image_url:
+                        db.update_card_image_url(card['product_id'], result.image_url)
                         total_ok += 1
                         session_mgr.rate_limiter.on_success()
+                    elif isinstance(result, FetchResult) and result.error:
+                        # Retryable — HTTP errors, timeouts, Cloudflare blocks
+                        db.mark_card_error(card['product_id'], result.error)
+                        total_error += 1
+                        session_mgr.rate_limiter.on_error(result.status_code)
+                        if result.status_code in (403, 429, 503):
+                            needs_rotation = True
                     else:
+                        # Page loaded fine but genuinely no image on it
                         db.mark_card_no_image(card['product_id'])
                         total_no_image += 1
-                        
+
+                # Rotate session if we're getting blocked
+                if needs_rotation or session_mgr.rate_limiter.should_rotate_session():
+                    session = await session_mgr.get_session(rotate=True)
+
+                # Cycle VPN if IP is burned (10+ consecutive 403s)
+                if session_mgr.rate_limiter.should_rotate_vpn():
+                    await _cycle_vpn()
+                    session = await session_mgr.get_session(rotate=True)
+
                 progress.advance(task, len(batch))
                 await session_mgr.rate_limiter.wait()
                 
@@ -618,23 +731,42 @@ async def scrape_with_curl_cffi(limit: int):
     console.print(f"Complete: {total_ok} found, {total_no_image} no image, {total_error} errors")
 
 
-async def fetch_image_url(session: AsyncSession, card: dict) -> Optional[str]:
-    """Fetch image URL from a card page using curl_cffi"""
+class FetchResult:
+    """Result of fetch_image_url — distinguishes success, no-image, and errors."""
+    __slots__ = ('image_url', 'error', 'no_image', 'status_code')
+    def __init__(self, image_url=None, error=None, no_image=False, status_code=0):
+        self.image_url = image_url
+        self.error = error
+        self.no_image = no_image
+        self.status_code = status_code
+
+
+async def fetch_image_url(session: AsyncSession, card: dict) -> FetchResult:
+    """Fetch image URL from a card page using curl_cffi.
+    Returns FetchResult to distinguish between no-image vs errors."""
+    url = card.get('full_url', '')
     try:
-        resp = await session.get(card['full_url'], timeout=10)
+        resp = await session.get(url, timeout=10)
         if resp.status_code != 200:
-            return None
-            
+            return FetchResult(error=f"HTTP {resp.status_code}", status_code=resp.status_code)
+
         # Extract image URL from HTML
         pattern = r'https://storage\.googleapis\.com/images\.pricecharting\.com/([^/\s"\'<>]+)/\d+'
         match = re.search(pattern, resp.text)
-        
+
         if match:
-            return f"https://storage.googleapis.com/images.pricecharting.com/{match.group(1)}/1600.jpg"
-        return None
-        
-    except Exception:
-        return None
+            image_url = f"https://storage.googleapis.com/images.pricecharting.com/{match.group(1)}/1600.jpg"
+            return FetchResult(image_url=image_url)
+
+        # Page loaded OK but genuinely no image on it
+        return FetchResult(no_image=True)
+
+    except Exception as e:
+        err_str = str(e)
+        # "Session is closed" is retryable, not a real failure
+        if "session is closed" in err_str.lower():
+            return FetchResult(error=f"Session closed (retryable)")
+        return FetchResult(error=f"{e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
