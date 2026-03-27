@@ -18,6 +18,7 @@ import glob
 import json
 import subprocess
 import shutil
+import time
 from urllib.parse import urljoin, urlparse
 from pathlib import Path
 
@@ -53,6 +54,23 @@ except ImportError:
         except ImportError:
             async def stealth_async(page):
                 pass  # No stealth available
+
+
+def _format_eta(seconds: float) -> str:
+    """Format seconds into a human-readable ETA like '3 days 12 hours 7 minutes'."""
+    if seconds <= 0:
+        return "done"
+    parts = []
+    days = int(seconds // 86400)
+    if days > 0:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    hours = int((seconds % 86400) // 3600)
+    if hours > 0:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    minutes = int((seconds % 3600) // 60)
+    if minutes > 0 or not parts:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    return " ".join(parts)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -740,12 +758,23 @@ async def scrape_card_images(page: Page, limit: int = 0):
     total_no_image = 0
     total_error = 0
 
-    console.print(f"\n[bold]Phase 4: Scraping image URLs via in-browser fetch ({FETCH_BATCH}x parallel)[/bold]\n")
+    # Get total remaining count for ETA calculation
+    total_remaining = db.count_pending_images()
+    if limit > 0:
+        total_remaining = min(total_remaining, limit)
+
+    console.print(f"\n[bold]Phase 4: Scraping image URLs via in-browser fetch ({FETCH_BATCH}x parallel)[/bold]")
+    console.print(f"  [dim]{total_remaining:,} cards remaining[/dim]\n")
 
     # Navigate to a real SCP page to establish CF cookies + warm up
     console.print("  [cyan]Warming up browser session...[/cyan]")
     await safe_goto(page, f"{config.BASE_URL}/login", wait_for_cf=True)
     await asyncio.sleep(random.uniform(3, 6))  # Human-like pause after page load
+
+    phase4_start = time.time()
+    total_processed = 0
+    last_eta_print = 0  # timestamp of last ETA display
+    ETA_INTERVAL = 120  # show ETA every 2 minutes
 
     while True:
         cards = db.get_cards_needing_images(DB_BATCH)
@@ -838,6 +867,26 @@ async def scrape_card_images(page: Page, limit: int = 0):
                         total_error += 1
 
                 progress.advance(ptask, len(batch))
+                total_processed += len(batch)
+
+                # Show ETA every 2 minutes
+                now = time.time()
+                if now - last_eta_print >= ETA_INTERVAL and total_processed > 0:
+                    elapsed = now - phase4_start
+                    cards_per_sec = total_processed / elapsed
+                    cards_left = total_remaining - total_processed
+                    if cards_per_sec > 0 and cards_left > 0:
+                        eta_seconds = cards_left / cards_per_sec
+                        eta_str = _format_eta(eta_seconds)
+                        console.print(
+                            f"  [cyan]ETA: ~{eta_str}[/cyan] — "
+                            f"[green]{total_ok:,}[/green] found, "
+                            f"[red]{total_error:,}[/red] errors, "
+                            f"{cards_per_sec:.1f} cards/sec, "
+                            f"{cards_left:,} remaining"
+                        )
+                    last_eta_print = now
+
                 await asyncio.sleep(random.uniform(BATCH_DELAY_MIN, BATCH_DELAY_MAX))
 
         console.print(f"  Batch done -- OK: [green]{total_ok}[/green], No image: [yellow]{total_no_image}[/yellow], Errors: [red]{total_error}[/red]")
@@ -861,7 +910,9 @@ async def scrape_card_images(page: Page, limit: int = 0):
     else:
         remaining_errors = 0
 
+    elapsed = time.time() - phase4_start
     console.print(f"\n  Final: [green]{total_ok}[/green] image URLs, [yellow]{total_no_image}[/yellow] no image, [red]{remaining_errors}[/red] remaining errors")
+    console.print(f"  [dim]Completed in {_format_eta(elapsed)}[/dim]")
     db.log_event("phase4_complete", f"Found {total_ok} image URLs, {total_no_image} no image, {remaining_errors} remaining errors")
 
 
@@ -1098,6 +1149,7 @@ async def download_images(limit: int = 0):
     skipped = 0  # already cached locally
     failed = 0
     sem = asyncio.Semaphore(config.IMAGE_CONCURRENT_DOWNLOADS)
+    phase5_start = time.time()
 
     # Shared state for live display
     progress_state = {"current_file": "", "current_set": ""}
@@ -1124,6 +1176,15 @@ async def download_images(limit: int = 0):
 
         def make_status_table():
             tbl = Table.grid(padding=(0, 2))
+            total_done = downloaded + skipped + failed
+            elapsed = time.time() - phase5_start
+            # ETA calculation
+            eta_str = ""
+            if total_done > 0 and elapsed > 5:
+                rate = total_done / elapsed
+                remaining = total_to_download - total_done
+                if rate > 0 and remaining > 0:
+                    eta_str = f"  [cyan]ETA: ~{_format_eta(remaining / rate)}[/cyan] ({rate:.1f}/sec)"
             tbl.add_row(
                 f"  [green]✓ {downloaded:,}[/green] downloaded",
                 f"[yellow]⊘ {skipped:,}[/yellow] cached",
@@ -1132,7 +1193,7 @@ async def download_images(limit: int = 0):
             tbl.add_row(
                 f"  [dim]Set: {progress_state['current_set'][:50]}[/dim]",
                 f"[dim]File: {progress_state['current_file'][:50]}[/dim]",
-                "",
+                eta_str,
             )
             return tbl
 
@@ -1170,6 +1231,7 @@ async def download_images(limit: int = 0):
                     break
 
     # Final summary
+    elapsed = time.time() - phase5_start
     console.print()
     summary = Table.grid(padding=(0, 2))
     summary.add_row("[bold]Phase 5 Complete[/bold]")
@@ -1179,7 +1241,10 @@ async def download_images(limit: int = 0):
         f"[red]✗ {failed:,}[/red] failed",
     )
     total = downloaded + skipped + failed
-    summary.add_row(f"  [bold]{total:,}[/bold] total processed")
+    summary.add_row(
+        f"  [bold]{total:,}[/bold] total processed",
+        f"[dim]in {_format_eta(elapsed)}[/dim]",
+    )
     console.print(Panel(summary, border_style="green" if failed == 0 else "yellow"))
     db.log_event("phase5_complete", f"Downloaded {downloaded}, cached {skipped}, failed {failed}")
 

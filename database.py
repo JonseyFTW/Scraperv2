@@ -219,6 +219,17 @@ def get_cards_needing_images(limit: int = 500) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def count_pending_images() -> int:
+    """Count how many cards still need image scraping (pending status)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT count(*) FROM cards WHERE status = 'pending'")
+    count = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return count
+
+
 def get_errored_cards(limit: int = 500) -> list[dict]:
     """Claim errored cards for retry. Uses SKIP LOCKED for concurrency."""
     conn = get_connection()
