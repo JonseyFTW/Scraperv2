@@ -229,7 +229,16 @@ def generate_embeddings(limit: int = 0):
             console.print(f"\n[yellow]Reached limit of {limit}[/yellow]")
             break
 
-    console.print(f"\n[green]Generated {total} embeddings ({collection.count()} total in ChromaDB)[/green]")
+    # Ensure data is flushed to disk so other tools (migrate_chroma.py) can see it
+    global _chroma_client, _chroma_collection
+    final_count = collection.count()
+    if _chroma_client is not None:
+        del _chroma_collection
+        del _chroma_client
+        _chroma_collection = None
+        _chroma_client = None
+
+    console.print(f"\n[green]Generated {total} embeddings ({final_count} total in ChromaDB)[/green]")
     if _skipped_ids:
         console.print(f"[yellow]Skipped {len(_skipped_ids)} cards (image file not found on disk)[/yellow]")
 
