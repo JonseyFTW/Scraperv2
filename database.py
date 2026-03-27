@@ -13,10 +13,18 @@ from config import DATABASE_URL
 WORKER_ID = os.environ.get("WORKER_ID", socket.gethostname())
 
 
-def get_connection():
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.autocommit = False
-    return conn
+def get_connection(retries=3):
+    for attempt in range(retries):
+        try:
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            conn.autocommit = False
+            return conn
+        except psycopg2.OperationalError:
+            if attempt < retries - 1:
+                import time
+                time.sleep(2 ** attempt)
+            else:
+                raise
 
 
 def init_db():
