@@ -28,7 +28,18 @@ COLLECTION_NAME = "card_images"
 
 
 def get_local_client():
-    """Connect to local persistent ChromaDB."""
+    """Connect to local persistent ChromaDB.
+    Forces SQLite WAL checkpoint so we see the latest embeddings."""
+    import sqlite3
+    import glob
+    # Force WAL checkpoint on ChromaDB's SQLite before opening
+    for db_file in glob.glob(f"{config.CHROMA_DIR}/**/chroma.sqlite3", recursive=True):
+        try:
+            conn = sqlite3.connect(db_file)
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.close()
+        except Exception:
+            pass
     return chromadb.PersistentClient(path=config.CHROMA_DIR)
 
 
