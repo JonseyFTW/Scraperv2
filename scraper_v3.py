@@ -40,6 +40,7 @@ except ImportError:
     # Fallback to Playwright if needed
     from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
+import psycopg2
 import config
 import database as db
 
@@ -702,25 +703,29 @@ async def scrape_with_curl_cffi(limit: int):
                 
                 needs_rotation = False
                 for card, result in zip(batch, results):
-                    if isinstance(result, Exception):
-                        db.mark_card_error(card['product_id'], str(result))
+                    try:
+                        if isinstance(result, Exception):
+                            db.mark_card_error(card['product_id'], str(result))
+                            total_error += 1
+                            session_mgr.rate_limiter.on_error()
+                        elif isinstance(result, FetchResult) and result.image_url:
+                            db.update_card_image_url(card['product_id'], result.image_url)
+                            total_ok += 1
+                            session_mgr.rate_limiter.on_success()
+                        elif isinstance(result, FetchResult) and result.error:
+                            # Retryable — HTTP errors, timeouts, Cloudflare blocks
+                            db.mark_card_error(card['product_id'], result.error)
+                            total_error += 1
+                            session_mgr.rate_limiter.on_error(result.status_code)
+                            if result.status_code in (403, 429, 503):
+                                needs_rotation = True
+                        else:
+                            # Page loaded fine but genuinely no image on it
+                            db.mark_card_no_image(card['product_id'])
+                            total_no_image += 1
+                    except psycopg2.OperationalError as db_err:
+                        console.print(f"[yellow]DB error (will retry card later): {db_err}[/yellow]")
                         total_error += 1
-                        session_mgr.rate_limiter.on_error()
-                    elif isinstance(result, FetchResult) and result.image_url:
-                        db.update_card_image_url(card['product_id'], result.image_url)
-                        total_ok += 1
-                        session_mgr.rate_limiter.on_success()
-                    elif isinstance(result, FetchResult) and result.error:
-                        # Retryable — HTTP errors, timeouts, Cloudflare blocks
-                        db.mark_card_error(card['product_id'], result.error)
-                        total_error += 1
-                        session_mgr.rate_limiter.on_error(result.status_code)
-                        if result.status_code in (403, 429, 503):
-                            needs_rotation = True
-                    else:
-                        # Page loaded fine but genuinely no image on it
-                        db.mark_card_no_image(card['product_id'])
-                        total_no_image += 1
 
                 # Rotate session if we're getting blocked
                 if needs_rotation or session_mgr.rate_limiter.should_rotate_session():

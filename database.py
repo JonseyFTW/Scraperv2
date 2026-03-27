@@ -34,29 +34,53 @@ def _get_pool():
     return _pool
 
 
+def _conn_is_alive(conn):
+    """Check if a pooled connection is still usable."""
+    try:
+        if conn.closed:
+            return False
+        # Reset any failed transaction state and ping the server
+        conn.rollback()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        return True
+    except Exception:
+        return False
+
+
 def get_connection(retries=3):
-    """Get a connection from the pool (falls back to direct connect on pool error)."""
+    """Get a healthy connection from the pool, replacing dead ones."""
     for attempt in range(retries):
         try:
             pool = _get_pool()
             conn = pool.getconn()
-            conn.autocommit = False
-            return conn
+            if _conn_is_alive(conn):
+                conn.autocommit = False
+                return conn
+            # Connection is dead — discard it and try again
+            pool.putconn(conn, close=True)
+            continue
         except (psycopg2.OperationalError, psycopg2.pool.PoolError):
             if attempt < retries - 1:
                 import time
                 time.sleep(2 ** attempt)
             else:
                 raise
+    # All retries exhausted (e.g. dead connections each time) — direct connect
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    conn.autocommit = False
+    return conn
 
 
 def put_connection(conn):
-    """Return a connection to the pool instead of closing it."""
+    """Return a connection to the pool, discarding it if broken."""
     try:
+        if conn.closed:
+            return
         pool = _get_pool()
         pool.putconn(conn)
     except Exception:
-        # If pool is broken, just close it directly
         try:
             conn.close()
         except Exception:
