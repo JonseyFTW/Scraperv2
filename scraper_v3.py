@@ -180,8 +180,34 @@ class SessionManager:
     def __init__(self):
         self.sessions = []
         self.current_index = 0
-        self.browsers = ["chrome136", "chrome135", "firefox120", "safari15_5"]
         self.rate_limiter = AdaptiveRateLimiter()
+        # Detect supported browser fingerprints for this curl_cffi version
+        self.browsers = self._detect_browsers()
+
+    @staticmethod
+    def _detect_browsers() -> list:
+        """Find which browser impersonations are actually supported."""
+        # Preferred order: newest Chrome first, then others
+        candidates = [
+            "chrome136", "chrome131", "chrome124", "chrome120",
+            "chrome119", "chrome116", "chrome110", "chrome107",
+            "chrome104", "chrome101", "chrome100",
+            "safari17_0", "safari15_5", "safari15_3",
+        ]
+        supported = []
+        for browser in candidates:
+            try:
+                from curl_cffi.requests import Session
+                s = Session(impersonate=browser)
+                s.close()
+                supported.append(browser)
+            except Exception:
+                continue
+        if not supported:
+            # Absolute fallback
+            supported = ["chrome110"]
+        console.print(f"[dim]Supported browsers: {', '.join(supported)}[/dim]")
+        return supported
         
     async def create_session(self) -> AsyncSession:
         """Create a new session with random browser fingerprint"""
