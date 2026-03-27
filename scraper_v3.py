@@ -598,6 +598,7 @@ async def scrape_with_curl_cffi(limit: int):
                     
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 
+                needs_rotation = False
                 for card, result in zip(batch, results):
                     if isinstance(result, Exception):
                         db.mark_card_error(card['product_id'], str(result))
@@ -611,12 +612,18 @@ async def scrape_with_curl_cffi(limit: int):
                         # Retryable — HTTP errors, timeouts, Cloudflare blocks
                         db.mark_card_error(card['product_id'], result.error)
                         total_error += 1
-                        session_mgr.rate_limiter.on_error()
+                        session_mgr.rate_limiter.on_error(result.status_code)
+                        if result.status_code in (403, 429, 503):
+                            needs_rotation = True
                     else:
                         # Page loaded fine but genuinely no image on it
                         db.mark_card_no_image(card['product_id'])
                         total_no_image += 1
-                        
+
+                # Rotate session if we're getting blocked
+                if needs_rotation or session_mgr.rate_limiter.should_rotate_session():
+                    session = await session_mgr.get_session(rotate=True)
+
                 progress.advance(task, len(batch))
                 await session_mgr.rate_limiter.wait()
                 
@@ -626,11 +633,12 @@ async def scrape_with_curl_cffi(limit: int):
 
 class FetchResult:
     """Result of fetch_image_url — distinguishes success, no-image, and errors."""
-    __slots__ = ('image_url', 'error', 'no_image')
-    def __init__(self, image_url=None, error=None, no_image=False):
+    __slots__ = ('image_url', 'error', 'no_image', 'status_code')
+    def __init__(self, image_url=None, error=None, no_image=False, status_code=0):
         self.image_url = image_url
         self.error = error
         self.no_image = no_image
+        self.status_code = status_code
 
 
 async def fetch_image_url(session: AsyncSession, card: dict) -> FetchResult:
@@ -640,7 +648,7 @@ async def fetch_image_url(session: AsyncSession, card: dict) -> FetchResult:
     try:
         resp = await session.get(url, timeout=10)
         if resp.status_code != 200:
-            return FetchResult(error=f"HTTP {resp.status_code} for {url}")
+            return FetchResult(error=f"HTTP {resp.status_code}", status_code=resp.status_code)
 
         # Extract image URL from HTML
         pattern = r'https://storage\.googleapis\.com/images\.pricecharting\.com/([^/\s"\'<>]+)/\d+'
