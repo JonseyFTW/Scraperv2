@@ -486,18 +486,24 @@ esac
 SCRIPTEOF
 chmod +x /usr/local/bin/scraper"
 
+# Symlink into /usr/bin so 'pct exec <CTID> -- scraper' works
+# (pct exec doesn't include /usr/local/bin in PATH)
+pct exec "$CTID" -- ln -sf /usr/local/bin/scraper /usr/bin/scraper
+
 # Keep legacy aliases for backwards compat
 pct exec "$CTID" -- bash -c "cat > /usr/local/bin/scraper-v2 << 'SCRIPTEOF'
 #!/bin/bash
 exec scraper v2 \"\$@\"
 SCRIPTEOF
 chmod +x /usr/local/bin/scraper-v2"
+pct exec "$CTID" -- ln -sf /usr/local/bin/scraper-v2 /usr/bin/scraper-v2
 
 pct exec "$CTID" -- bash -c "cat > /usr/local/bin/test-cdn << 'SCRIPTEOF'
 #!/bin/bash
 exec scraper cdn-test
 SCRIPTEOF
 chmod +x /usr/local/bin/test-cdn"
+pct exec "$CTID" -- ln -sf /usr/local/bin/test-cdn /usr/bin/test-cdn
 
 if [[ "$USE_REDIS" == "yes" ]]; then
     pct exec "$CTID" -- bash -c "cat > /usr/local/bin/scraper-queue << 'SCRIPTEOF'
@@ -505,6 +511,7 @@ if [[ "$USE_REDIS" == "yes" ]]; then
 exec scraper queue
 SCRIPTEOF
 chmod +x /usr/local/bin/scraper-queue"
+    pct exec "$CTID" -- ln -sf /usr/local/bin/scraper-queue /usr/bin/scraper-queue
 fi
 
 msg_ok "Configuration written"
