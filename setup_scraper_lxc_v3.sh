@@ -377,41 +377,61 @@ ENVEOF"
 # Helper commands for v3
 pct exec "$CTID" -- bash -c "cat > /usr/local/bin/scraper << 'SCRIPTEOF'
 #!/bin/bash
-cd ${INSTALL_DIR}
+INSTALL_DIR=\"${INSTALL_DIR}\"
+cd \"\$INSTALL_DIR\"
 set -a; source .env; set +a
 source venv/bin/activate
-python main_v3.py \"\$@\"
+
+case \"\${1:-}\" in
+    update)
+        echo \"Pulling latest changes...\"
+        git pull origin main
+        echo \"Updating dependencies...\"
+        pip install -q -r requirements.txt
+        pip install -q curl-cffi>=0.7.0 scrapling>=0.2.0 redis>=5.0.0 2>/dev/null || true
+        if python -c \"import camoufox\" 2>/dev/null; then
+            echo \"Fetching Camoufox browser...\"
+            python -m camoufox fetch 2>/dev/null || true
+        fi
+        echo \"Done! Scraper is up to date.\"
+        ;;
+    vpn)
+        nordvpn status
+        ;;
+    cdn-test)
+        python main_v3.py --cdn-test
+        ;;
+    queue)
+        python task_queue.py stats
+        ;;
+    v2)
+        shift
+        python main.py \"\$@\"
+        ;;
+    *)
+        python main_v3.py \"\$@\"
+        ;;
+esac
 SCRIPTEOF
 chmod +x /usr/local/bin/scraper"
 
-# Add v2 fallback command
+# Keep legacy aliases for backwards compat
 pct exec "$CTID" -- bash -c "cat > /usr/local/bin/scraper-v2 << 'SCRIPTEOF'
 #!/bin/bash
-cd ${INSTALL_DIR}
-set -a; source .env; set +a
-source venv/bin/activate
-python main.py \"\$@\"
+exec scraper v2 \"\$@\"
 SCRIPTEOF
 chmod +x /usr/local/bin/scraper-v2"
 
-# Add CDN test command
 pct exec "$CTID" -- bash -c "cat > /usr/local/bin/test-cdn << 'SCRIPTEOF'
 #!/bin/bash
-cd ${INSTALL_DIR}
-set -a; source .env; set +a
-source venv/bin/activate
-python main_v3.py --cdn-test
+exec scraper cdn-test
 SCRIPTEOF
 chmod +x /usr/local/bin/test-cdn"
 
-# Add Redis monitor command
 if [[ "$USE_REDIS" == "yes" ]]; then
     pct exec "$CTID" -- bash -c "cat > /usr/local/bin/scraper-queue << 'SCRIPTEOF'
 #!/bin/bash
-cd ${INSTALL_DIR}
-set -a; source .env; set +a
-source venv/bin/activate
-python task_queue.py stats
+exec scraper queue
 SCRIPTEOF
 chmod +x /usr/local/bin/scraper-queue"
 fi
