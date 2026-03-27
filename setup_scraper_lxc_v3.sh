@@ -327,21 +327,38 @@ fi
 # ── Clone repo and install Python deps (v3 optimized) ───────────────────
 msg_info "Installing scraper v3 and Python dependencies"
 pct exec "$CTID" -- bash -c "
+    # Clone repo
     git clone --branch ${REPO_BRANCH} ${REPO_URL} ${INSTALL_DIR} &>/dev/null
     cd ${INSTALL_DIR}
+    
+    # Create virtual environment (required for Ubuntu 24.04+)
     python3 -m venv venv
     source venv/bin/activate
     
+    # Verify we're in venv
+    echo \"Using Python: \$(which python)\"
+    echo \"Using pip: \$(which pip)\"
+    
     # Install v3 dependencies
     pip install -q --upgrade pip wheel setuptools &>/dev/null
-    pip install -q curl-cffi &>/dev/null
-    pip install -q scrapling &>/dev/null || echo 'Scrapling optional, skipping'
-    pip install -q redis &>/dev/null || echo 'Redis optional, skipping'
+    
+    # Install curl_cffi with build dependencies
+    pip install -q curl-cffi &>/dev/null || {
+        echo 'Installing curl_cffi with build dependencies...'
+        apt-get install -y -qq python3-dev libcurl4-openssl-dev &>/dev/null
+        pip install -q curl-cffi &>/dev/null
+    }
+    
+    # Install optional v3 packages
+    pip install -q scrapling &>/dev/null || echo 'Scrapling optional, will use Playwright fallback'
+    pip install -q redis &>/dev/null || echo 'Redis optional, will use PostgreSQL queue'
+    
+    # Install base requirements
     pip install -q -r requirements.txt &>/dev/null
     
     # Install Playwright for fallback
     playwright install chromium &>/dev/null
-    playwright install-deps chromium &>/dev/null
+    playwright install-deps chromium &>/dev/null || true
 "
 msg_ok "Scraper v3 installed"
 
