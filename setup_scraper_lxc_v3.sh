@@ -408,6 +408,9 @@ case \"\${1:-}\" in
         shift
         python lxc_stats.py \"\$@\"
         ;;
+    reset-no-image)
+        python main_v3.py --reset-no-image
+        ;;
     v2)
         shift
         python main.py \"\$@\"
