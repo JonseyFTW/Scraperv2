@@ -237,15 +237,15 @@ def generate_embeddings(limit: int = 0):
     if _chroma_client is not None:
         try:
             import sqlite3
-            import glob
             # Release ChromaDB's hold first
             del _chroma_collection
             del _chroma_client
             _chroma_collection = None
             _chroma_client = None
 
-            # Now checkpoint the WAL
-            for db_file in glob.glob(f"{config.CHROMA_DIR}/**/chroma.sqlite3", recursive=True):
+            # Checkpoint the WAL so data is visible to other processes
+            db_file = os.path.join(config.CHROMA_DIR, "chroma.sqlite3")
+            if os.path.exists(db_file):
                 conn = sqlite3.connect(db_file)
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 conn.close()
