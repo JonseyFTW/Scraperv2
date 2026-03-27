@@ -749,14 +749,19 @@ async def scrape_card_images(page: Page, limit: int = 0):
     This bypasses Cloudflare since the browser context already has CF cookies.
     Processes ~10-25 cards/sec depending on rate limiting.
     """
-    FETCH_BATCH = 2           # parallel fetches per batch (lower = less suspicious)
-    BATCH_DELAY_MIN = 4       # min seconds between batches
-    BATCH_DELAY_MAX = 8       # max seconds between batches
-    CF_REFRESH_EVERY = 25     # re-validate CF cookies every N batches
+    # Adaptive speed settings — starts fast, throttles on CF blocks
+    FETCH_BATCH = 6           # parallel fetches per batch
+    BATCH_DELAY_MIN = 1.5     # min seconds between batches (when things are good)
+    BATCH_DELAY_MAX = 3.0     # max seconds between batches
+    CF_REFRESH_EVERY = 50     # re-validate CF cookies every N batches
     DB_BATCH    = 500         # cards per DB fetch
     total_ok    = 0
     total_no_image = 0
     total_error = 0
+
+    # Adaptive throttle — increases on CF blocks, decreases on success
+    throttle_multiplier = 1.0  # 1.0 = normal, higher = slower
+    consecutive_ok_batches = 0
 
     # Get total remaining count for ETA calculation
     total_remaining = db.count_pending_images()
@@ -837,16 +842,25 @@ async def scrape_card_images(page: Page, limit: int = 0):
                 except Exception:
                     results = [{"hash": None, "reason": "evaluate_error"}] * len(batch)
 
-                # If we got CF blocked, pause and refresh the session
+                # Adaptive throttle based on CF blocks
                 cf_hits = sum(1 for r in results if isinstance(r, dict) and r.get("reason") in ("cf_blocked", "cf_challenge"))
                 if cf_hits > 0:
-                    console.print(f"  [yellow]Cloudflare blocked {cf_hits}/{len(batch)} — refreshing session...[/yellow]")
-                    # Try rotating VPN if we keep getting blocked
+                    consecutive_ok_batches = 0
+                    throttle_multiplier = min(throttle_multiplier * 2.0, 8.0)  # Double delay, cap at 8x
+                    console.print(f"  [yellow]CF blocked {cf_hits}/{len(batch)} — throttle {throttle_multiplier:.0f}x, refreshing...[/yellow]")
                     rotated = await maybe_rotate_vpn()
                     if rotated:
                         await asyncio.sleep(random.uniform(5, 10))
+                        throttle_multiplier = 1.0  # Reset after VPN rotation
                     await safe_goto(page, f"{config.BASE_URL}/category/football-cards", wait_for_cf=True)
-                    await asyncio.sleep(random.uniform(10, 20))
+                    await asyncio.sleep(random.uniform(8, 15) * throttle_multiplier)
+                else:
+                    consecutive_ok_batches += 1
+                    # Speed back up after 5 consecutive clean batches
+                    if consecutive_ok_batches >= 5 and throttle_multiplier > 1.0:
+                        throttle_multiplier = max(throttle_multiplier * 0.5, 1.0)
+                        if throttle_multiplier <= 1.0:
+                            console.print(f"  [green]Throttle cleared — back to full speed[/green]")
 
                 for card, result in zip(batch, results):
                     pid = card["product_id"]
@@ -887,7 +901,8 @@ async def scrape_card_images(page: Page, limit: int = 0):
                         )
                     last_eta_print = now
 
-                await asyncio.sleep(random.uniform(BATCH_DELAY_MIN, BATCH_DELAY_MAX))
+                delay = random.uniform(BATCH_DELAY_MIN, BATCH_DELAY_MAX) * throttle_multiplier
+                await asyncio.sleep(delay)
 
         console.print(f"  Batch done -- OK: [green]{total_ok}[/green], No image: [yellow]{total_no_image}[/yellow], Errors: [red]{total_error}[/red]")
 
@@ -1203,7 +1218,7 @@ async def download_images(limit: int = 0):
                 live.update(Group(progress, make_status_table()))
 
             while True:
-                cards = db.get_cards_needing_download(200)
+                cards = db.get_cards_needing_download(500)
                 if not cards:
                     break
 
