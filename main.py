@@ -119,8 +119,14 @@ async def run_phase(phase: int, sport: str = None, limit: int = 0):
             elif phase == 4:
                 await scraper.scrape_card_images(page, limit)
         finally:
-            await context.close()
-            await browser.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
 def main():
