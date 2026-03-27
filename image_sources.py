@@ -513,48 +513,52 @@ class MultiSourceImageFinder:
 
         async def _run_source(name, fn):
             try:
-                return await asyncio.wait_for(fn(session, card), timeout=12)
+                result = await asyncio.wait_for(fn(session, card), timeout=12)
+                return (name, result)
             except asyncio.TimeoutError:
-                return SourceResult(source=name, error="timeout")
+                return (name, SourceResult(source=name, error="timeout"))
             except asyncio.CancelledError:
-                return SourceResult(source=name, error="cancelled")
+                return (name, SourceResult(source=name, error="cancelled"))
+            except Exception as e:
+                return (name, SourceResult(source=name, error=str(e)[:200]))
 
         # Launch all sources concurrently
-        tasks = {
-            name: asyncio.create_task(_run_source(name, fn))
+        tasks = [
+            asyncio.create_task(_run_source(name, fn))
             for name, fn in self.sources
-        }
+        ]
 
         winner = None
         last_result = SourceResult(source="none", error="no sources configured")
+        errors_for_card = []
 
-        # As each finishes, check if it found an image
-        for coro in asyncio.as_completed(tasks.values()):
-            result = await coro
-            source_name = result.source
+        # Wait for all to complete (they're fast with timeouts)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for item in results:
+            if isinstance(item, Exception):
+                continue
+            name, result = item
 
             if result.image_url and not winner:
                 winner = result
-                self.stats.found[source_name] = self.stats.found.get(source_name, 0) + 1
+                self.stats.found[name] = self.stats.found.get(name, 0) + 1
                 self.stats.total_found += 1
-                console.print(f"  [green]✓[/green] {source_name}: {card_name}")
-                # Cancel all remaining tasks
-                for name, task in tasks.items():
-                    if not task.done():
-                        task.cancel()
-                break
+                console.print(f"  [green]✓ {name}[/green]: {card_name}")
             elif result.error and result.error != "cancelled":
-                self.stats.errors[source_name] = self.stats.errors.get(source_name, 0) + 1
+                self.stats.errors[name] = self.stats.errors.get(name, 0) + 1
+                errors_for_card.append(f"{name}={result.error[:40]}")
                 last_result = result
             else:
-                self.stats.missed[source_name] = self.stats.missed.get(source_name, 0) + 1
+                self.stats.missed[name] = self.stats.missed.get(name, 0) + 1
                 last_result = result
 
         if winner:
             return winner
 
         self.stats.total_not_found += 1
-        console.print(f"  [yellow]✗[/yellow] no image: {card_name}")
+        err_summary = " | ".join(errors_for_card) if errors_for_card else "no results"
+        console.print(f"  [yellow]✗[/yellow] {card_name} [{err_summary}]")
         return last_result
 
     async def find_images_batch(
