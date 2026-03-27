@@ -1263,8 +1263,14 @@ async def run_full_pipeline(sport: str = None, limit: int = 0):
             parse_csvs()
 
         finally:
-            await context.close()
-            await browser.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
     # Phase 4: Scrape image URLs via lightweight HTTP (no browser needed!)
     # Uses /offers?product={id} endpoint: ~38 KB vs ~289 KB, 20x concurrent

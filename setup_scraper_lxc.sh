@@ -274,7 +274,12 @@ pct exec "$CTID" -- bash -c '
         python3 python3-pip python3-venv \
         git curl wget gnupg2 apt-transport-https \
         libpq-dev build-essential \
-        ca-certificates &>/dev/null
+        ca-certificates \
+        libgtk-3-0 libdbus-glib-1-2 libasound2t64 \
+        libxcomposite1 libxdamage1 libxrandr2 \
+        libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+        libdrm2 libgbm1 libpango-1.0-0 libcairo2 \
+        libnspr4 libnss3 xvfb &>/dev/null
 '
 msg_ok "System packages installed"
 
