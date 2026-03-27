@@ -39,11 +39,12 @@ def _conn_is_alive(conn):
     try:
         if conn.closed:
             return False
-        # Reset any failed transaction state and ping the server
+        # Reset any failed transaction state, ping, then end the transaction
         conn.rollback()
         cur = conn.cursor()
         cur.execute("SELECT 1")
         cur.close()
+        conn.rollback()  # End transaction so autocommit can be set after
         return True
     except Exception:
         return False
