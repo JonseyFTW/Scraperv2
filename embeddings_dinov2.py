@@ -1,39 +1,34 @@
 #!/usr/bin/env python3
 """
-SportsCardPro Scraper - DINOv2 Embedding Generator (ChromaDB + RunPod)
+SportsCardPro Scraper - DINOv2 Embedding Generator (ChromaDB)
 
-Generates vector embeddings for downloaded card images using DINOv2-ViT-L/14
-hosted on a RunPod serverless endpoint. Stores embeddings in ChromaDB for
-fast indexed similarity search.
+Generates vector embeddings for downloaded card images using DINOv2-ViT-L/14.
+Runs locally on GPU with batched inference for maximum throughput.
+Stores embeddings in ChromaDB for fast indexed similarity search.
 
 Drop-in replacement for embeddings.py — uses DINOv2 (1024-dim) instead of
 CLIP ViT-B-32 (512-dim). Stores in a SEPARATE collection since dimensions differ.
 
 Usage:
     python embeddings_dinov2.py generate              # Generate embeddings for all downloaded cards
+    python embeddings_dinov2.py generate --limit 100  # Generate only 100 embeddings (for testing)
+    python embeddings_dinov2.py generate --batch 64   # Custom batch size (default: 32)
     python embeddings_dinov2.py search image.jpg      # Find top matches for an input image
     python embeddings_dinov2.py stats                 # Show embedding coverage
-    python embeddings_dinov2.py generate --limit 100  # Generate only 100 embeddings (for testing)
 
 Requirements:
-    pip install requests numpy chromadb rich
-
-Environment variables:
-    RUNPOD_API_KEY          Your RunPod API key
-    RUNPOD_ENDPOINT_ID      Your serverless endpoint ID (default in config.py)
+    pip install torch torchvision numpy chromadb rich
 
 Note: DINOv2 is vision-only — no text search support (use CLIP for that).
 """
 import argparse
-import base64
 import os
 import sys
 import time
 
 import chromadb
-import requests
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.table import Table
 
 import config
@@ -41,173 +36,122 @@ import database as db
 
 console = Console()
 
-# Collection name — MUST be different from CLIP's "card_images" because
-# DINOv2 produces 1024-dim embeddings vs CLIP's 512-dim
 COLLECTION_NAME = "card_images_dinov2"
 
-RUNPOD_TIMEOUT = 90  # seconds to wait for serverless response
-RUNPOD_POLL_INTERVAL = 1.0  # seconds between status polls
+# Lazy-loaded model globals
+_model = None
+_transform = None
+_device = None
 
 
-def _runpod_url(path: str) -> str:
-    """Build a RunPod serverless API URL."""
-    return f"https://api.runpod.ai/v2/{config.RUNPOD_ENDPOINT_ID}/{path}"
+def _load_model():
+    """Load DINOv2-ViT-L/14 on GPU with fp16 for speed."""
+    global _model, _transform, _device
+    if _model is not None:
+        return
 
-
-def _runpod_headers() -> dict:
-    """Build auth headers for RunPod API."""
-    if not config.RUNPOD_API_KEY:
-        console.print("[red]RUNPOD_API_KEY not set. Export it as an environment variable.[/red]")
+    try:
+        import torch
+        from torchvision import transforms
+    except ImportError:
+        console.print("[red]Missing dependencies. Install with:[/red]")
+        console.print("  pip install torch torchvision")
         sys.exit(1)
-    return {
-        "Authorization": f"Bearer {config.RUNPOD_API_KEY}",
-        "Content-Type": "application/json",
-    }
+
+    _device = "cuda" if torch.cuda.is_available() else "cpu"
+    console.print(f"[cyan]Loading DINOv2-ViT-L/14 on {_device}...[/cyan]")
+
+    _model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14")
+    _model.eval()
+    _model = _model.to(_device)
+
+    # Use fp16 on GPU for ~2x speedup
+    if _device == "cuda":
+        _model = _model.half()
+        console.print("[green]Using fp16 (half precision) for faster inference[/green]")
+
+    # DINOv2 expects 518x518 images (14px patches * 37 = 518)
+    _transform = transforms.Compose([
+        transforms.Resize(518, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(518),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    # Warm up
+    dummy = torch.randn(1, 3, 518, 518).to(_device)
+    if _device == "cuda":
+        dummy = dummy.half()
+    with torch.no_grad():
+        _model(dummy)
+    if _device == "cuda":
+        torch.cuda.synchronize()
+
+    param_count = sum(p.numel() for p in _model.parameters()) / 1e6
+    vram = torch.cuda.get_device_properties(0).total_mem / 1e9 if _device == "cuda" else 0
+    console.print(f"[green]DINOv2-ViT-L/14 ready — {param_count:.0f}M params, 1024-dim, {vram:.1f}GB VRAM[/green]")
 
 
-def _embed_image(image_path: str):
-    """Send an image to RunPod DINOv2 endpoint and return the 1024-dim embedding."""
+def _embed_single(image_path: str):
+    """Generate a 1024-dim embedding for a single image. Used for search."""
+    import torch
+    from PIL import Image
+
+    _load_model()
+
     try:
-        with open(image_path, "rb") as f:
-            image_b64 = base64.b64encode(f.read()).decode("utf-8")
+        img = Image.open(image_path).convert("RGB")
+        img_tensor = _transform(img).unsqueeze(0).to(_device)
+        if _device == "cuda":
+            img_tensor = img_tensor.half()
+
+        with torch.no_grad():
+            features = _model(img_tensor)
+            features = features / features.norm(dim=-1, keepdim=True)
+
+        return features.cpu().float().numpy().flatten()
     except Exception as e:
-        console.print(f"[red]Error reading {image_path}: {e}[/red]")
-        return None
-
-    payload = {
-        "input": {
-            "action": "embed",
-            "image": image_b64,
-        }
-    }
-
-    try:
-        # Use runsync for simplicity — blocks until the worker returns
-        resp = requests.post(
-            _runpod_url("runsync"),
-            json=payload,
-            headers=_runpod_headers(),
-            timeout=RUNPOD_TIMEOUT,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        status = data.get("status")
-
-        # If the endpoint returned IN_QUEUE or IN_PROGRESS, poll for result
-        if status in ("IN_QUEUE", "IN_PROGRESS"):
-            job_id = data["id"]
-            deadline = time.time() + RUNPOD_TIMEOUT
-            while time.time() < deadline:
-                time.sleep(RUNPOD_POLL_INTERVAL)
-                poll_resp = requests.get(
-                    _runpod_url(f"status/{job_id}"),
-                    headers=_runpod_headers(),
-                    timeout=30,
-                )
-                poll_resp.raise_for_status()
-                data = poll_resp.json()
-                status = data.get("status")
-                if status == "COMPLETED":
-                    break
-                if status == "FAILED":
-                    console.print(f"[red]RunPod job failed for {image_path}: {data}[/red]")
-                    return None
-
-            if status != "COMPLETED":
-                console.print(f"[red]RunPod job timed out for {image_path}[/red]")
-                return None
-
-        if status == "COMPLETED":
-            output = data.get("output")
-            if output is None:
-                console.print(f"[red]RunPod returned no output for {image_path}. Response: {data}[/red]")
-                return None
-            if "error" in output:
-                console.print(f"[red]RunPod error for {image_path}: {output['error']}[/red]")
-                return None
-            embedding = output.get("embedding")
-            if embedding is None:
-                console.print(f"[red]No 'embedding' key in response for {image_path}. Keys: {list(output.keys())}[/red]")
-                return None
-            return embedding
-        else:
-            error_msg = data.get("error", "no error details")
-            console.print(f"[red]RunPod status '{status}' for {image_path}: {error_msg}[/red]")
-            console.print(f"[dim]{str(data)[:500]}[/dim]")
-            return None
-
-    except requests.exceptions.RequestException as e:
-        console.print(f"[red]RunPod request error for {image_path}: {e}[/red]")
+        console.print(f"[red]Error embedding {image_path}: {e}[/red]")
         return None
 
 
-def _embed_image_batch(image_paths: list[str]) -> list:
-    """Send a batch of images to RunPod and return embeddings.
+def _embed_batch(image_paths: list[str]) -> list:
+    """Generate embeddings for a batch of images in one GPU pass."""
+    import torch
+    from PIL import Image
 
-    Falls back to single-image calls if the endpoint doesn't support batch.
-    """
-    # Try batch request first
-    images_b64 = []
-    valid_paths = []
-    for path in image_paths:
+    _load_model()
+
+    tensors = []
+    valid_indices = []
+
+    for i, path in enumerate(image_paths):
         try:
-            with open(path, "rb") as f:
-                images_b64.append(base64.b64encode(f.read()).decode("utf-8"))
-                valid_paths.append(path)
+            img = Image.open(path).convert("RGB")
+            tensor = _transform(img)
+            tensors.append(tensor)
+            valid_indices.append(i)
         except Exception as e:
-            console.print(f"[red]Error reading {path}: {e}[/red]")
-            images_b64.append(None)
+            console.print(f"[red]Error loading {path}: {e}[/red]")
 
-    payload = {
-        "input": {
-            "images": [img for img in images_b64 if img is not None],
-        }
-    }
+    if not tensors:
+        return [None] * len(image_paths)
 
-    try:
-        resp = requests.post(
-            _runpod_url("runsync"),
-            json=payload,
-            headers=_runpod_headers(),
-            timeout=RUNPOD_TIMEOUT,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    batch = torch.stack(tensors).to(_device)
+    if _device == "cuda":
+        batch = batch.half()
 
-        status = data.get("status")
-        if status in ("IN_QUEUE", "IN_PROGRESS"):
-            job_id = data["id"]
-            deadline = time.time() + RUNPOD_TIMEOUT
-            while time.time() < deadline:
-                time.sleep(RUNPOD_POLL_INTERVAL)
-                poll_resp = requests.get(
-                    _runpod_url(f"status/{job_id}"),
-                    headers=_runpod_headers(),
-                    timeout=30,
-                )
-                poll_resp.raise_for_status()
-                data = poll_resp.json()
-                status = data.get("status")
-                if status == "COMPLETED":
-                    break
-                if status == "FAILED":
-                    break
+    with torch.no_grad():
+        features = _model(batch)
+        features = features / features.norm(dim=-1, keepdim=True)
 
-        if status == "COMPLETED":
-            output = data["output"]
-            # Support both {"embeddings": [...]} and {"embedding": [...]}
-            embeddings = output.get("embeddings", [output.get("embedding")])
-            return embeddings
+    embeddings_np = features.cpu().float().numpy()
 
-    except requests.exceptions.RequestException:
-        pass
+    # Map back to original indices
+    results = [None] * len(image_paths)
+    for idx, valid_idx in enumerate(valid_indices):
+        results[valid_idx] = embeddings_np[idx].flatten().tolist()
 
-    # Fallback: send images one at a time
-    results = []
-    for path in valid_paths:
-        emb = _embed_image(path)
-        results.append(emb)
     return results
 
 
@@ -253,7 +197,7 @@ def _resolve_image_path(image_path: str) -> str:
     return os.path.join(config.IMAGE_DIR, basename)
 
 
-def get_cards_needing_embeddings(limit: int = 500) -> list[dict]:
+def get_cards_needing_embeddings(limit: int = 0) -> list[dict]:
     """Get downloaded cards that don't have DINOv2 embeddings yet."""
     collection = get_collection()
 
@@ -276,75 +220,92 @@ def get_cards_needing_embeddings(limit: int = 500) -> list[dict]:
     skip = existing_ids | _skipped_ids
     cards = [dict(r) for r in rows if str(r["product_id"]) not in skip]
 
-    return cards[:limit]
+    if limit > 0:
+        return cards[:limit]
+    return cards
 
 
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
-def generate_embeddings(limit: int = 0):
-    """Generate DINOv2 embeddings for all downloaded cards via RunPod."""
-    batch_size = 100 if limit == 0 else min(limit, 100)
-    total = 0
+def generate_embeddings(limit: int = 0, batch_size: int = 32):
+    """Generate DINOv2 embeddings using local GPU with batched inference."""
+    import torch
 
-    console.print(f"\n[bold]Generating DINOv2 embeddings via RunPod (ChromaDB → {COLLECTION_NAME})[/bold]")
-    console.print(f"  Endpoint: [cyan]{config.RUNPOD_ENDPOINT_ID}[/cyan]\n")
+    console.print(f"\n[bold]Generating DINOv2 embeddings — local GPU, batch_size={batch_size}[/bold]")
+    console.print(f"  Collection: [cyan]{COLLECTION_NAME}[/cyan]\n")
 
+    _load_model()
     collection = get_collection()
 
-    while True:
-        cards = get_cards_needing_embeddings(batch_size)
-        if not cards:
-            break
+    cards = get_cards_needing_embeddings(limit)
+    if not cards:
+        console.print("[green]All cards already have embeddings![/green]")
+        return
 
-        batch_ids = []
-        batch_embeddings = []
-        batch_metadatas = []
+    console.print(f"  Cards to embed: [cyan]{len(cards)}[/cyan]\n")
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console
-        ) as progress:
-            task = progress.add_task("Embedding", total=len(cards))
+    total = 0
+    start_time = time.time()
 
-            for card in cards:
-                progress.update(task, description=f"Embed: {(card['product_name'] or 'img')[:30]}")
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Embedding", total=len(cards))
 
-                resolved_path = _resolve_image_path(card.get("image_path", ""))
-                if resolved_path and os.path.exists(resolved_path):
-                    vec = _embed_image(resolved_path)
-                    if vec is not None:
-                        batch_ids.append(str(card["product_id"]))
-                        batch_embeddings.append(vec if isinstance(vec, list) else vec.tolist())
-                        batch_metadatas.append({
+        # Process in batches
+        for batch_start in range(0, len(cards), batch_size):
+            batch_cards = cards[batch_start:batch_start + batch_size]
+
+            # Resolve paths and filter
+            paths = []
+            valid_cards = []
+            for card in batch_cards:
+                resolved = _resolve_image_path(card.get("image_path", ""))
+                if resolved and os.path.exists(resolved):
+                    paths.append(resolved)
+                    valid_cards.append(card)
+                else:
+                    _skipped_ids.add(str(card["product_id"]))
+
+            if paths:
+                embeddings = _embed_batch(paths)
+
+                chroma_ids = []
+                chroma_embeddings = []
+                chroma_metadatas = []
+
+                for card, emb in zip(valid_cards, embeddings):
+                    if emb is not None:
+                        chroma_ids.append(str(card["product_id"]))
+                        chroma_embeddings.append(emb)
+                        chroma_metadatas.append({
                             "product_name": card["product_name"] or "",
                             "set_slug": card["set_slug"] or "",
                             "image_path": card["image_path"] or "",
                             "loose_price": float(card["loose_price"] or 0),
                         })
                         total += 1
-                else:
-                    _skipped_ids.add(str(card["product_id"]))
 
-                progress.advance(task)
+                if chroma_ids:
+                    collection.upsert(
+                        ids=chroma_ids,
+                        embeddings=chroma_embeddings,
+                        metadatas=chroma_metadatas,
+                    )
 
-                if limit > 0 and total >= limit:
-                    break
+            progress.update(task, advance=len(batch_cards),
+                            description=f"Batch {batch_start // batch_size + 1} — {total} done")
 
-        if batch_ids:
-            collection.upsert(
-                ids=batch_ids,
-                embeddings=batch_embeddings,
-                metadatas=batch_metadatas,
-            )
-
-        if limit > 0 and total >= limit:
-            console.print(f"\n[yellow]Reached limit of {limit}[/yellow]")
-            break
+    elapsed = time.time() - start_time
+    rate = total / elapsed if elapsed > 0 else 0
 
     global _chroma_client, _chroma_collection
     final_count = collection.count()
@@ -354,9 +315,10 @@ def generate_embeddings(limit: int = 0):
         _chroma_collection = None
         _chroma_client = None
 
-    console.print(f"\n[green]Generated {total} embeddings ({final_count} total in ChromaDB)[/green]")
+    console.print(f"\n[green]Generated {total} embeddings in {elapsed:.1f}s ({rate:.1f} img/s)[/green]")
+    console.print(f"[green]{final_count} total in ChromaDB[/green]")
     if _skipped_ids:
-        console.print(f"[yellow]Skipped {len(_skipped_ids)} cards (image file not found on disk)[/yellow]")
+        console.print(f"[yellow]Skipped {len(_skipped_ids)} cards (image file not found)[/yellow]")
 
 
 def _display_results(results: dict, title: str):
@@ -400,16 +362,14 @@ def search_by_image(image_path: str, top_k: int = 10):
         console.print("[yellow]No embeddings in database yet. Run 'generate' first.[/yellow]")
         return
 
-    console.print(f"[cyan]Embedding query image via RunPod DINOv2...[/cyan]")
-    query_vec = _embed_image(image_path)
+    console.print(f"[cyan]Embedding query image with DINOv2...[/cyan]")
+    query_vec = _embed_single(image_path)
     if query_vec is None:
         return
 
-    query_list = query_vec if isinstance(query_vec, list) else query_vec.tolist()
-
     console.print(f"[cyan]Searching {top_k} closest matches...[/cyan]")
     results = collection.query(
-        query_embeddings=[query_list],
+        query_embeddings=[query_vec.tolist()],
         n_results=min(top_k, collection.count()),
     )
 
@@ -428,8 +388,7 @@ def show_embedding_stats():
     db.put_connection(conn)
 
     console.print(f"\n  Collection:       [cyan]{COLLECTION_NAME}[/cyan]")
-    console.print(f"  Model:            [cyan]DINOv2-ViT-L/14 (1024-dim) via RunPod[/cyan]")
-    console.print(f"  Endpoint:         [cyan]{config.RUNPOD_ENDPOINT_ID}[/cyan]")
+    console.print(f"  Model:            [cyan]DINOv2-ViT-L/14 (1024-dim, local GPU)[/cyan]")
     console.print(f"  Downloaded cards: [cyan]{total_cards}[/cyan]")
     console.print(f"  Embeddings:       [cyan]{total_embs}[/cyan]")
     if total_cards > 0:
@@ -439,11 +398,12 @@ def show_embedding_stats():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DINOv2 Embedding Generator for Sports Cards (RunPod)")
+    parser = argparse.ArgumentParser(description="DINOv2 Embedding Generator for Sports Cards (Local GPU)")
     subparsers = parser.add_subparsers(dest="command")
 
     gen_parser = subparsers.add_parser("generate", help="Generate DINOv2 embeddings for downloaded cards")
-    gen_parser.add_argument("--limit", type=int, default=0, help="Max embeddings to generate")
+    gen_parser.add_argument("--limit", type=int, default=0, help="Max embeddings to generate (0=all)")
+    gen_parser.add_argument("--batch", type=int, default=32, help="GPU batch size (default: 32)")
 
     img_parser = subparsers.add_parser("search", help="Search by image")
     img_parser.add_argument("image", help="Path to query image")
@@ -454,7 +414,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "generate":
-        generate_embeddings(args.limit)
+        generate_embeddings(args.limit, args.batch)
     elif args.command == "search":
         search_by_image(args.image, args.top)
     elif args.command == "stats":
