@@ -55,6 +55,10 @@ CHROMA_DIR = os.path.join(DATA_DIR, "chromadb")
 #   Example: export SCP_LINUX_DATA_PREFIX=/mnt/scraper-data
 LINUX_DATA_PREFIX = os.environ.get("SCP_LINUX_DATA_PREFIX", "")
 
+# ── RunPod (DINOv2 serverless endpoint) ──────────────────────────────────
+RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
+RUNPOD_ENDPOINT_ID = os.environ.get("RUNPOD_ENDPOINT_ID", "m5et95n0vtnnmv")
+
 # ── Scraping behavior ─────────────────────────────────────────────────────
 REQUEST_DELAY_MIN = 1.0        # Min seconds between page loads (per batch of 10)
 REQUEST_DELAY_MAX = 3.0        # Max seconds between page loads
