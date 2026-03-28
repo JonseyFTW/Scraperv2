@@ -76,6 +76,7 @@ def _embed_image(image_path: str):
 
     payload = {
         "input": {
+            "action": "embed",
             "image": image_b64,
         }
     }
@@ -122,21 +123,14 @@ def _embed_image(image_path: str):
             if output is None:
                 console.print(f"[red]RunPod returned no output for {image_path}. Response: {data}[/red]")
                 return None
-            # Adapt to whatever key the handler uses
-            if isinstance(output, list):
-                return output
-            if isinstance(output, dict):
-                for key in ("embedding", "embeddings", "vector", "features"):
-                    if key in output:
-                        val = output[key]
-                        # If it's a list of lists (batch), take first
-                        if val and isinstance(val[0], list):
-                            return val[0]
-                        return val
-            # If we get here, print the output so the user can see the schema
-            console.print(f"[yellow]Unknown output format. Keys: {list(output.keys()) if isinstance(output, dict) else type(output)}[/yellow]")
-            console.print(f"[dim]{str(output)[:500]}[/dim]")
-            return None
+            if "error" in output:
+                console.print(f"[red]RunPod error for {image_path}: {output['error']}[/red]")
+                return None
+            embedding = output.get("embedding")
+            if embedding is None:
+                console.print(f"[red]No 'embedding' key in response for {image_path}. Keys: {list(output.keys())}[/red]")
+                return None
+            return embedding
         else:
             console.print(f"[red]Unexpected RunPod status '{status}' for {image_path}[/red]")
             return None
