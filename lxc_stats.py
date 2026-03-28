@@ -62,6 +62,8 @@ def get_worker_stats():
             SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS processing,
             SUM(CASE WHEN status = 'downloading' THEN 1 ELSE 0 END) AS downloading,
             SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded,
+            SUM(CASE WHEN status = 'image_found' THEN 1 ELSE 0 END) AS image_found,
+            SUM(CASE WHEN status = 'no_image' THEN 1 ELSE 0 END) AS no_image,
             SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors
         FROM cards
     """)
@@ -192,9 +194,9 @@ def display_stats():
         f"{totals['processing'] or 0:,}",
         f"{totals['downloading'] or 0:,}",
         f"{totals['downloaded'] or 0:,}",
-        "",
+        f"{totals['image_found'] or 0:,}",
         f"{totals['errors'] or 0:,}",
-        "",
+        f"{totals['no_image'] or 0:,}",
         overall_rate_str,
     )
 
@@ -204,7 +206,7 @@ def display_stats():
     pending = totals.get("pending", 0) or 0
     processing = totals.get("processing", 0) or 0
     downloading = totals.get("downloading", 0) or 0
-    done = totals.get("downloaded", 0) or 0
+    done = (totals.get("downloaded", 0) or 0) + (totals.get("image_found", 0) or 0) + (totals.get("no_image", 0) or 0)
     total = totals["total"]
     pct = (done / total * 100) if total > 0 else 0
 

@@ -14,6 +14,7 @@ import json
 import os
 import random
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -692,7 +693,9 @@ async def scrape_with_curl_cffi(limit: int):
     total_ok = 0
     total_no_image = 0
     total_error = 0
-    
+    last_progress_time = time.time()
+    STALL_TIMEOUT = 15 * 60  # 15 minutes
+
     while True:
         cards = db.get_cards_needing_images(500)
         if not cards or (limit > 0 and total_ok >= limit):
@@ -730,6 +733,7 @@ async def scrape_with_curl_cffi(limit: int):
                         elif isinstance(result, FetchResult) and result.image_url:
                             db.update_card_image_url(card['product_id'], result.image_url)
                             total_ok += 1
+                            last_progress_time = time.time()
                             session_mgr.rate_limiter.on_success()
                         elif isinstance(result, FetchResult) and result.error:
                             # Retryable — HTTP errors, timeouts, Cloudflare blocks
@@ -762,6 +766,13 @@ async def scrape_with_curl_cffi(limit: int):
                         session = await session_mgr.get_session(rotate=True)
 
                 progress.advance(task, len(batch))
+
+                # Watchdog: exit if no images found for 15 minutes so systemd restarts us
+                if time.time() - last_progress_time > STALL_TIMEOUT:
+                    console.print("[red]No images found in 15 minutes — restarting...[/red]")
+                    await session_mgr.close_all()
+                    sys.exit(1)
+
                 await session_mgr.rate_limiter.wait()
                 
     await session_mgr.close_all()
