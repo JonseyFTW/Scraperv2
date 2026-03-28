@@ -532,14 +532,15 @@ Environment=\"PATH=${INSTALL_DIR}/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/s
 EnvironmentFile=${INSTALL_DIR}/.env
 ExecStartPre=/bin/sleep 10
 ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/main_v3.py --phase 4 --limit 1000
-Restart=on-failure
-RestartSec=300
+Restart=always
+RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-systemctl daemon-reload"
-msg_ok "Systemd service created"
+systemctl daemon-reload
+systemctl enable --now scraper.service"
+msg_ok "Systemd service created and enabled"
 
 # ── Done! ─────────────────────────────────────────────────────────────────
 VPN_STATUS=""
