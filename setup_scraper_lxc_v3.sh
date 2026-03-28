@@ -531,7 +531,7 @@ WorkingDirectory=${INSTALL_DIR}
 Environment=\"PATH=${INSTALL_DIR}/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"
 EnvironmentFile=${INSTALL_DIR}/.env
 ExecStartPre=/bin/sleep 10
-ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/main_v3.py --phase 4 --limit 1000
+ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/main_v3.py --phase 4
 Restart=always
 RestartSec=30
 
