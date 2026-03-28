@@ -88,7 +88,7 @@ def _load_model():
         torch.cuda.synchronize()
 
     param_count = sum(p.numel() for p in _model.parameters()) / 1e6
-    vram = torch.cuda.get_device_properties(0).total_mem / 1e9 if _device == "cuda" else 0
+    vram = torch.cuda.get_device_properties(0).total_memory / 1e9 if _device == "cuda" else 0
     console.print(f"[green]DINOv2-ViT-L/14 ready — {param_count:.0f}M params, 1024-dim, {vram:.1f}GB VRAM[/green]")
 
 
