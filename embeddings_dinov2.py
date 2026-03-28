@@ -132,7 +132,9 @@ def _embed_image(image_path: str):
                 return None
             return embedding
         else:
-            console.print(f"[red]Unexpected RunPod status '{status}' for {image_path}[/red]")
+            error_msg = data.get("error", "no error details")
+            console.print(f"[red]RunPod status '{status}' for {image_path}: {error_msg}[/red]")
+            console.print(f"[dim]{str(data)[:500]}[/dim]")
             return None
 
     except requests.exceptions.RequestException as e:
