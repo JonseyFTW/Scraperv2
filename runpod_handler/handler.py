@@ -192,20 +192,34 @@ def triple_query_majority_vote(
     return best_result["ids"][0], best_result["distances"][0], best_result["metadatas"][0]
 
 
+def get_or_create_collection(name: str):
+    """Get or create a ChromaDB collection by name (for upsert to any collection)."""
+    chroma_client = chromadb.PersistentClient(path=CHROMADB_PATH)
+    return chroma_client.get_or_create_collection(
+        name=name,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
 def handler(event):
     """
     RunPod serverless handler.
 
     Input (event["input"]):
-      - action: "search" | "embed" | "health"
+      - action: "search" | "embed" | "health" | "upsert"
       - image: base64-encoded image (for search/embed)
       - mime_type: "image/jpeg" (optional)
       - top_k: number of results (optional, default 5)
+      - collection: collection name (for upsert, defaults to COLLECTION_NAME)
+      - ids: list of IDs (for upsert)
+      - embeddings: list of 1024-dim vectors (for upsert)
+      - metadatas: list of metadata dicts (for upsert)
 
     Returns:
       search  → matches, embedding_count, query_time_ms
       embed   → embedding (1024-dim float list)
       health  → status info
+      upsert  → upserted count, collection, total count
     """
     if model is None:
         load_model()
@@ -307,6 +321,36 @@ def handler(event):
             "matches": matches,
             "embedding_count": count,
             "query_time_ms": round(elapsed_ms, 1),
+        }
+
+    if action == "upsert":
+        ids = input_data.get("ids")
+        embeddings = input_data.get("embeddings")
+        metadatas = input_data.get("metadatas")
+
+        if not ids or not embeddings:
+            return {"error": "Missing 'ids' and/or 'embeddings' fields"}
+        if len(ids) != len(embeddings):
+            return {"error": f"ids ({len(ids)}) and embeddings ({len(embeddings)}) length mismatch"}
+
+        coll_name = input_data.get("collection", COLLECTION_NAME)
+        target = get_or_create_collection(coll_name)
+
+        start = time.monotonic()
+        upsert_kwargs = {"ids": ids, "embeddings": embeddings}
+        if metadatas:
+            upsert_kwargs["metadatas"] = metadatas
+        target.upsert(**upsert_kwargs)
+        elapsed_ms = (time.monotonic() - start) * 1000
+
+        new_count = target.count()
+        print(f"[DINOv2] Upserted {len(ids)} embeddings into '{coll_name}' ({new_count:,} total)")
+
+        return {
+            "upserted": len(ids),
+            "collection": coll_name,
+            "total_count": new_count,
+            "upsert_ms": round(elapsed_ms, 1),
         }
 
     return {"error": f"Unknown action: {action}"}

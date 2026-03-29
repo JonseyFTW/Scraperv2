@@ -466,6 +466,88 @@ def migrate_collection():
     console.print(f"[dim]Deleted old collection '{OLD_NAME}'[/dim]")
 
 
+def sync_to_runpod(limit: int = 0, batch_size: int = 500):
+    """Push local sports card embeddings to RunPod ChromaDB via the serverless upsert action."""
+    import requests
+
+    if not config.RUNPOD_API_KEY:
+        console.print("[red]RUNPOD_API_KEY not set. Export it first.[/red]")
+        return
+    if not config.RUNPOD_ENDPOINT_ID:
+        console.print("[red]RUNPOD_ENDPOINT_ID not set.[/red]")
+        return
+
+    collection = get_collection()
+    total_count = collection.count()
+    if total_count == 0:
+        console.print("[yellow]No local embeddings to sync. Run 'generate' first.[/yellow]")
+        return
+
+    to_send = limit if limit > 0 else total_count
+    console.print(f"\n[bold]Syncing sports card embeddings to RunPod[/bold]")
+    console.print(f"  Endpoint:   [cyan]{config.RUNPOD_ENDPOINT_ID}[/cyan]")
+    console.print(f"  Collection: [cyan]{COLLECTION_NAME}[/cyan]")
+    console.print(f"  Local count: [cyan]{total_count}[/cyan]")
+    console.print(f"  Batch size: [cyan]{batch_size}[/cyan]\n")
+
+    endpoint_url = f"https://api.runpod.ai/v2/{config.RUNPOD_ENDPOINT_ID}/runsync"
+    headers = {
+        "Authorization": f"Bearer {config.RUNPOD_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+    offset = 0
+    sent = 0
+
+    with Progress(
+        SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+        BarColumn(), TaskProgressColumn(), console=console,
+    ) as progress:
+        task = progress.add_task("Syncing", total=min(to_send, total_count))
+
+        while offset < total_count and sent < to_send:
+            chunk = min(batch_size, to_send - sent)
+            results = collection.get(
+                include=["embeddings", "metadatas"],
+                limit=chunk,
+                offset=offset,
+            )
+            ids = results["ids"]
+            if not ids:
+                break
+
+            payload = {
+                "input": {
+                    "action": "upsert",
+                    "collection": COLLECTION_NAME,
+                    "ids": ids,
+                    "embeddings": results["embeddings"],
+                    "metadatas": results["metadatas"],
+                }
+            }
+
+            try:
+                resp = requests.post(endpoint_url, json=payload, headers=headers, timeout=120)
+                resp.raise_for_status()
+                result = resp.json()
+                if result.get("status") == "COMPLETED":
+                    sent += len(ids)
+                else:
+                    console.print(f"[yellow]RunPod status: {result.get('status')} — continuing[/yellow]")
+                    sent += len(ids)
+            except requests.RequestException as e:
+                console.print(f"[red]RunPod request failed: {e}[/red]")
+                console.print("[yellow]Tip: You can also rsync the ChromaDB dir via a temporary GPU Pod.[/yellow]")
+                break
+
+            offset += len(ids)
+            progress.update(task, advance=len(ids),
+                            description=f"Sent {sent}/{min(to_send, total_count)}")
+
+    console.print(f"\n[green]Synced {sent} embeddings to RunPod[/green]")
+
+
 def main():
     parser = argparse.ArgumentParser(description="DINOv2 Embedding Generator for Sports Cards (Local GPU)")
     subparsers = parser.add_subparsers(dest="command")
@@ -481,6 +563,10 @@ def main():
     subparsers.add_parser("stats", help="Show embedding stats")
     subparsers.add_parser("migrate", help="Migrate from old collection name (card_images_dinov2)")
 
+    sync_parser = subparsers.add_parser("sync", help="Push embeddings to RunPod ChromaDB")
+    sync_parser.add_argument("--limit", type=int, default=0, help="Max embeddings to sync (0=all)")
+    sync_parser.add_argument("--batch", type=int, default=500, help="Batch size per API request (default: 500)")
+
     args = parser.parse_args()
 
     if args.command == "generate":
@@ -491,6 +577,8 @@ def main():
         show_embedding_stats()
     elif args.command == "migrate":
         migrate_collection()
+    elif args.command == "sync":
+        sync_to_runpod(limit=args.limit, batch_size=args.batch)
     else:
         parser.print_help()
 
