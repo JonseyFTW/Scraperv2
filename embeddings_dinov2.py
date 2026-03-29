@@ -36,7 +36,7 @@ import database as db
 
 console = Console()
 
-COLLECTION_NAME = "card_images_dinov2"
+COLLECTION_NAME = "card_embeddings_dinov2"
 
 # Lazy-loaded model globals
 _model = None
