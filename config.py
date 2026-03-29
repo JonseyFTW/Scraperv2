@@ -59,6 +59,13 @@ LINUX_DATA_PREFIX = os.environ.get("SCP_LINUX_DATA_PREFIX", "")
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 RUNPOD_ENDPOINT_ID = os.environ.get("RUNPOD_ENDPOINT_ID", "m5et95n0vtnnmv")
 
+# ── RunPod S3 (Network Volume access) ───────────────────────────────────
+# Create an S3 API key in RunPod dashboard → Storage → "+ Create S3 API key"
+RUNPOD_S3_ACCESS_KEY = os.environ.get("RUNPOD_S3_ACCESS_KEY", "")
+RUNPOD_S3_SECRET_KEY = os.environ.get("RUNPOD_S3_SECRET_KEY", "")
+RUNPOD_S3_ENDPOINT = os.environ.get("RUNPOD_S3_ENDPOINT", "https://s3api-us-nc-1.runpod.io")
+RUNPOD_S3_BUCKET = os.environ.get("RUNPOD_S3_BUCKET", "fwlo3ibabg")
+
 # ── Scraping behavior ─────────────────────────────────────────────────────
 REQUEST_DELAY_MIN = 1.0        # Min seconds between page loads (per batch of 10)
 REQUEST_DELAY_MAX = 3.0        # Max seconds between page loads
