@@ -25,8 +25,8 @@ import torch
 from PIL import Image
 
 # --- Configuration ---
-CHROMADB_PATH = os.environ.get("CHROMADB_PATH", "/data/chromadb")
-SQLITE_PATH = os.environ.get("SQLITE_PATH", "/data/sportscards.db")
+CHROMADB_PATH = os.environ.get("CHROMADB_PATH", "/runpod-volume/chromadb")
+SQLITE_PATH = os.environ.get("SQLITE_PATH", "/runpod-volume/sportscards.db")
 COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "card_embeddings_dinov2")
 TOP_K = int(os.environ.get("DINOV2_TOP_K", "5"))
 
