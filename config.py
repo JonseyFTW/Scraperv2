@@ -78,8 +78,20 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
 ]
 
+# ── Pokemon TCG (TCGdex API — free, no key required) ────────────────────
+TCGDEX_BASE = "https://api.tcgdex.net/v2/en"
+POKEMON_IMAGE_DIR = os.environ.get(
+    "POKEMON_IMAGE_DIR", os.path.join(DATA_DIR, "pokemon_images")
+)
+POKEMON_IMAGE_QUALITY = "high"      # "high" or "low"
+POKEMON_IMAGE_FORMAT = "png"        # png, jpg, or webp
+POKEMON_DOWNLOAD_WORKERS = 8
+POKEMON_REQUEST_DELAY = 0.05        # delay between API calls (be polite)
+POKEMON_CHROMA_COLLECTION = "pokemon_embeddings_dinov2"
+
 # Ensure dirs exist
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CSV_DIR, exist_ok=True)
 os.makedirs(IMAGE_DIR, exist_ok=True)
 os.makedirs(CHROMA_DIR, exist_ok=True)
+os.makedirs(POKEMON_IMAGE_DIR, exist_ok=True)

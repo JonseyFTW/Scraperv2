@@ -138,6 +138,38 @@ def init_db():
         END $$;
     """)
 
+    # ── Pokemon TCG tables ───────────────────────────────────────────────
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pokemon_sets (
+            id              TEXT PRIMARY KEY,
+            name            TEXT NOT NULL,
+            series          TEXT,
+            total           INTEGER DEFAULT 0,
+            release_date    TEXT,
+            images_symbol   TEXT,
+            images_logo     TEXT,
+            created_at      TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS pokemon_cards (
+            id              TEXT PRIMARY KEY,   -- e.g. "base1-1"
+            name            TEXT NOT NULL,
+            local_id        TEXT,               -- card number within set
+            set_id          TEXT REFERENCES pokemon_sets(id),
+            set_name        TEXT,
+            category        TEXT,               -- Pokemon, Trainer, Energy
+            image_url       TEXT,               -- TCGdex base image URL
+            image_path      TEXT,               -- local file path after download
+            status          TEXT DEFAULT 'pending',  -- pending | downloaded | error
+            error_msg       TEXT,
+            created_at      TIMESTAMPTZ DEFAULT NOW(),
+            updated_at      TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pokemon_cards_status ON pokemon_cards(status);
+        CREATE INDEX IF NOT EXISTS idx_pokemon_cards_set ON pokemon_cards(set_id);
+    """)
+
     # Create indexes (IF NOT EXISTS supported in PG 9.5+)
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_pid ON cards(product_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_set ON cards(set_slug)")
@@ -516,3 +548,90 @@ def get_image_failure_stats() -> dict:
     cur.close()
     put_connection(conn)
     return stats
+
+
+# ── Pokemon TCG operations ───────────────────────────────────────────────
+
+def upsert_pokemon_set(set_data: dict):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO pokemon_sets (id, name, series, total, release_date, images_symbol, images_logo)
+        VALUES (%(id)s, %(name)s, %(series)s, %(total)s, %(release_date)s, %(images_symbol)s, %(images_logo)s)
+        ON CONFLICT(id) DO UPDATE SET
+            name = EXCLUDED.name, series = EXCLUDED.series, total = EXCLUDED.total,
+            release_date = EXCLUDED.release_date, images_symbol = EXCLUDED.images_symbol,
+            images_logo = EXCLUDED.images_logo
+    """, set_data)
+    conn.commit()
+    cur.close()
+    put_connection(conn)
+
+
+def upsert_pokemon_cards_bulk(cards: list[dict]):
+    conn = get_connection()
+    cur = conn.cursor()
+    psycopg2.extras.execute_batch(cur, """
+        INSERT INTO pokemon_cards (id, name, local_id, set_id, set_name, category, image_url, status)
+        VALUES (%(id)s, %(name)s, %(local_id)s, %(set_id)s, %(set_name)s, %(category)s, %(image_url)s, %(status)s)
+        ON CONFLICT(id) DO UPDATE SET
+            name = EXCLUDED.name, local_id = EXCLUDED.local_id, set_name = EXCLUDED.set_name,
+            category = EXCLUDED.category, image_url = EXCLUDED.image_url,
+            updated_at = NOW()
+    """, cards)
+    conn.commit()
+    cur.close()
+    put_connection(conn)
+
+
+def pokemon_mark_downloaded(card_id: str, image_path: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE pokemon_cards SET status = 'downloaded', image_path = %s, updated_at = NOW()
+        WHERE id = %s
+    """, (image_path, card_id))
+    conn.commit()
+    cur.close()
+    put_connection(conn)
+
+
+def pokemon_mark_error(card_id: str, msg: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE pokemon_cards SET status = 'error', error_msg = %s, updated_at = NOW()
+        WHERE id = %s
+    """, (msg, card_id))
+    conn.commit()
+    cur.close()
+    put_connection(conn)
+
+
+def get_pokemon_cards_by_status(status: str, limit: int = 0) -> list[dict]:
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    sql = "SELECT * FROM pokemon_cards WHERE status = %s ORDER BY id"
+    if limit > 0:
+        sql += f" LIMIT {limit}"
+    cur.execute(sql, (status,))
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    put_connection(conn)
+    return rows
+
+
+def get_pokemon_stats() -> dict:
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    s = {}
+    cur.execute("SELECT COUNT(*) AS c FROM pokemon_sets")
+    s["sets"] = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM pokemon_cards")
+    s["total"] = cur.fetchone()["c"]
+    for st in ("pending", "downloaded", "error"):
+        cur.execute("SELECT COUNT(*) AS c FROM pokemon_cards WHERE status = %s", (st,))
+        s[st] = cur.fetchone()["c"]
+    cur.close()
+    put_connection(conn)
+    return s
