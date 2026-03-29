@@ -397,6 +397,75 @@ def show_embedding_stats():
     console.print(f"  Storage:          [dim]{config.CHROMA_DIR}[/dim]")
 
 
+def migrate_collection():
+    """Migrate embeddings from old collection name to the current one."""
+    OLD_NAME = "card_images_dinov2"
+
+    client = chromadb.PersistentClient(path=config.CHROMA_DIR)
+
+    try:
+        old_col = client.get_collection(name=OLD_NAME)
+    except Exception:
+        console.print(f"[yellow]Old collection '{OLD_NAME}' not found — nothing to migrate.[/yellow]")
+        return
+
+    old_count = old_col.count()
+    if old_count == 0:
+        console.print(f"[yellow]Old collection '{OLD_NAME}' is empty.[/yellow]")
+        return
+
+    new_col = client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
+    )
+    existing = set(new_col.get(include=[])["ids"]) if new_col.count() > 0 else set()
+
+    console.print(f"[cyan]Migrating {old_count} embeddings: {OLD_NAME} → {COLLECTION_NAME}[/cyan]")
+
+    batch_size = 5000
+    migrated = 0
+
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                  BarColumn(), TaskProgressColumn(), console=console) as progress:
+        task = progress.add_task("Migrating", total=old_count)
+        offset = 0
+
+        while offset < old_count:
+            results = old_col.get(
+                include=["embeddings", "metadatas"],
+                limit=batch_size,
+                offset=offset,
+            )
+            ids = results["ids"]
+            if not ids:
+                break
+
+            # Filter out already-migrated
+            new_ids = []
+            new_embs = []
+            new_metas = []
+            for i, cid in enumerate(ids):
+                if cid not in existing:
+                    new_ids.append(cid)
+                    new_embs.append(results["embeddings"][i])
+                    new_metas.append(results["metadatas"][i])
+
+            if new_ids:
+                new_col.upsert(ids=new_ids, embeddings=new_embs, metadatas=new_metas)
+                migrated += len(new_ids)
+
+            offset += len(ids)
+            progress.update(task, advance=len(ids),
+                            description=f"Migrated {migrated}")
+
+    console.print(f"[green]Migrated {migrated} embeddings to '{COLLECTION_NAME}'[/green]")
+    console.print(f"[green]{new_col.count()} total in new collection[/green]")
+
+    # Delete old collection
+    client.delete_collection(name=OLD_NAME)
+    console.print(f"[dim]Deleted old collection '{OLD_NAME}'[/dim]")
+
+
 def main():
     parser = argparse.ArgumentParser(description="DINOv2 Embedding Generator for Sports Cards (Local GPU)")
     subparsers = parser.add_subparsers(dest="command")
@@ -410,6 +479,7 @@ def main():
     img_parser.add_argument("--top", type=int, default=10, help="Number of results")
 
     subparsers.add_parser("stats", help="Show embedding stats")
+    subparsers.add_parser("migrate", help="Migrate from old collection name (card_images_dinov2)")
 
     args = parser.parse_args()
 
@@ -419,6 +489,8 @@ def main():
         search_by_image(args.image, args.top)
     elif args.command == "stats":
         show_embedding_stats()
+    elif args.command == "migrate":
+        migrate_collection()
     else:
         parser.print_help()
 
