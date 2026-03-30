@@ -26,6 +26,7 @@ import argparse
 import os
 import sys
 
+import chromadb
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, FileSizeColumn
 from rich.table import Table
@@ -183,13 +184,99 @@ def show_status():
         console.print(f"[red]Error listing volume: {e}[/red]")
 
 
+def verify():
+    """Compare local ChromaDB collection counts against RunPod endpoint."""
+    import requests as http_requests
+
+    if not config.RUNPOD_API_KEY:
+        console.print("[red]RUNPOD_API_KEY not set. Export it first.[/red]")
+        return
+    if not config.RUNPOD_ENDPOINT_ID:
+        console.print("[red]RUNPOD_ENDPOINT_ID not set.[/red]")
+        return
+
+    console.print(f"\n[bold]Verifying Local vs RunPod ChromaDB[/bold]\n")
+
+    # --- Local counts ---
+    try:
+        local_client = chromadb.PersistentClient(path=config.CHROMA_DIR)
+        local_collections = {}
+        for col in local_client.list_collections():
+            name = col.name if hasattr(col, 'name') else col
+            c = local_client.get_collection(name)
+            local_collections[name] = c.count()
+    except Exception as e:
+        console.print(f"[red]Error reading local ChromaDB: {e}[/red]")
+        return
+
+    # --- RunPod counts (via health endpoint) ---
+    endpoint_url = f"https://api.runpod.ai/v2/{config.RUNPOD_ENDPOINT_ID}/runsync"
+    headers = {
+        "Authorization": f"Bearer {config.RUNPOD_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    console.print("[cyan]Querying RunPod endpoint health...[/cyan]")
+    remote_count = None
+    try:
+        resp = http_requests.post(
+            endpoint_url,
+            json={"input": {"action": "health"}},
+            headers=headers,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("status") == "COMPLETED":
+            output = result.get("output", {})
+            remote_count = output.get("embedding_count", 0)
+            remote_collection = output.get("collection", "card_embeddings_dinov2")
+            console.print(f"[green]RunPod endpoint is healthy ({output.get('device', 'unknown')})[/green]")
+        else:
+            console.print(f"[yellow]RunPod status: {result.get('status')} — endpoint may be cold starting[/yellow]")
+            console.print("[dim]Try again in 30-60 seconds if the endpoint was sleeping.[/dim]")
+    except Exception as e:
+        console.print(f"[red]Error querying RunPod: {e}[/red]")
+
+    # --- Display comparison ---
+    table = Table(title="ChromaDB Collection Comparison")
+    table.add_column("Collection", style="cyan")
+    table.add_column("Local", justify="right", style="green")
+    table.add_column("RunPod", justify="right", style="yellow")
+    table.add_column("Status", style="white")
+
+    for name, local_count in sorted(local_collections.items()):
+        if name == "card_embeddings_dinov2" and remote_count is not None:
+            diff = local_count - remote_count
+            if diff == 0:
+                status = "[green]In sync[/green]"
+            elif diff > 0:
+                status = f"[yellow]RunPod missing {diff:,}[/yellow]"
+            else:
+                status = f"[yellow]Local missing {abs(diff):,}[/yellow]"
+            table.add_row(name, f"{local_count:,}", f"{remote_count:,}", status)
+        else:
+            table.add_row(name, f"{local_count:,}", "[dim]—[/dim]",
+                          "[dim]Not checked (only main collection queried)[/dim]")
+
+    console.print(table)
+
+    if remote_count is not None and local_collections.get("card_embeddings_dinov2", 0) != remote_count:
+        console.print(f"\n[yellow]To fix: run 'python sync_to_runpod.py' to re-upload, "
+                       "then restart RunPod workers.[/yellow]")
+    console.print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sync ChromaDB to RunPod Network Volume (S3)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be uploaded")
     parser.add_argument("--status", action="store_true", help="Show what's on the RunPod volume")
+    parser.add_argument("--verify", action="store_true", help="Compare local vs RunPod embedding counts")
     args = parser.parse_args()
 
-    if args.status:
+    if args.verify:
+        verify()
+    elif args.status:
         show_status()
     else:
         sync(dry_run=args.dry_run)

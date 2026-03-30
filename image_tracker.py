@@ -5,11 +5,15 @@ Run: python image_tracker.py [--port 5000] [--host 0.0.0.0]
 """
 import argparse
 import math
+import os
 
-from flask import Flask, render_template_string, request, jsonify
+import chromadb
+from flask import Flask, render_template_string, request, jsonify, send_file, abort
 import psycopg2
 import psycopg2.extras
+import requests as http_requests
 
+import config
 from config import DATABASE_URL
 
 app = Flask(__name__)
@@ -329,6 +333,174 @@ def api_stats():
     return jsonify(stats)
 
 
+@app.route("/embeddings")
+def embeddings_page():
+    """Show local ChromaDB vs RunPod embedding counts."""
+    # --- Local ChromaDB ---
+    local_collections = {}
+    try:
+        client = chromadb.PersistentClient(path=config.CHROMA_DIR)
+        for col in client.list_collections():
+            name = col.name if hasattr(col, 'name') else col
+            c = client.get_collection(name)
+            local_collections[name] = c.count()
+    except Exception as e:
+        local_collections = {"error": str(e)}
+
+    # --- DB card counts (for context) ---
+    scp_downloaded = query(
+        "SELECT COUNT(*) AS c FROM cards WHERE status='downloaded'", one=True
+    )["c"]
+    try:
+        pokemon_downloaded = query(
+            "SELECT COUNT(*) AS c FROM pokemon_cards WHERE status='downloaded'", one=True
+        )["c"]
+    except Exception:
+        pokemon_downloaded = 0
+    try:
+        tcgplayer_downloaded = query(
+            "SELECT COUNT(*) AS c FROM tcgplayer_cards WHERE status='downloaded'", one=True
+        )["c"]
+    except Exception:
+        tcgplayer_downloaded = 0
+
+    # --- RunPod health check ---
+    runpod_data = None
+    runpod_error = None
+    if config.RUNPOD_API_KEY and config.RUNPOD_ENDPOINT_ID:
+        try:
+            resp = http_requests.post(
+                f"https://api.runpod.ai/v2/{config.RUNPOD_ENDPOINT_ID}/runsync",
+                json={"input": {"action": "health"}},
+                headers={
+                    "Authorization": f"Bearer {config.RUNPOD_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            if result.get("status") == "COMPLETED":
+                runpod_data = result.get("output", {})
+            else:
+                runpod_error = f"Endpoint status: {result.get('status')} (may be cold starting)"
+        except Exception as e:
+            runpod_error = str(e)
+    else:
+        runpod_error = "RUNPOD_API_KEY or RUNPOD_ENDPOINT_ID not configured"
+
+    return render_template_string(
+        EMBEDDINGS_HTML,
+        local=local_collections,
+        runpod=runpod_data,
+        runpod_error=runpod_error,
+        scp_downloaded=scp_downloaded,
+        pokemon_downloaded=pokemon_downloaded,
+        tcgplayer_downloaded=tcgplayer_downloaded,
+    )
+
+
+@app.route("/embeddings/browse")
+def embeddings_browse():
+    """Browse embeddings with card images from a ChromaDB collection."""
+    collection_name = request.args.get("collection", "card_embeddings_dinov2")
+    search_query = request.args.get("q", "").strip()
+    page = int(request.args.get("page", 1))
+    per_page = 48
+
+    try:
+        client = chromadb.PersistentClient(path=config.CHROMA_DIR)
+        col = client.get_collection(collection_name)
+        total = col.count()
+    except Exception as e:
+        return render_template_string(
+            BROWSE_HTML,
+            cards=[], collection=collection_name, search=search_query,
+            page=1, total_pages=1, total=0, error=str(e),
+            collections=[],
+        )
+
+    # List available collections for the dropdown
+    all_collections = []
+    for c in client.list_collections():
+        name = c.name if hasattr(c, 'name') else c
+        all_collections.append(name)
+
+    # Search or paginate
+    cards = []
+    if search_query:
+        # Filter by metadata name/title match
+        results = col.get(
+            include=["metadatas"],
+            limit=total,  # get all to filter
+        )
+        matched = []
+        q_lower = search_query.lower()
+        for cid, meta in zip(results["ids"], results["metadatas"]):
+            searchable = " ".join([
+                str(meta.get("product_name", "")),
+                str(meta.get("name", "")),
+                str(meta.get("full_title", "")),
+                str(meta.get("set_slug", "")),
+                str(meta.get("set_name", "")),
+            ]).lower()
+            if q_lower in searchable:
+                matched.append({"id": cid, "meta": meta})
+
+        total = len(matched)
+        total_pages = max(1, math.ceil(total / per_page))
+        page = min(page, total_pages)
+        start = (page - 1) * per_page
+        cards = matched[start:start + per_page]
+    else:
+        total_pages = max(1, math.ceil(total / per_page))
+        page = min(page, total_pages)
+        offset = (page - 1) * per_page
+
+        results = col.get(
+            include=["metadatas"],
+            limit=per_page,
+            offset=offset,
+        )
+        for cid, meta in zip(results["ids"], results["metadatas"]):
+            cards.append({"id": cid, "meta": meta})
+
+    return render_template_string(
+        BROWSE_HTML,
+        cards=cards, collection=collection_name, search=search_query,
+        page=page, total_pages=total_pages, total=total, error=None,
+        collections=all_collections,
+    )
+
+
+@app.route("/card-image")
+def serve_card_image():
+    """Proxy route to serve card images from local filesystem paths stored in ChromaDB."""
+    path = request.args.get("path", "")
+    if not path:
+        abort(404)
+
+    # Security: only serve from known image directories
+    allowed_prefixes = [
+        config.IMAGE_DIR,
+        config.POKEMON_IMAGE_DIR,
+        config.TCGPLAYER_IMAGE_DIR,
+        config.DATA_DIR,
+    ]
+    # Also allow LINUX_DATA_PREFIX paths (translate them)
+    if config.LINUX_DATA_PREFIX and path.startswith(config.LINUX_DATA_PREFIX):
+        path = os.path.join(config.DATA_DIR, path[len(config.LINUX_DATA_PREFIX):].lstrip("/\\"))
+
+    real_path = os.path.realpath(path)
+    if not any(real_path.startswith(os.path.realpath(p)) for p in allowed_prefixes if p):
+        abort(403)
+
+    if not os.path.isfile(real_path):
+        abort(404)
+
+    return send_file(real_path)
+
+
 # ── HTML Templates ───────────────────────────────────────────────────────────
 
 BASE_CSS = """
@@ -429,6 +601,7 @@ NAV = """
   <a href="/" {% if request.path == '/' %}class="active" style="color:var(--text)"{% endif %}>Dashboard</a>
   <a href="/sets" {% if '/sets' in request.path %}class="active" style="color:var(--text)"{% endif %}>Sports Cards</a>
   <a href="/pokemon" {% if '/pokemon' in request.path %}class="active" style="color:var(--text)"{% endif %}>Pokemon</a>
+  <a href="/embeddings" {% if '/embeddings' in request.path %}class="active" style="color:var(--text)"{% endif %}>Embeddings</a>
 </nav>
 """
 
@@ -719,6 +892,227 @@ POKEMON_DETAIL_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf
   {% else %}
   <div class="empty">No cards match this filter.</div>
   {% endif %}
+</div>
+</body></html>"""
+
+
+EMBEDDINGS_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Embeddings — Image Tracker</title>""" + BASE_CSS + """</head><body>""" + NAV + """
+<div class="container">
+  <h1>Embeddings</h1>
+  <p style="color:var(--text2)">Local ChromaDB vs RunPod — verify your embeddings are in sync</p>
+
+  <h2>Downloaded Cards (available for embedding)</h2>
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="label">Sports Cards</div>
+      <div class="value green">{{ "{:,}".format(scp_downloaded) }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Pokemon (TCGdex)</div>
+      <div class="value green">{{ "{:,}".format(pokemon_downloaded) }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Pokemon (TCGPlayer)</div>
+      <div class="value green">{{ "{:,}".format(tcgplayer_downloaded) }}</div>
+    </div>
+  </div>
+
+  <h2>Local ChromaDB Collections</h2>
+  {% if local.get('error') %}
+  <div class="stat-card" style="border-color:var(--red)">
+    <div class="label">Error</div>
+    <div class="value red" style="font-size:1rem">{{ local.error }}</div>
+  </div>
+  {% else %}
+  <div class="stats-grid">
+    {% for name, count in local.items() %}
+    <a href="/embeddings/browse?collection={{ name }}" style="text-decoration:none;color:var(--text)">
+    <div class="stat-card" style="cursor:pointer">
+      <div class="label">{{ name }}</div>
+      <div class="value blue">{{ "{:,}".format(count) }}</div>
+      <div style="font-size:0.75rem;color:var(--accent);margin-top:0.25rem">Browse &rarr;</div>
+    </div>
+    </a>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <h2>RunPod Endpoint</h2>
+  {% if runpod %}
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="label">Status</div>
+      <div class="value green" style="font-size:1.5rem">{{ runpod.status or 'ok' }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Embeddings on RunPod</div>
+      <div class="value blue">{{ "{:,}".format(runpod.embedding_count or 0) }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Device</div>
+      <div class="value" style="font-size:1.25rem;color:var(--text2)">{{ runpod.device or 'unknown' }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Model</div>
+      <div class="value" style="font-size:0.9rem;color:var(--text2)">{{ runpod.model or 'unknown' }}</div>
+    </div>
+  </div>
+
+  <h2>Sync Status</h2>
+  {% set local_scp = local.get('card_embeddings_dinov2', 0) %}
+  {% set remote_scp = runpod.embedding_count or 0 %}
+  {% set diff = local_scp - remote_scp %}
+  <table>
+    <thead><tr><th>Collection</th><th>Local</th><th>RunPod</th><th>Difference</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>card_embeddings_dinov2</td>
+        <td>{{ "{:,}".format(local_scp) }}</td>
+        <td>{{ "{:,}".format(remote_scp) }}</td>
+        <td>{% if diff == 0 %}—{% elif diff > 0 %}<span style="color:var(--yellow)">+{{ "{:,}".format(diff) }} local</span>{% else %}<span style="color:var(--yellow)">+{{ "{:,}".format(diff|abs) }} remote</span>{% endif %}</td>
+        <td>{% if diff == 0 %}<span class="badge badge-green">In Sync</span>{% else %}<span class="badge badge-red">Out of Sync</span>{% endif %}</td>
+      </tr>
+      {% for name, count in local.items() %}
+      {% if name != 'card_embeddings_dinov2' and name != 'error' %}
+      <tr>
+        <td>{{ name }}</td>
+        <td>{{ "{:,}".format(count) }}</td>
+        <td style="color:var(--text2)">—</td>
+        <td style="color:var(--text2)">—</td>
+        <td style="color:var(--text2);font-size:0.8rem">Not synced to RunPod</td>
+      </tr>
+      {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% if diff != 0 %}
+  <p style="margin-top:1rem;color:var(--yellow)">Run <code style="background:var(--surface2);padding:0.2rem 0.5rem;border-radius:4px">python sync_to_runpod.py</code> to re-sync, then restart RunPod workers.</p>
+  {% endif %}
+
+  {% elif runpod_error %}
+  <div class="stat-card" style="border-color:var(--yellow)">
+    <div class="label">RunPod Unavailable</div>
+    <div class="value yellow" style="font-size:1rem;word-break:break-all">{{ runpod_error }}</div>
+  </div>
+  <p style="margin-top:1rem;color:var(--text2)">The endpoint may be sleeping. Try refreshing in 30-60 seconds.</p>
+  {% endif %}
+
+  <h2 style="margin-top:2rem">Coverage</h2>
+  {% set scp_emb = local.get('card_embeddings_dinov2', 0) %}
+  {% set poke_emb = local.get('pokemon_embeddings_dinov2', 0) %}
+  {% set scp_pct = (100 * scp_emb / scp_downloaded) if scp_downloaded > 0 else 0 %}
+  {% set poke_total = pokemon_downloaded + tcgplayer_downloaded %}
+  {% set poke_pct = (100 * poke_emb / poke_total) if poke_total > 0 else 0 %}
+  <table>
+    <thead><tr><th>Source</th><th>Downloaded</th><th>Embedded</th><th>Coverage</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Sports Cards</td>
+        <td>{{ "{:,}".format(scp_downloaded) }}</td>
+        <td>{{ "{:,}".format(scp_emb) }}</td>
+        <td>
+          <div style="display:flex;align-items:center;gap:0.5rem">
+            <div class="bar-bg" style="min-width:200px"><div class="bar-fill {% if scp_pct > 80 %}green{% elif scp_pct > 50 %}yellow{% else %}red{% endif %}" style="width:{{ scp_pct }}%"></div></div>
+            <span style="font-size:0.8rem;color:var(--text2)">{{ "%.1f"|format(scp_pct) }}%</span>
+          </div>
+        </td>
+      </tr>
+      <tr>
+        <td>Pokemon (all sources)</td>
+        <td>{{ "{:,}".format(poke_total) }}</td>
+        <td>{{ "{:,}".format(poke_emb) }}</td>
+        <td>
+          <div style="display:flex;align-items:center;gap:0.5rem">
+            <div class="bar-bg" style="min-width:200px"><div class="bar-fill {% if poke_pct > 80 %}green{% elif poke_pct > 50 %}yellow{% else %}red{% endif %}" style="width:{{ poke_pct }}%"></div></div>
+            <span style="font-size:0.8rem;color:var(--text2)">{{ "%.1f"|format(poke_pct) }}%</span>
+          </div>
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+</body></html>"""
+
+
+
+BROWSE_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Browse Embeddings — Image Tracker</title>""" + BASE_CSS + """
+<style>
+  .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; margin: 1.5rem 0; }
+  .card-item { background: var(--surface); border: 1px solid var(--surface2); border-radius: 12px; overflow: hidden; transition: border-color 0.2s; }
+  .card-item:hover { border-color: var(--accent); }
+  .card-img { width: 100%; aspect-ratio: 3/4; object-fit: contain; background: #0a0f1a; display: block; }
+  .card-img-placeholder { width: 100%; aspect-ratio: 3/4; background: var(--surface2); display: flex; align-items: center;
+    justify-content: center; color: var(--text2); font-size: 0.8rem; }
+  .card-info { padding: 0.75rem; }
+  .card-info .name { font-size: 0.85rem; font-weight: 600; line-height: 1.3; margin-bottom: 0.25rem;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card-info .meta { font-size: 0.75rem; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card-info .id { font-size: 0.7rem; color: var(--surface2); font-family: monospace; margin-top: 0.25rem; }
+</style>
+</head><body>""" + NAV + PAGINATION_MACRO + """
+<div class="container">
+  <h1>Browse Embeddings</h1>
+  <p style="color:var(--text2)">Viewing images stored in ChromaDB — {{ "{:,}".format(total) }} embeddings</p>
+
+  {% if error %}
+  <div class="stat-card" style="border-color:var(--red);margin:1rem 0">
+    <div class="label">Error</div>
+    <div class="value red" style="font-size:1rem">{{ error }}</div>
+  </div>
+  {% else %}
+
+  <div class="filters">
+    <form method="get" action="/embeddings/browse" style="display:flex;gap:0.75rem;align-items:center;flex-wrap:wrap">
+      <select name="collection">
+        {% for c in collections %}
+        <option value="{{ c }}" {% if c == collection %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+      <input type="text" name="q" value="{{ search }}" placeholder="Search by card name or set...">
+      <button type="submit" class="btn">Search</button>
+      {% if search %}<a href="/embeddings/browse?collection={{ collection }}" class="btn" style="background:var(--surface2);color:var(--text)">Clear</a>{% endif %}
+    </form>
+  </div>
+
+  {% if cards %}
+  <div class="card-grid">
+    {% for card in cards %}
+    <div class="card-item">
+      {% set img_path = card.meta.get('image_path', '') %}
+      {% if img_path %}
+      <img class="card-img" src="/card-image?path={{ img_path | urlencode }}" alt="{{ card.meta.get('product_name') or card.meta.get('name', '') }}" loading="lazy"
+           onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+      <div class="card-img-placeholder" style="display:none">Image not found</div>
+      {% else %}
+      <div class="card-img-placeholder">No image path</div>
+      {% endif %}
+      <div class="card-info">
+        <div class="name" title="{{ card.meta.get('product_name') or card.meta.get('full_title') or card.meta.get('name', 'Unknown') }}">
+          {{ card.meta.get('product_name') or card.meta.get('full_title') or card.meta.get('name', 'Unknown') }}
+        </div>
+        <div class="meta">{{ card.meta.get('set_slug') or card.meta.get('set_name', '') }}</div>
+        {% if card.meta.get('loose_price') and card.meta.loose_price > 0 %}
+        <div class="meta" style="color:var(--green)">${{ "%.2f"|format(card.meta.loose_price) }}</div>
+        {% endif %}
+        {% if card.meta.get('source') %}
+        <div class="meta">Source: {{ card.meta.source }}</div>
+        {% endif %}
+        <div class="id">{{ card.id }}</div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  {{ pagination(page, total_pages, '/embeddings/browse?collection=' ~ collection ~ '&q=' ~ search) }}
+  {% else %}
+  <div class="empty">No embeddings found{% if search %} matching "{{ search }}"{% endif %}.</div>
+  {% endif %}
+  {% endif %}
+
+  <p style="margin-top:1.5rem"><a href="/embeddings">&larr; Back to Embeddings overview</a></p>
 </div>
 </body></html>"""
 
