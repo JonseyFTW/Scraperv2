@@ -231,9 +231,20 @@ def _download_one(card: dict, session: requests.Session) -> tuple[int, bool, str
     return card["product_id"], False, ""
 
 
-def download_images(limit: int = 0):
+def download_images(limit: int = 0, retry_errors: bool = False):
     """Download images for all pending TCGPlayer Pokemon cards."""
     db.init_db()
+
+    if retry_errors:
+        conn = db.get_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE tcgplayer_cards SET status='pending', error_msg=NULL WHERE status='error'")
+        reset_count = cur.rowcount
+        conn.commit()
+        cur.close()
+        db.put_connection(conn)
+        if reset_count:
+            console.print(f"[cyan]Reset {reset_count} errored cards back to pending[/cyan]")
 
     pending = db.get_tcgplayer_cards_by_status("pending", limit=limit)
     if not pending:
@@ -365,6 +376,7 @@ def main():
 
     dl_p = subparsers.add_parser("download", help="Download pending card images")
     dl_p.add_argument("--limit", type=int, default=0, help="Max images to download (0=all)")
+    dl_p.add_argument("--retry-errors", action="store_true", help="Reset errored cards and retry them")
 
     subparsers.add_parser("stats", help="Show scraping progress")
     subparsers.add_parser("sets", help="List all available sets")
@@ -372,13 +384,14 @@ def main():
     run_p = subparsers.add_parser("run", help="Full pipeline: fetch + download")
     run_p.add_argument("--set", type=int, help="Only process a specific set (groupId)")
     run_p.add_argument("--limit", type=int, default=0, help="Max images to download")
+    run_p.add_argument("--retry-errors", action="store_true", help="Reset errored cards and retry them")
 
     args = parser.parse_args()
 
     if args.command == "fetch":
         fetch_cards(set_filter=args.set)
     elif args.command == "download":
-        download_images(limit=args.limit)
+        download_images(limit=args.limit, retry_errors=args.retry_errors)
     elif args.command == "stats":
         show_stats()
     elif args.command == "sets":
@@ -386,7 +399,7 @@ def main():
     elif args.command == "run":
         console.print("\n[bold]===== TCGPLAYER POKEMON FULL PIPELINE =====[/bold]\n")
         fetch_cards(set_filter=args.set)
-        download_images(limit=args.limit)
+        download_images(limit=args.limit, retry_errors=args.retry_errors)
         show_stats()
     else:
         parser.print_help()
