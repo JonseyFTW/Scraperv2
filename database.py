@@ -170,6 +170,42 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_pokemon_cards_set ON pokemon_cards(set_id);
     """)
 
+    # ── TCGPlayer Pokemon tables ────────────────────────────────────────
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tcgplayer_sets (
+            group_id        INTEGER PRIMARY KEY,   -- TCGPlayer groupId
+            name            TEXT NOT NULL,
+            abbreviation    TEXT,
+            is_supplemental BOOLEAN DEFAULT FALSE,
+            published_on    TEXT,
+            modified_on     TEXT,
+            card_count      INTEGER DEFAULT 0,
+            created_at      TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS tcgplayer_cards (
+            product_id      INTEGER PRIMARY KEY,   -- TCGPlayer productId
+            name            TEXT NOT NULL,
+            clean_name      TEXT,
+            group_id        INTEGER REFERENCES tcgplayer_sets(group_id),
+            group_name      TEXT,
+            image_url       TEXT,                   -- CDN image URL
+            image_path      TEXT,                   -- local file path after download
+            product_url     TEXT,                   -- tcgplayer.com product page
+            card_number     TEXT,
+            rarity          TEXT,
+            card_type       TEXT,                   -- Pokemon, Trainer, Energy
+            ext_data        JSONB,                  -- full extendedData from API
+            status          TEXT DEFAULT 'pending', -- pending | downloaded | error | skipped
+            error_msg       TEXT,
+            created_at      TIMESTAMPTZ DEFAULT NOW(),
+            updated_at      TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tcgplayer_cards_status ON tcgplayer_cards(status);
+        CREATE INDEX IF NOT EXISTS idx_tcgplayer_cards_group ON tcgplayer_cards(group_id);
+    """)
+
     # Create indexes (IF NOT EXISTS supported in PG 9.5+)
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_pid ON cards(product_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_set ON cards(set_slug)")
@@ -631,6 +667,112 @@ def get_pokemon_stats() -> dict:
     s["total"] = cur.fetchone()["c"]
     for st in ("pending", "downloaded", "error"):
         cur.execute("SELECT COUNT(*) AS c FROM pokemon_cards WHERE status = %s", (st,))
+        s[st] = cur.fetchone()["c"]
+    cur.close()
+    put_connection(conn)
+    return s
+
+
+# ── TCGPlayer Pokemon operations ────────────────────────────────────────
+
+def upsert_tcgplayer_set(set_data: dict):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tcgplayer_sets (group_id, name, abbreviation, is_supplemental,
+                                     published_on, modified_on, card_count)
+        VALUES (%(group_id)s, %(name)s, %(abbreviation)s, %(is_supplemental)s,
+                %(published_on)s, %(modified_on)s, %(card_count)s)
+        ON CONFLICT(group_id) DO UPDATE SET
+            name = EXCLUDED.name, abbreviation = EXCLUDED.abbreviation,
+            is_supplemental = EXCLUDED.is_supplemental,
+            published_on = EXCLUDED.published_on, modified_on = EXCLUDED.modified_on,
+            card_count = EXCLUDED.card_count
+    """, set_data)
+    conn.commit()
+    cur.close()
+    put_connection(conn)
+
+
+def upsert_tcgplayer_cards_bulk(cards: list[dict]):
+    conn = get_connection()
+    cur = conn.cursor()
+    psycopg2.extras.execute_batch(cur, """
+        INSERT INTO tcgplayer_cards (product_id, name, clean_name, group_id, group_name,
+                                      image_url, product_url, card_number, rarity,
+                                      card_type, ext_data, status)
+        VALUES (%(product_id)s, %(name)s, %(clean_name)s, %(group_id)s, %(group_name)s,
+                %(image_url)s, %(product_url)s, %(card_number)s, %(rarity)s,
+                %(card_type)s, %(ext_data)s, %(status)s)
+        ON CONFLICT(product_id) DO UPDATE SET
+            name = EXCLUDED.name, clean_name = EXCLUDED.clean_name,
+            group_name = EXCLUDED.group_name, image_url = EXCLUDED.image_url,
+            product_url = EXCLUDED.product_url, card_number = EXCLUDED.card_number,
+            rarity = EXCLUDED.rarity, card_type = EXCLUDED.card_type,
+            ext_data = EXCLUDED.ext_data, updated_at = NOW()
+    """, cards)
+    conn.commit()
+    cur.close()
+    put_connection(conn)
+
+
+def tcgplayer_mark_downloaded(product_id: int, image_path: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE tcgplayer_cards SET status = 'downloaded', image_path = %s, updated_at = NOW()
+        WHERE product_id = %s
+    """, (image_path, product_id))
+    conn.commit()
+    cur.close()
+    put_connection(conn)
+
+
+def tcgplayer_mark_error(product_id: int, msg: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE tcgplayer_cards SET status = 'error', error_msg = %s, updated_at = NOW()
+        WHERE product_id = %s
+    """, (msg, product_id))
+    conn.commit()
+    cur.close()
+    put_connection(conn)
+
+
+def get_tcgplayer_cards_by_status(status: str, limit: int = 0) -> list[dict]:
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    sql = "SELECT * FROM tcgplayer_cards WHERE status = %s ORDER BY product_id"
+    if limit > 0:
+        sql += f" LIMIT {limit}"
+    cur.execute(sql, (status,))
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    put_connection(conn)
+    return rows
+
+
+def get_tcgplayer_sets() -> list[dict]:
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM tcgplayer_sets ORDER BY name")
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    put_connection(conn)
+    return rows
+
+
+def get_tcgplayer_stats() -> dict:
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    s = {}
+    cur.execute("SELECT COUNT(*) AS c FROM tcgplayer_sets")
+    s["sets"] = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM tcgplayer_cards")
+    s["total"] = cur.fetchone()["c"]
+    for st in ("pending", "downloaded", "error", "skipped"):
+        cur.execute("SELECT COUNT(*) AS c FROM tcgplayer_cards WHERE status = %s", (st,))
         s[st] = cur.fetchone()["c"]
     cur.close()
     put_connection(conn)
