@@ -491,6 +491,25 @@ def serve_card_image():
     if not path:
         abort(404)
 
+    # Translate paths from different environments to local DATA_DIR
+    # Windows Z:\ drive (mapped to NAS share, same as DATA_DIR)
+    if path.startswith("Z:\\") or path.startswith("Z:/"):
+        path = os.path.join(config.DATA_DIR, path[3:].replace("\\", "/"))
+    # Windows UNC paths to NAS
+    elif path.startswith("\\\\192.168.1.14\\Data\\scraper"):
+        rel = path[len("\\\\192.168.1.14\\Data\\scraper"):].replace("\\", "/").lstrip("/")
+        path = os.path.join(config.DATA_DIR, rel)
+    # Linux container paths with /home/user/Scraperv2/data/
+    elif "/Scraperv2/data/" in path:
+        rel = path.split("/Scraperv2/data/", 1)[1]
+        path = os.path.join(config.DATA_DIR, rel)
+    # LINUX_DATA_PREFIX translation (e.g. /mnt/scraper-data on containers)
+    elif config.LINUX_DATA_PREFIX and path.startswith(config.LINUX_DATA_PREFIX):
+        path = os.path.join(config.DATA_DIR, path[len(config.LINUX_DATA_PREFIX):].lstrip("/\\"))
+
+    # Normalize path separators
+    path = path.replace("\\", "/")
+
     # Security: only serve from known image directories
     allowed_prefixes = [
         config.IMAGE_DIR,
@@ -498,9 +517,6 @@ def serve_card_image():
         config.TCGPLAYER_IMAGE_DIR,
         config.DATA_DIR,
     ]
-    # Also allow LINUX_DATA_PREFIX paths (translate them)
-    if config.LINUX_DATA_PREFIX and path.startswith(config.LINUX_DATA_PREFIX):
-        path = os.path.join(config.DATA_DIR, path[len(config.LINUX_DATA_PREFIX):].lstrip("/\\"))
 
     real_path = os.path.realpath(path)
     if not any(real_path.startswith(os.path.realpath(p)) for p in allowed_prefixes if p):
