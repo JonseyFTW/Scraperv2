@@ -6,6 +6,9 @@ Run: python image_tracker.py [--port 5000] [--host 0.0.0.0]
 import argparse
 import math
 import os
+import subprocess
+import threading
+import time as _time
 
 import chromadb
 from flask import Flask, render_template_string, request, jsonify, send_file, abort
@@ -528,6 +531,226 @@ def serve_card_image():
     return send_file(real_path)
 
 
+# ── Background job tracking ──────────────────────────────────────────────────
+
+_jobs = {}  # id -> {process, command, started, output, status}
+_jobs_lock = threading.Lock()
+
+
+def _run_job(job_id: str, cmd: list[str]):
+    """Run a subprocess in the background and capture output."""
+    with _jobs_lock:
+        _jobs[job_id]["status"] = "running"
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        _jobs[job_id]["pid"] = proc.pid
+
+        output_lines = []
+        for line in proc.stdout:
+            output_lines.append(line)
+            # Keep last 200 lines
+            if len(output_lines) > 200:
+                output_lines.pop(0)
+            with _jobs_lock:
+                _jobs[job_id]["output"] = "".join(output_lines)
+
+        proc.wait()
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "done" if proc.returncode == 0 else "error"
+            _jobs[job_id]["returncode"] = proc.returncode
+    except Exception as e:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["output"] += f"\n\nError: {e}"
+
+
+@app.route("/workers")
+def workers_page():
+    """Show per-container scraper worker stats."""
+    # Per-worker breakdown (same query as lxc_stats.py)
+    workers = query("""
+        SELECT
+            COALESCE(worker_id, 'unassigned') AS worker,
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS processing,
+            SUM(CASE WHEN status = 'downloading' THEN 1 ELSE 0 END) AS downloading,
+            SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded,
+            SUM(CASE WHEN status = 'image_found' THEN 1 ELSE 0 END) AS image_found,
+            SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors,
+            SUM(CASE WHEN status = 'no_image' THEN 1 ELSE 0 END) AS no_image
+        FROM cards
+        GROUP BY worker_id
+        ORDER BY total DESC
+    """)
+
+    totals = query("""
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+            SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS processing,
+            SUM(CASE WHEN status = 'downloading' THEN 1 ELSE 0 END) AS downloading,
+            SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded,
+            SUM(CASE WHEN status = 'image_found' THEN 1 ELSE 0 END) AS image_found,
+            SUM(CASE WHEN status = 'no_image' THEN 1 ELSE 0 END) AS no_image,
+            SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors
+        FROM cards
+    """, one=True)
+
+    active_workers = sum(1 for w in workers if w["worker"] != "unassigned"
+                         and ((w["processing"] or 0) + (w["downloading"] or 0)) > 0)
+    total_workers = sum(1 for w in workers if w["worker"] != "unassigned")
+
+    done = (totals["downloaded"] or 0) + (totals["image_found"] or 0) + (totals["no_image"] or 0)
+    pct = (done / totals["total"] * 100) if totals["total"] else 0
+
+    return render_template_string(
+        WORKERS_HTML,
+        workers=workers, totals=totals,
+        active_workers=active_workers, total_workers=total_workers,
+        done=done, pct=pct,
+    )
+
+
+@app.route("/api/workers")
+def api_workers():
+    """JSON endpoint for live-refreshing worker data."""
+    workers = query("""
+        SELECT
+            COALESCE(worker_id, 'unassigned') AS worker,
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS processing,
+            SUM(CASE WHEN status = 'downloading' THEN 1 ELSE 0 END) AS downloading,
+            SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded,
+            SUM(CASE WHEN status = 'image_found' THEN 1 ELSE 0 END) AS image_found,
+            SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors,
+            SUM(CASE WHEN status = 'no_image' THEN 1 ELSE 0 END) AS no_image
+        FROM cards
+        GROUP BY worker_id
+        ORDER BY total DESC
+    """)
+    totals = query("""
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+            SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS processing,
+            SUM(CASE WHEN status = 'downloading' THEN 1 ELSE 0 END) AS downloading,
+            SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded,
+            SUM(CASE WHEN status = 'image_found' THEN 1 ELSE 0 END) AS image_found,
+            SUM(CASE WHEN status = 'no_image' THEN 1 ELSE 0 END) AS no_image,
+            SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors
+        FROM cards
+    """, one=True)
+    return jsonify({"workers": workers, "totals": totals})
+
+
+# ── Actions ─────────────────────────────────────────────────────────────────
+
+# Allowed commands (whitelist for security)
+ALLOWED_ACTIONS = {
+    "phase3":           {"cmd": ["python3", "main.py", "--phase", "3"], "label": "Phase 3 — Parse CSVs", "needs": "DB only"},
+    "phase5":           {"cmd": ["python3", "main.py", "--phase", "5"], "label": "Phase 5 — Download Images", "needs": "DB + NAS"},
+    "phase5_limit":     {"cmd": ["python3", "main.py", "--phase", "5", "--limit", "500"], "label": "Phase 5 — Download 500 Images", "needs": "DB + NAS"},
+    "reset_errors":     {"cmd": ["python3", "main.py", "--reset-errors"], "label": "Reset Errors to Pending", "needs": "DB only"},
+    "tcgplayer_fetch":  {"cmd": ["python3", "tcgplayer_scraper.py", "fetch"], "label": "TCGPlayer — Fetch Catalog", "needs": "Internet + DB"},
+    "tcgplayer_dl":     {"cmd": ["python3", "tcgplayer_scraper.py", "download"], "label": "TCGPlayer — Download Images", "needs": "Internet + DB + NAS"},
+    "tcgplayer_run":    {"cmd": ["python3", "tcgplayer_scraper.py", "run", "--retry-errors"], "label": "TCGPlayer — Full Pipeline", "needs": "Internet + DB + NAS"},
+    "tcgplayer_stats":  {"cmd": ["python3", "tcgplayer_scraper.py", "stats"], "label": "TCGPlayer — Stats", "needs": "DB only"},
+    "embed_sports":     {"cmd": ["python3", "embeddings_dinov2.py", "generate", "--batch", "128"], "label": "Embed Sports Cards (DINOv2)", "needs": "GPU + NAS"},
+    "embed_pokemon":    {"cmd": ["python3", "pokemon_embeddings.py", "generate", "--batch", "128"], "label": "Embed Pokemon Cards (DINOv2)", "needs": "GPU + NAS"},
+    "embed_stats":      {"cmd": ["python3", "embeddings_dinov2.py", "stats"], "label": "Sports Embedding Stats", "needs": "ChromaDB"},
+    "pokemon_stats":    {"cmd": ["python3", "pokemon_embeddings.py", "stats"], "label": "Pokemon Embedding Stats", "needs": "ChromaDB"},
+    "sync_runpod":      {"cmd": ["python3", "sync_to_runpod.py"], "label": "Sync ChromaDB to RunPod", "needs": "RunPod API key"},
+    "sync_verify":      {"cmd": ["python3", "sync_to_runpod.py", "--verify"], "label": "Verify RunPod Sync", "needs": "RunPod API key"},
+}
+
+
+@app.route("/actions")
+def actions_page():
+    """Show available actions and running jobs."""
+    with _jobs_lock:
+        jobs = [
+            {"id": jid, "command": j["command"], "status": j["status"],
+             "started": j["started"]}
+            for jid, j in sorted(_jobs.items(), key=lambda x: x[1]["started"], reverse=True)
+        ][:20]  # Last 20
+
+    return render_template_string(ACTIONS_HTML, actions=ALLOWED_ACTIONS, jobs=jobs)
+
+
+@app.route("/actions/run", methods=["POST"])
+def run_action():
+    """Start a background action."""
+    action_id = request.form.get("action")
+    if action_id not in ALLOWED_ACTIONS:
+        return jsonify({"error": "Unknown action"}), 400
+
+    action = ALLOWED_ACTIONS[action_id]
+
+    # Don't allow duplicate running jobs
+    with _jobs_lock:
+        for jid, j in _jobs.items():
+            if j["command"] == action["label"] and j["status"] == "running":
+                return jsonify({"error": "Already running", "job_id": jid}), 409
+
+    job_id = f"{action_id}_{int(_time.time())}"
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "command": action["label"],
+            "status": "starting",
+            "started": _time.strftime("%Y-%m-%d %H:%M:%S"),
+            "output": "",
+            "pid": None,
+            "returncode": None,
+        }
+
+    thread = threading.Thread(target=_run_job, args=(job_id, action["cmd"]), daemon=True)
+    thread.start()
+
+    return jsonify({"job_id": job_id, "status": "started"})
+
+
+@app.route("/actions/job/<job_id>")
+def job_status(job_id):
+    """Get job output and status."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        return jsonify({
+            "id": job_id,
+            "command": job["command"],
+            "status": job["status"],
+            "output": job["output"],
+            "started": job["started"],
+            "returncode": job.get("returncode"),
+        })
+
+
+@app.route("/actions/stop/<job_id>", methods=["POST"])
+def stop_job(job_id):
+    """Stop a running job."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if job["status"] != "running" or not job.get("pid"):
+            return jsonify({"error": "Job not running"}), 400
+        try:
+            import signal
+            os.kill(job["pid"], signal.SIGTERM)
+            job["status"] = "stopped"
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    return jsonify({"status": "stopped"})
+
+
 # ── HTML Templates ───────────────────────────────────────────────────────────
 
 BASE_CSS = """
@@ -629,6 +852,8 @@ NAV = """
   <a href="/sets" {% if '/sets' in request.path %}class="active" style="color:var(--text)"{% endif %}>Sports Cards</a>
   <a href="/pokemon" {% if '/pokemon' in request.path %}class="active" style="color:var(--text)"{% endif %}>Pokemon</a>
   <a href="/embeddings" {% if '/embeddings' in request.path %}class="active" style="color:var(--text)"{% endif %}>Embeddings</a>
+  <a href="/workers" {% if '/workers' in request.path %}class="active" style="color:var(--text)"{% endif %}>Workers</a>
+  <a href="/actions" {% if '/actions' in request.path %}class="active" style="color:var(--text)"{% endif %}>Actions</a>
 </nav>
 """
 
@@ -1153,6 +1378,225 @@ BROWSE_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><met
 
   <p style="margin-top:1.5rem"><a href="/embeddings">&larr; Back to Embeddings overview</a></p>
 </div>
+</body></html>"""
+
+
+WORKERS_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Workers — Image Tracker</title>""" + BASE_CSS + """
+<style>
+  .auto-refresh { font-size:0.8rem; color:var(--text2); margin-left:1rem; }
+  .active-badge { background:rgba(74,222,128,0.2); color:var(--green); padding:0.1rem 0.5rem;
+    border-radius:99px; font-size:0.75rem; font-weight:600; margin-left:0.5rem; }
+</style>
+</head><body>""" + NAV + """
+<div class="container">
+  <h1>Workers <span class="auto-refresh" id="refresh-status">Auto-refreshes every 10s</span></h1>
+  <p style="color:var(--text2)">Scraper container status — {{ active_workers }}/{{ total_workers }} active, {{ "%.1f"|format(pct) }}% done</p>
+
+  <div class="stats-grid">
+    <div class="stat-card"><div class="label">Total Cards</div><div class="value">{{ "{:,}".format(totals.total) }}</div></div>
+    <div class="stat-card"><div class="label">Pending</div><div class="value yellow">{{ "{:,}".format(totals.pending or 0) }}</div></div>
+    <div class="stat-card"><div class="label">In Flight</div><div class="value blue">{{ "{:,}".format((totals.processing or 0) + (totals.downloading or 0)) }}</div></div>
+    <div class="stat-card"><div class="label">Downloaded</div><div class="value green">{{ "{:,}".format(totals.downloaded or 0) }}</div></div>
+    <div class="stat-card"><div class="label">Errors</div><div class="value red">{{ "{:,}".format(totals.errors or 0) }}</div></div>
+    <div class="stat-card"><div class="label">Completion</div><div class="value green">{{ "%.1f"|format(pct) }}%</div></div>
+  </div>
+
+  <div id="workers-table">
+  <table>
+    <thead><tr>
+      <th>Container</th><th>Total</th><th>Processing</th><th>Downloading</th>
+      <th>Downloaded</th><th>Image Found</th><th>Errors</th><th>No Image</th>
+    </tr></thead>
+    <tbody>
+    {% for w in workers %}
+    <tr>
+      <td>
+        {{ w.worker }}
+        {% if (w.processing or 0) + (w.downloading or 0) > 0 %}
+        <span class="active-badge">ACTIVE</span>
+        {% endif %}
+      </td>
+      <td>{{ "{:,}".format(w.total) }}</td>
+      <td style="color:var(--yellow)">{{ "{:,}".format(w.processing or 0) }}</td>
+      <td style="color:var(--blue)">{{ "{:,}".format(w.downloading or 0) }}</td>
+      <td style="color:var(--green)">{{ "{:,}".format(w.downloaded or 0) }}</td>
+      <td>{{ "{:,}".format(w.image_found or 0) }}</td>
+      <td style="color:var(--red)">{{ "{:,}".format(w.errors or 0) }}</td>
+      <td style="color:var(--text2)">{{ "{:,}".format(w.no_image or 0) }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+    <tfoot><tr style="border-top:2px solid var(--accent);font-weight:700">
+      <td>TOTAL</td>
+      <td>{{ "{:,}".format(totals.total) }}</td>
+      <td style="color:var(--yellow)">{{ "{:,}".format(totals.processing or 0) }}</td>
+      <td style="color:var(--blue)">{{ "{:,}".format(totals.downloading or 0) }}</td>
+      <td style="color:var(--green)">{{ "{:,}".format(totals.downloaded or 0) }}</td>
+      <td>{{ "{:,}".format(totals.image_found or 0) }}</td>
+      <td style="color:var(--red)">{{ "{:,}".format(totals.errors or 0) }}</td>
+      <td style="color:var(--text2)">{{ "{:,}".format(totals.no_image or 0) }}</td>
+    </tr></tfoot>
+  </table>
+  </div>
+</div>
+<script>
+// Auto-refresh the page every 10 seconds
+setTimeout(() => location.reload(), 10000);
+</script>
+</body></html>"""
+
+
+ACTIONS_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Actions — Image Tracker</title>""" + BASE_CSS + """
+<style>
+  .action-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:1rem; margin:1.5rem 0; }
+  .action-card { background:var(--surface); border:1px solid var(--surface2); border-radius:12px; padding:1.25rem; }
+  .action-card h3 { font-size:0.95rem; margin-bottom:0.25rem; }
+  .action-card .needs { font-size:0.75rem; color:var(--text2); margin-bottom:0.75rem; }
+  .action-card .cmd { font-size:0.7rem; color:var(--text2); font-family:monospace; background:var(--bg);
+    padding:0.3rem 0.5rem; border-radius:4px; margin-bottom:0.75rem; word-break:break-all; }
+  .action-btn { background:var(--accent); color:var(--bg); border:none; border-radius:8px;
+    padding:0.5rem 1rem; cursor:pointer; font-size:0.85rem; font-weight:600; width:100%; }
+  .action-btn:hover { opacity:0.9; }
+  .action-btn:disabled { opacity:0.4; cursor:not-allowed; }
+  .action-btn.danger { background:var(--red); }
+  .job-card { background:var(--surface); border:1px solid var(--surface2); border-radius:12px;
+    padding:1rem; margin-bottom:1rem; }
+  .job-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem; }
+  .job-output { background:var(--bg); color:var(--green); font-family:monospace; font-size:0.75rem;
+    padding:0.75rem; border-radius:8px; max-height:300px; overflow-y:auto; white-space:pre-wrap;
+    word-break:break-all; }
+  .status-running { color:var(--yellow); }
+  .status-done { color:var(--green); }
+  .status-error { color:var(--red); }
+  .status-stopped { color:var(--orange); }
+  .stop-btn { background:var(--red); color:white; border:none; border-radius:6px;
+    padding:0.3rem 0.6rem; cursor:pointer; font-size:0.8rem; }
+</style>
+</head><body>""" + NAV + """
+<div class="container">
+  <h1>Actions</h1>
+  <p style="color:var(--text2)">Run scraper commands from the web UI</p>
+
+  <h2>Scraper Phases</h2>
+  <div class="action-grid">
+    {% for aid, a in actions.items() if aid.startswith('phase') or aid.startswith('reset') %}
+    <div class="action-card">
+      <h3>{{ a.label }}</h3>
+      <div class="needs">Requires: {{ a.needs }}</div>
+      <div class="cmd">{{ a.cmd | join(' ') }}</div>
+      <button class="action-btn" onclick="runAction('{{ aid }}', this)">Run</button>
+    </div>
+    {% endfor %}
+  </div>
+
+  <h2>TCGPlayer Pokemon</h2>
+  <div class="action-grid">
+    {% for aid, a in actions.items() if aid.startswith('tcgplayer') %}
+    <div class="action-card">
+      <h3>{{ a.label }}</h3>
+      <div class="needs">Requires: {{ a.needs }}</div>
+      <div class="cmd">{{ a.cmd | join(' ') }}</div>
+      <button class="action-btn" onclick="runAction('{{ aid }}', this)">Run</button>
+    </div>
+    {% endfor %}
+  </div>
+
+  <h2>Embeddings</h2>
+  <div class="action-grid">
+    {% for aid, a in actions.items() if aid.startswith('embed') or aid.startswith('pokemon_stats') or aid.startswith('sync') %}
+    <div class="action-card">
+      <h3>{{ a.label }}</h3>
+      <div class="needs">Requires: {{ a.needs }}</div>
+      <div class="cmd">{{ a.cmd | join(' ') }}</div>
+      <button class="action-btn" onclick="runAction('{{ aid }}', this)">Run</button>
+    </div>
+    {% endfor %}
+  </div>
+
+  <h2>Running Jobs</h2>
+  <div id="jobs-container">
+  {% if jobs %}
+    {% for job in jobs %}
+    <div class="job-card" id="job-{{ job.id }}">
+      <div class="job-header">
+        <div>
+          <strong>{{ job.command }}</strong>
+          <span class="status-{{ job.status }}"> [{{ job.status }}]</span>
+          <span style="color:var(--text2);font-size:0.8rem;margin-left:0.5rem">{{ job.started }}</span>
+        </div>
+        {% if job.status == 'running' %}
+        <button class="stop-btn" onclick="stopJob('{{ job.id }}')">Stop</button>
+        {% endif %}
+      </div>
+      <div class="job-output" id="output-{{ job.id }}">Loading...</div>
+    </div>
+    {% endfor %}
+  {% else %}
+    <p style="color:var(--text2)" id="no-jobs">No jobs have been run yet.</p>
+  {% endif %}
+  </div>
+</div>
+<script>
+function runAction(actionId, btn) {
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+  fetch('/actions/run', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: 'action=' + actionId
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.error) {
+      alert(data.error);
+      btn.disabled = false;
+      btn.textContent = 'Run';
+      return;
+    }
+    // Reload to show the new job
+    location.reload();
+  })
+  .catch(e => {
+    alert('Error: ' + e);
+    btn.disabled = false;
+    btn.textContent = 'Run';
+  });
+}
+
+function stopJob(jobId) {
+  fetch('/actions/stop/' + jobId, {method: 'POST'})
+  .then(r => r.json())
+  .then(() => location.reload());
+}
+
+// Poll running job outputs
+function refreshJobs() {
+  document.querySelectorAll('.job-card').forEach(card => {
+    const jobId = card.id.replace('job-', '');
+    fetch('/actions/job/' + jobId)
+    .then(r => r.json())
+    .then(data => {
+      const outputEl = document.getElementById('output-' + jobId);
+      if (outputEl && data.output) {
+        outputEl.textContent = data.output;
+        outputEl.scrollTop = outputEl.scrollHeight;
+      }
+      // Update status
+      const statusEl = card.querySelector('[class^="status-"]');
+      if (statusEl) {
+        statusEl.className = 'status-' + data.status;
+        statusEl.textContent = ' [' + data.status + ']';
+      }
+    });
+  });
+}
+
+// Refresh job outputs every 2 seconds
+setInterval(refreshJobs, 2000);
+refreshJobs();
+</script>
 </body></html>"""
 
 
