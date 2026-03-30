@@ -338,14 +338,18 @@ def embeddings_page():
     """Show local ChromaDB vs RunPod embedding counts."""
     # --- Local ChromaDB ---
     local_collections = {}
+    local_available = False
     try:
         client = chromadb.PersistentClient(path=config.CHROMA_DIR)
         for col in client.list_collections():
             name = col.name if hasattr(col, 'name') else col
             c = client.get_collection(name)
-            local_collections[name] = c.count()
-    except Exception as e:
-        local_collections = {"error": str(e)}
+            count = c.count()
+            if count > 0:
+                local_available = True
+            local_collections[name] = count
+    except Exception:
+        pass  # ChromaDB not available on this machine — that's fine
 
     # --- DB card counts (for context) ---
     scp_downloaded = query(
@@ -367,6 +371,7 @@ def embeddings_page():
     # --- RunPod health check ---
     runpod_data = None
     runpod_error = None
+    runpod_collections = {}
     if config.RUNPOD_API_KEY and config.RUNPOD_ENDPOINT_ID:
         try:
             resp = http_requests.post(
@@ -382,6 +387,10 @@ def embeddings_page():
             result = resp.json()
             if result.get("status") == "COMPLETED":
                 runpod_data = result.get("output", {})
+                runpod_collections = runpod_data.get("collections", {})
+                # Fallback for old handler without collections field
+                if not runpod_collections and runpod_data.get("embedding_count"):
+                    runpod_collections = {"card_embeddings_dinov2": runpod_data["embedding_count"]}
             else:
                 runpod_error = f"Endpoint status: {result.get('status')} (may be cold starting)"
         except Exception as e:
@@ -392,8 +401,10 @@ def embeddings_page():
     return render_template_string(
         EMBEDDINGS_HTML,
         local=local_collections,
+        local_available=local_available,
         runpod=runpod_data,
         runpod_error=runpod_error,
+        runpod_collections=runpod_collections,
         scp_downloaded=scp_downloaded,
         pokemon_downloaded=pokemon_downloaded,
         tcgplayer_downloaded=tcgplayer_downloaded,
@@ -900,7 +911,7 @@ EMBEDDINGS_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <title>Embeddings — Image Tracker</title>""" + BASE_CSS + """</head><body>""" + NAV + """
 <div class="container">
   <h1>Embeddings</h1>
-  <p style="color:var(--text2)">Local ChromaDB vs RunPod — verify your embeddings are in sync</p>
+  <p style="color:var(--text2)">ChromaDB embedding status — local and RunPod</p>
 
   <h2>Downloaded Cards (available for embedding)</h2>
   <div class="stats-grid">
@@ -918,13 +929,8 @@ EMBEDDINGS_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     </div>
   </div>
 
+  {% if local_available %}
   <h2>Local ChromaDB Collections</h2>
-  {% if local.get('error') %}
-  <div class="stat-card" style="border-color:var(--red)">
-    <div class="label">Error</div>
-    <div class="value red" style="font-size:1rem">{{ local.error }}</div>
-  </div>
-  {% else %}
   <div class="stats-grid">
     {% for name, count in local.items() %}
     <a href="/embeddings/browse?collection={{ name }}" style="text-decoration:none;color:var(--text)">
@@ -946,10 +952,6 @@ EMBEDDINGS_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
       <div class="value green" style="font-size:1.5rem">{{ runpod.status or 'ok' }}</div>
     </div>
     <div class="stat-card">
-      <div class="label">Embeddings on RunPod</div>
-      <div class="value blue">{{ "{:,}".format(runpod.embedding_count or 0) }}</div>
-    </div>
-    <div class="stat-card">
       <div class="label">Device</div>
       <div class="value" style="font-size:1.25rem;color:var(--text2)">{{ runpod.device or 'unknown' }}</div>
     </div>
@@ -959,37 +961,58 @@ EMBEDDINGS_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     </div>
   </div>
 
+  <h2>RunPod Collections</h2>
+  <div class="stats-grid">
+    {% for name, count in runpod_collections.items() %}
+    <div class="stat-card">
+      <div class="label">{{ name }}</div>
+      <div class="value blue">{{ "{:,}".format(count) }}</div>
+    </div>
+    {% endfor %}
+  </div>
+
   <h2>Sync Status</h2>
-  {% set local_scp = local.get('card_embeddings_dinov2', 0) %}
-  {% set remote_scp = runpod.embedding_count or 0 %}
-  {% set diff = local_scp - remote_scp %}
   <table>
     <thead><tr><th>Collection</th><th>Local</th><th>RunPod</th><th>Difference</th><th>Status</th></tr></thead>
     <tbody>
-      <tr>
-        <td>card_embeddings_dinov2</td>
-        <td>{{ "{:,}".format(local_scp) }}</td>
-        <td>{{ "{:,}".format(remote_scp) }}</td>
-        <td>{% if diff == 0 %}—{% elif diff > 0 %}<span style="color:var(--yellow)">+{{ "{:,}".format(diff) }} local</span>{% else %}<span style="color:var(--yellow)">+{{ "{:,}".format(diff|abs) }} remote</span>{% endif %}</td>
-        <td>{% if diff == 0 %}<span class="badge badge-green">In Sync</span>{% else %}<span class="badge badge-red">Out of Sync</span>{% endif %}</td>
-      </tr>
-      {% for name, count in local.items() %}
-      {% if name != 'card_embeddings_dinov2' and name != 'error' %}
+      {% set all_names = [] %}
+      {% for name in runpod_collections %}{% if all_names.append(name) %}{% endif %}{% endfor %}
+      {% for name in local %}{% if name not in all_names and all_names.append(name) %}{% endif %}{% endfor %}
+      {% for name in all_names %}
+      {% set local_count = local.get(name, 0) %}
+      {% set remote_count = runpod_collections.get(name, 0) %}
+      {% set has_local = name in local and local[name] > 0 %}
+      {% set has_remote = name in runpod_collections %}
       <tr>
         <td>{{ name }}</td>
-        <td>{{ "{:,}".format(count) }}</td>
-        <td style="color:var(--text2)">—</td>
-        <td style="color:var(--text2)">—</td>
-        <td style="color:var(--text2);font-size:0.8rem">Not synced to RunPod</td>
+        <td>{% if has_local %}{{ "{:,}".format(local_count) }}{% else %}<span style="color:var(--text2)">—</span>{% endif %}</td>
+        <td>{% if has_remote %}{{ "{:,}".format(remote_count) }}{% else %}<span style="color:var(--text2)">—</span>{% endif %}</td>
+        <td>
+          {% if has_local and has_remote %}
+            {% set diff = local_count - remote_count %}
+            {% if diff == 0 %}—
+            {% elif diff > 0 %}<span style="color:var(--yellow)">+{{ "{:,}".format(diff) }} local</span>
+            {% else %}<span style="color:var(--yellow)">+{{ "{:,}".format(diff|abs) }} remote</span>{% endif %}
+          {% elif not has_local and has_remote %}
+            <span style="color:var(--text2)">local N/A</span>
+          {% else %}
+            <span style="color:var(--text2)">—</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if has_local and has_remote %}
+            {% if local_count == remote_count %}<span class="badge badge-green">In Sync</span>
+            {% else %}<span class="badge badge-red">Out of Sync</span>{% endif %}
+          {% elif not has_local and has_remote %}
+            <span style="color:var(--text2);font-size:0.8rem">Local ChromaDB not on this machine</span>
+          {% else %}
+            <span style="color:var(--text2);font-size:0.8rem">Not on RunPod</span>
+          {% endif %}
+        </td>
       </tr>
-      {% endif %}
       {% endfor %}
     </tbody>
   </table>
-
-  {% if diff != 0 %}
-  <p style="margin-top:1rem;color:var(--yellow)">Run <code style="background:var(--surface2);padding:0.2rem 0.5rem;border-radius:4px">python sync_to_runpod.py</code> to re-sync, then restart RunPod workers.</p>
-  {% endif %}
 
   {% elif runpod_error %}
   <div class="stat-card" style="border-color:var(--yellow)">
@@ -1000,8 +1023,8 @@ EMBEDDINGS_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
   {% endif %}
 
   <h2 style="margin-top:2rem">Coverage</h2>
-  {% set scp_emb = local.get('card_embeddings_dinov2', 0) %}
-  {% set poke_emb = local.get('pokemon_embeddings_dinov2', 0) %}
+  {% set scp_emb = runpod_collections.get('card_embeddings_dinov2', 0) if runpod_collections else local.get('card_embeddings_dinov2', 0) %}
+  {% set poke_emb = runpod_collections.get('pokemon_embeddings_dinov2', 0) if runpod_collections else local.get('pokemon_embeddings_dinov2', 0) %}
   {% set scp_pct = (100 * scp_emb / scp_downloaded) if scp_downloaded > 0 else 0 %}
   {% set poke_total = pokemon_downloaded + tcgplayer_downloaded %}
   {% set poke_pct = (100 * poke_emb / poke_total) if poke_total > 0 else 0 %}
