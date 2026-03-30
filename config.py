@@ -96,9 +96,23 @@ POKEMON_DOWNLOAD_WORKERS = 8
 POKEMON_REQUEST_DELAY = 0.05        # delay between API calls (be polite)
 POKEMON_CHROMA_COLLECTION = "pokemon_embeddings_dinov2"
 
+# ── TCGPlayer Pokemon (via TCGCSV — free, no key required) ─────────────
+# TCGCSV.com is a public mirror of TCGPlayer's catalog API.
+# CategoryId 3 = Pokemon in TCGPlayer's catalog.
+TCGCSV_BASE = "https://tcgcsv.com/tcgplayer"
+TCGPLAYER_CATEGORY_ID = 3           # Pokemon
+TCGPLAYER_IMAGE_CDN = "https://tcgplayer-cdn.tcgplayer.com/product"
+TCGPLAYER_IMAGE_DIR = os.environ.get(
+    "TCGPLAYER_IMAGE_DIR", os.path.join(DATA_DIR, "tcgplayer_pokemon_images")
+)
+TCGPLAYER_DOWNLOAD_WORKERS = 8      # parallel image downloads
+TCGPLAYER_REQUEST_DELAY = 1.0       # delay between TCGCSV API calls (be polite)
+TCGPLAYER_IMAGE_SIZE = "in_1000x1000"  # "200w" for thumbnails, "in_1000x1000" for high-res
+
 # Ensure dirs exist
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CSV_DIR, exist_ok=True)
 os.makedirs(IMAGE_DIR, exist_ok=True)
 os.makedirs(CHROMA_DIR, exist_ok=True)
 os.makedirs(POKEMON_IMAGE_DIR, exist_ok=True)
+os.makedirs(TCGPLAYER_IMAGE_DIR, exist_ok=True)

@@ -198,33 +198,58 @@ def _get_existing_ids() -> set[str]:
 _skipped_ids: set[str] = set()
 
 
-def get_cards_needing_embeddings(limit: int = 0) -> list[dict]:
-    """Get downloaded Pokemon cards that don't have DINOv2 embeddings yet."""
+def get_cards_needing_embeddings(limit: int = 0, source: str = "all") -> list[dict]:
+    """Get downloaded Pokemon cards that don't have DINOv2 embeddings yet.
+
+    Args:
+        limit: Max cards to return (0=all).
+        source: "tcgdex" for TCGdex cards only, "tcgplayer" for TCGPlayer only,
+                "all" for both (default).
+    """
     existing_ids = _get_existing_ids()
-
-    cards = db.get_pokemon_cards_by_status("downloaded")
-
     skip = existing_ids | _skipped_ids
-    cards = [c for c in cards if c["id"] not in skip]
+    cards = []
+
+    # TCGdex Pokemon cards (original source)
+    if source in ("tcgdex", "all"):
+        tcgdex_cards = db.get_pokemon_cards_by_status("downloaded")
+        for c in tcgdex_cards:
+            if c["id"] not in skip:
+                c["_source"] = "tcgdex"
+                cards.append(c)
+
+    # TCGPlayer Pokemon cards
+    if source in ("tcgplayer", "all"):
+        tcgp_cards = db.get_tcgplayer_cards_by_status("downloaded")
+        for c in tcgp_cards:
+            chroma_id = f"tcgp_{c['product_id']}"
+            if chroma_id not in skip:
+                # Normalize fields to match TCGdex card format
+                c["id"] = chroma_id
+                c["set_name"] = c.get("group_name", "")
+                c["local_id"] = c.get("card_number", "")
+                c["_source"] = "tcgplayer"
+                cards.append(c)
 
     if limit > 0:
         return cards[:limit]
     return cards
 
 
-def generate_embeddings(limit: int = 0, batch_size: int = 32):
+def generate_embeddings(limit: int = 0, batch_size: int = 32, source: str = "all"):
     """Generate DINOv2 embeddings for downloaded Pokemon card images."""
     import torch
 
     db.init_db()
 
     console.print(f"\n[bold]Generating DINOv2 embeddings for Pokemon cards — batch_size={batch_size}[/bold]")
-    console.print(f"  Collection: [cyan]{COLLECTION_NAME}[/cyan]\n")
+    console.print(f"  Collection: [cyan]{COLLECTION_NAME}[/cyan]")
+    console.print(f"  Source:     [cyan]{source}[/cyan]\n")
 
     _load_model()
     collection = get_collection()
 
-    cards = get_cards_needing_embeddings(limit)
+    cards = get_cards_needing_embeddings(limit, source=source)
     if not cards:
         console.print("[green]All Pokemon cards already have embeddings![/green]")
         return
@@ -263,18 +288,21 @@ def generate_embeddings(limit: int = 0, batch_size: int = 32):
 
                 for card, emb in zip(valid_cards, embeddings):
                     if emb is not None:
-                        full_title = f"{card['name']} ({card['set_name']} #{card['local_id']})"
+                        local_id = card.get("local_id") or card.get("card_number") or ""
+                        set_name = card.get("set_name") or card.get("group_name") or ""
+                        full_title = f"{card['name']} ({set_name} #{local_id})"
                         chroma_ids.append(card["id"])
                         chroma_embeddings.append(emb)
                         chroma_metadatas.append({
                             "name": card["name"],
                             "full_title": full_title,
-                            "set_id": card["set_id"] or "",
-                            "set_name": card["set_name"] or "",
-                            "local_id": card["local_id"] or "",
-                            "category": card.get("category") or "",
-                            "image_path": card["image_path"] or "",
+                            "set_id": card.get("set_id") or str(card.get("group_id", "")),
+                            "set_name": set_name,
+                            "local_id": local_id,
+                            "category": card.get("category") or card.get("card_type") or "",
+                            "image_path": card.get("image_path") or "",
                             "card_type": "pokemon",
+                            "source": card.get("_source", "tcgdex"),
                         })
                         total += 1
 
@@ -462,16 +490,28 @@ def show_stats():
     collection = get_collection()
     emb_count = collection.count()
 
+    # TCGPlayer stats
+    try:
+        t = db.get_tcgplayer_stats()
+        tcg_downloaded = t.get("downloaded", 0)
+    except Exception:
+        tcg_downloaded = 0
+
+    total_downloaded = s["downloaded"] + tcg_downloaded
+
     console.print(f"\n[bold]Pokemon Embedding Stats[/bold]\n")
-    console.print(f"  Collection:       [cyan]{COLLECTION_NAME}[/cyan]")
-    console.print(f"  Model:            [cyan]DINOv2-ViT-L/14 (1024-dim, local GPU)[/cyan]")
-    console.print(f"  Downloaded cards: [cyan]{s['downloaded']}[/cyan]")
-    console.print(f"  Embeddings:       [cyan]{emb_count}[/cyan]")
-    if s["downloaded"] > 0:
-        pct = (emb_count / s["downloaded"]) * 100
-        console.print(f"  Coverage:         [green]{pct:.1f}%[/green]")
-    console.print(f"  ChromaDB:         [dim]{config.CHROMA_DIR}[/dim]")
-    console.print(f"  Image dir:        [dim]{config.POKEMON_IMAGE_DIR}[/dim]")
+    console.print(f"  Collection:          [cyan]{COLLECTION_NAME}[/cyan]")
+    console.print(f"  Model:               [cyan]DINOv2-ViT-L/14 (1024-dim, local GPU)[/cyan]")
+    console.print(f"  TCGdex cards:        [cyan]{s['downloaded']}[/cyan]")
+    console.print(f"  TCGPlayer cards:     [cyan]{tcg_downloaded}[/cyan]")
+    console.print(f"  Total downloadable:  [cyan]{total_downloaded}[/cyan]")
+    console.print(f"  Embeddings:          [cyan]{emb_count}[/cyan]")
+    if total_downloaded > 0:
+        pct = (emb_count / total_downloaded) * 100
+        console.print(f"  Coverage:            [green]{pct:.1f}%[/green]")
+    console.print(f"  ChromaDB:            [dim]{config.CHROMA_DIR}[/dim]")
+    console.print(f"  TCGdex images:       [dim]{config.POKEMON_IMAGE_DIR}[/dim]")
+    console.print(f"  TCGPlayer images:    [dim]{config.TCGPLAYER_IMAGE_DIR}[/dim]")
     console.print()
 
 
@@ -488,6 +528,8 @@ def main():
     gen_p = subparsers.add_parser("generate", help="Generate DINOv2 embeddings for Pokemon cards")
     gen_p.add_argument("--limit", type=int, default=0, help="Max embeddings to generate (0=all)")
     gen_p.add_argument("--batch", type=int, default=32, help="GPU batch size (default: 32)")
+    gen_p.add_argument("--source", choices=["all", "tcgdex", "tcgplayer"], default="all",
+                        help="Card source: tcgdex, tcgplayer, or all (default: all)")
 
     img_p = subparsers.add_parser("search", help="Search by image")
     img_p.add_argument("image", help="Path to query image")
@@ -502,7 +544,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "generate":
-        generate_embeddings(args.limit, args.batch)
+        generate_embeddings(args.limit, args.batch, source=args.source)
     elif args.command == "search":
         search_by_image(args.image, args.top)
     elif args.command == "stats":
