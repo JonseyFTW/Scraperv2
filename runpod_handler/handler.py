@@ -229,11 +229,22 @@ def handler(event):
 
     if action == "health":
         count = collection.count() if collection else 0
+        # List all collections with their counts
+        all_collections = {}
+        try:
+            chroma_client = chromadb.PersistentClient(path=CHROMADB_PATH)
+            for col in chroma_client.list_collections():
+                col_name = col.name if hasattr(col, 'name') else col
+                c = chroma_client.get_collection(col_name)
+                all_collections[col_name] = c.count()
+        except Exception as e:
+            all_collections = {"error": str(e)}
         return {
             "status": "ok",
             "model": "DINOv2-ViT-L/14 (1024-dim)",
             "device": str(device),
             "embedding_count": count,
+            "collections": all_collections,
             "sqlite_available": os.path.exists(SQLITE_PATH),
         }
 
