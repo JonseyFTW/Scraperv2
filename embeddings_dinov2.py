@@ -197,14 +197,8 @@ def _resolve_image_path(image_path: str) -> str:
     return os.path.join(config.IMAGE_DIR, basename)
 
 
-def get_cards_needing_embeddings(limit: int = 0, source: str = "all") -> list[dict]:
-    """Get downloaded cards that don't have DINOv2 embeddings yet.
-
-    Args:
-        limit: Max cards to return (0=all).
-        source: "scp" for SportsCardPro only, "tcgplayer" for TCGPlayer only,
-                "all" for both (default).
-    """
+def get_cards_needing_embeddings(limit: int = 0) -> list[dict]:
+    """Get downloaded cards that don't have DINOv2 embeddings yet."""
     collection = get_collection()
 
     existing_ids = set()
@@ -212,43 +206,19 @@ def get_cards_needing_embeddings(limit: int = 0, source: str = "all") -> list[di
         all_existing = collection.get(include=[])
         existing_ids = set(all_existing["ids"])
 
-    skip = existing_ids | _skipped_ids
-    cards = []
-
     conn = db.get_connection()
     cur = conn.cursor(cursor_factory=__import__('psycopg2').extras.RealDictCursor)
-
-    # SportsCardPro cards
-    if source in ("scp", "all"):
-        cur.execute("""
-            SELECT * FROM cards
-            WHERE status = 'downloaded' AND image_path IS NOT NULL
-            ORDER BY id
-        """)
-        for r in cur.fetchall():
-            if str(r["product_id"]) not in skip:
-                cards.append(dict(r))
-
-    # TCGPlayer Pokemon cards (use "tcg_" prefix to avoid ID collisions)
-    if source in ("tcgplayer", "all"):
-        cur.execute("""
-            SELECT * FROM tcgplayer_cards
-            WHERE status = 'downloaded' AND image_path IS NOT NULL
-            ORDER BY product_id
-        """)
-        for r in cur.fetchall():
-            chroma_id = f"tcg_{r['product_id']}"
-            if chroma_id not in skip:
-                card = dict(r)
-                # Normalize fields to match SCP card format for embedding pipeline
-                card["_chroma_id"] = chroma_id
-                card["product_name"] = card.get("name", "")
-                card["set_slug"] = card.get("group_name", "")
-                card["loose_price"] = 0  # no price data from TCGCSV catalog
-                cards.append(card)
-
+    cur.execute("""
+        SELECT * FROM cards
+        WHERE status = 'downloaded' AND image_path IS NOT NULL
+        ORDER BY id
+    """)
+    rows = cur.fetchall()
     cur.close()
     db.put_connection(conn)
+
+    skip = existing_ids | _skipped_ids
+    cards = [dict(r) for r in rows if str(r["product_id"]) not in skip]
 
     if limit > 0:
         return cards[:limit]
@@ -259,18 +229,17 @@ def get_cards_needing_embeddings(limit: int = 0, source: str = "all") -> list[di
 # Commands
 # ---------------------------------------------------------------------------
 
-def generate_embeddings(limit: int = 0, batch_size: int = 32, source: str = "all"):
+def generate_embeddings(limit: int = 0, batch_size: int = 32):
     """Generate DINOv2 embeddings using local GPU with batched inference."""
     import torch
 
     console.print(f"\n[bold]Generating DINOv2 embeddings — local GPU, batch_size={batch_size}[/bold]")
-    console.print(f"  Collection: [cyan]{COLLECTION_NAME}[/cyan]")
-    console.print(f"  Source:     [cyan]{source}[/cyan]\n")
+    console.print(f"  Collection: [cyan]{COLLECTION_NAME}[/cyan]\n")
 
     _load_model()
     collection = get_collection()
 
-    cards = get_cards_needing_embeddings(limit, source=source)
+    cards = get_cards_needing_embeddings(limit)
     if not cards:
         console.print("[green]All cards already have embeddings![/green]")
         return
@@ -304,7 +273,7 @@ def generate_embeddings(limit: int = 0, batch_size: int = 32, source: str = "all
                     paths.append(resolved)
                     valid_cards.append(card)
                 else:
-                    _skipped_ids.add(card.get("_chroma_id") or str(card["product_id"]))
+                    _skipped_ids.add(str(card["product_id"]))
 
             if paths:
                 embeddings = _embed_batch(paths)
@@ -315,15 +284,13 @@ def generate_embeddings(limit: int = 0, batch_size: int = 32, source: str = "all
 
                 for card, emb in zip(valid_cards, embeddings):
                     if emb is not None:
-                        cid = card.get("_chroma_id") or str(card["product_id"])
-                        chroma_ids.append(cid)
+                        chroma_ids.append(str(card["product_id"]))
                         chroma_embeddings.append(emb)
                         chroma_metadatas.append({
-                            "product_name": card.get("product_name") or card.get("name") or "",
-                            "set_slug": card.get("set_slug") or card.get("group_name") or "",
-                            "image_path": card.get("image_path") or "",
-                            "loose_price": float(card.get("loose_price") or 0),
-                            "source": "tcgplayer" if card.get("_chroma_id") else "scp",
+                            "product_name": card["product_name"] or "",
+                            "set_slug": card["set_slug"] or "",
+                            "image_path": card["image_path"] or "",
+                            "loose_price": float(card["loose_price"] or 0),
                         })
                         total += 1
 
@@ -416,27 +383,18 @@ def show_embedding_stats():
     conn = db.get_connection()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM cards WHERE status='downloaded'")
-    scp_cards = cur.fetchone()[0]
-    try:
-        cur.execute("SELECT COUNT(*) FROM tcgplayer_cards WHERE status='downloaded'")
-        tcg_cards = cur.fetchone()[0]
-    except Exception:
-        conn.rollback()
-        tcg_cards = 0
+    total_cards = cur.fetchone()[0]
     cur.close()
     db.put_connection(conn)
 
-    total_cards = scp_cards + tcg_cards
-    console.print(f"\n  Collection:         [cyan]{COLLECTION_NAME}[/cyan]")
-    console.print(f"  Model:              [cyan]DINOv2-ViT-L/14 (1024-dim, local GPU)[/cyan]")
-    console.print(f"  SCP cards:          [cyan]{scp_cards}[/cyan]")
-    console.print(f"  TCGPlayer cards:    [cyan]{tcg_cards}[/cyan]")
-    console.print(f"  Total downloadable: [cyan]{total_cards}[/cyan]")
-    console.print(f"  Embeddings:         [cyan]{total_embs}[/cyan]")
+    console.print(f"\n  Collection:       [cyan]{COLLECTION_NAME}[/cyan]")
+    console.print(f"  Model:            [cyan]DINOv2-ViT-L/14 (1024-dim, local GPU)[/cyan]")
+    console.print(f"  Downloaded cards: [cyan]{total_cards}[/cyan]")
+    console.print(f"  Embeddings:       [cyan]{total_embs}[/cyan]")
     if total_cards > 0:
         pct = (total_embs / total_cards) * 100
-        console.print(f"  Coverage:           [green]{pct:.1f}%[/green]")
-    console.print(f"  Storage:            [dim]{config.CHROMA_DIR}[/dim]")
+        console.print(f"  Coverage:         [green]{pct:.1f}%[/green]")
+    console.print(f"  Storage:          [dim]{config.CHROMA_DIR}[/dim]")
 
 
 def migrate_collection():
@@ -597,8 +555,6 @@ def main():
     gen_parser = subparsers.add_parser("generate", help="Generate DINOv2 embeddings for downloaded cards")
     gen_parser.add_argument("--limit", type=int, default=0, help="Max embeddings to generate (0=all)")
     gen_parser.add_argument("--batch", type=int, default=32, help="GPU batch size (default: 32)")
-    gen_parser.add_argument("--source", choices=["all", "scp", "tcgplayer"], default="all",
-                            help="Card source: scp, tcgplayer, or all (default: all)")
 
     img_parser = subparsers.add_parser("search", help="Search by image")
     img_parser.add_argument("image", help="Path to query image")
@@ -614,7 +570,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "generate":
-        generate_embeddings(args.limit, args.batch, source=args.source)
+        generate_embeddings(args.limit, args.batch)
     elif args.command == "search":
         search_by_image(args.image, args.top)
     elif args.command == "stats":
