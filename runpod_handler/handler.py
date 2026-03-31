@@ -45,7 +45,19 @@ def load_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Load DINOv2-ViT-L/14 from torch hub (Meta's official weights)
-    model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14")
+    model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14_reg")
+
+    # Load fine-tuned weights if available
+    finetuned_weights = os.environ.get(
+        "FINETUNED_WEIGHTS", "/runpod-volume/dinov2_finetuned_backbone.pt"
+    )
+    if os.path.exists(finetuned_weights):
+        state_dict = torch.load(finetuned_weights, map_location=device)
+        model.load_state_dict(state_dict, strict=False)
+        print(f"[DINOv2] Loaded fine-tuned weights from {finetuned_weights}")
+    else:
+        print(f"[DINOv2] No fine-tuned weights at {finetuned_weights}, using base model")
+
     model.eval()
     model = model.to(device)
     print(f"[DINOv2] Model loaded on {device} — 1024-dim embeddings")
@@ -239,9 +251,14 @@ def handler(event):
                 all_collections[col_name] = c.count()
         except Exception as e:
             all_collections = {"error": str(e)}
+        finetuned_weights = os.environ.get(
+            "FINETUNED_WEIGHTS", "/runpod-volume/dinov2_finetuned_backbone.pt"
+        )
         return {
             "status": "ok",
-            "model": "DINOv2-ViT-L/14 (1024-dim)",
+            "model": "DINOv2-ViT-L/14-reg (1024-dim)",
+            "finetuned": os.path.exists(finetuned_weights),
+            "finetuned_weights": finetuned_weights if os.path.exists(finetuned_weights) else None,
             "device": str(device),
             "embedding_count": count,
             "collections": all_collections,
