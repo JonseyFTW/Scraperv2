@@ -108,6 +108,10 @@ class ScanAugmentation:
             radius = random.uniform(0.3, 1.2)
             img = img.filter(ImageFilter.GaussianBlur(radius=radius))
 
+        # Background bleed — card on dark/light/wood/fabric surface
+        if random.random() < 0.35:
+            img = self._add_background_bleed(img)
+
         # JPEG compression artifacts
         if random.random() < 0.3:
             import io
@@ -138,6 +142,51 @@ class ScanAugmentation:
         arr += mask[:, :, np.newaxis] * intensity
         arr = np.clip(arr, 0, 255).astype(np.uint8)
         return Image.fromarray(arr)
+
+    def _add_background_bleed(self, img: Image.Image) -> Image.Image:
+        """Place the card on a colored/textured background with visible border."""
+        import numpy as np
+
+        w, h = img.size
+        # Pad 3-8% on each side
+        pad_pct = random.uniform(0.03, 0.08)
+        pad_x = int(w * pad_pct)
+        pad_y = int(h * pad_pct)
+        new_w = w + 2 * pad_x
+        new_h = h + 2 * pad_y
+
+        # Pick a background color
+        bg_type = random.choice(["dark", "light", "wood", "fabric", "solid"])
+        if bg_type == "dark":
+            bg_color = (random.randint(10, 50), random.randint(10, 50), random.randint(10, 50))
+        elif bg_type == "light":
+            bg_color = (random.randint(200, 245), random.randint(200, 245), random.randint(200, 245))
+        elif bg_type == "wood":
+            # Warm brown tones
+            r = random.randint(120, 180)
+            bg_color = (r, int(r * 0.7), int(r * 0.4))
+        elif bg_type == "fabric":
+            # Muted blue/gray/green
+            base = random.randint(80, 150)
+            shift = random.choice([(0, 0, 30), (0, 20, 0), (0, 0, 0)])
+            bg_color = (base + shift[0], base + shift[1], base + shift[2])
+        else:
+            bg_color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+
+        # Create background and paste card onto it
+        bg = Image.new("RGB", (new_w, new_h), bg_color)
+
+        # Add slight noise to background for realism
+        bg_arr = np.array(bg, dtype=np.float32)
+        noise = np.random.normal(0, random.uniform(3, 12), bg_arr.shape)
+        bg_arr = np.clip(bg_arr + noise, 0, 255).astype(np.uint8)
+        bg = Image.fromarray(bg_arr)
+
+        bg.paste(img, (pad_x, pad_y))
+
+        # Resize back to original dimensions
+        bg = bg.resize((w, h), Image.LANCZOS)
+        return bg
 
 
 # ---------------------------------------------------------------------------
