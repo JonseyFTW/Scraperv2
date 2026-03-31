@@ -346,7 +346,7 @@ def train(manifest_path: str, hard_negatives_path: str, output_dir: str,
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
-        vram = torch.cuda.get_device_properties(0).total_mem / 1e9
+        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
         gpu_name = torch.cuda.get_device_name(0)
         console.print(f"[green]GPU: {gpu_name} ({vram:.1f}GB VRAM)[/green]")
     else:
