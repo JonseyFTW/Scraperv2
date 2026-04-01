@@ -96,17 +96,21 @@ def export_from_chromadb(chromadb_path: str, collection_name: str, output_dir: s
 
         for card_id, meta in zip(results["ids"], results["metadatas"]):
             image_path = meta.get("image_path", "")
-            name = meta.get("name", "")
+            # Support both Pokemon format ("name") and sports card format ("product_name")
+            name = meta.get("name", "") or meta.get("product_name", "")
 
             if not image_path or not name:
                 skipped += 1
                 continue
 
+            # Strip card number from product_name (e.g., "Ahmad Rashad #383" -> "Ahmad Rashad")
+            clean_name = re.sub(r'\s*#\d+\s*$', '', name).strip()
+
             manifest.append({
                 "id": card_id,
-                "name": name,
+                "name": clean_name,
                 "full_title": meta.get("full_title", name),
-                "set_name": meta.get("set_name", ""),
+                "set_name": meta.get("set_name", "") or meta.get("set_slug", ""),
                 "set_id": meta.get("set_id", ""),
                 "local_id": meta.get("local_id", ""),
                 "image_path": image_path,
