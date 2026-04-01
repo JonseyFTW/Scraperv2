@@ -144,7 +144,7 @@ def step1_export(collections: list[dict], chromadb_path: str) -> bool:
         console.print(f"\n[cyan]Exporting {col['name']}...[/cyan]")
 
         # Check if already exported
-        manifest_path = os.path.join(col["export_dir"], "manifest.json")
+        manifest_path = os.path.join(PROJECT_DIR, col["export_dir"], "manifest.json")
         if os.path.exists(manifest_path):
             with open(manifest_path) as f:
                 existing = json.load(f)
@@ -175,7 +175,7 @@ def step2_merge(collections: list[dict]) -> bool:
 
     # Verify all exports exist
     for d in input_dirs:
-        manifest = os.path.join(d, "manifest.json")
+        manifest = os.path.join(PROJECT_DIR, d, "manifest.json")
         if not os.path.exists(manifest):
             console.print(f"[red]Missing {manifest} — run Step 1 first[/red]")
             return False
@@ -252,7 +252,7 @@ def step4_reembed(collections: list[dict], chromadb_path: str, batch_size: int) 
     for col in collections:
         console.print(f"\n[cyan]Re-embedding → {col['finetuned_name']}...[/cyan]")
 
-        manifest = os.path.join(col["export_dir"], "manifest.json")
+        manifest = os.path.join(PROJECT_DIR, col["export_dir"], "manifest.json")
         if not os.path.exists(manifest):
             console.print(f"[red]Missing {manifest} — run Step 1 first[/red]")
             return False
