@@ -669,7 +669,7 @@ def parse_single_csv(csv_path: str, set_slug: str) -> list[dict]:
 
         for row in reader:
             # Normalize column names (handle hyphens vs underscores)
-            norm = {k.strip().lower().replace("-", "_"): v.strip() for k, v in row.items() if k}
+            norm = {k.strip().lower().replace("-", "_"): (v.strip() if v else "") for k, v in row.items() if k}
 
             product_id = norm.get("id", "")
             product_name = norm.get("product_name", norm.get("name", ""))
