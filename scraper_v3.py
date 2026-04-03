@@ -557,17 +557,18 @@ async def new_stealth_page(context):
 # Phase 4: Smart Image URL Discovery 
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def scrape_card_images_v3(limit: int = 0):
+async def scrape_card_images_v3(limit: int = 0, sport: str = None):
     """
     Smart image scraping:
     1. First try to use CDN pattern (no requests needed!)
     2. Fall back to curl_cffi batch requests
     3. Last resort: Scrapling for stubborn pages
     """
-    console.print(f"\n[bold]Phase 4: Smart Image URL Discovery[/bold]\n")
-    
+    sport_label = f" [{sport}]" if sport else ""
+    console.print(f"\n[bold]Phase 4: Smart Image URL Discovery{sport_label}[/bold]\n")
+
     # First, try to discover CDN pattern using a peek (don't claim cards)
-    sample_cards = db.peek_cards_needing_images(10)
+    sample_cards = db.peek_cards_needing_images(10, sport=sport)
     if not sample_cards:
         console.print("[green]No cards needing images![/green]")
         return
@@ -577,13 +578,13 @@ async def scrape_card_images_v3(limit: int = 0):
 
     if pattern:
         # We found a pattern! Apply it to all cards
-        await apply_cdn_pattern(pattern, cdn_engine, limit)
+        await apply_cdn_pattern(pattern, cdn_engine, limit, sport=sport)
     else:
         # Fall back to scraping
-        await scrape_with_curl_cffi(limit)
+        await scrape_with_curl_cffi(limit, sport=sport)
 
 
-async def apply_cdn_pattern(pattern: str, cdn_engine: CDNPatternEngine, limit: int):
+async def apply_cdn_pattern(pattern: str, cdn_engine: CDNPatternEngine, limit: int, sport: str = None):
     """Apply discovered CDN pattern to generate image URLs without any requests!"""
     console.print(f"[green]Applying CDN pattern: {pattern}[/green]")
     
@@ -591,13 +592,13 @@ async def apply_cdn_pattern(pattern: str, cdn_engine: CDNPatternEngine, limit: i
     total_processed = 0
     
     while True:
-        cards = db.get_cards_needing_images(batch_size)
+        cards = db.get_cards_needing_images(batch_size, sport=sport)
         if not cards:
             break
-            
+
         if limit > 0 and total_processed >= limit:
             break
-            
+
         for card in cards:
             if limit > 0 and total_processed >= limit:
                 break
@@ -684,7 +685,7 @@ async def _cycle_vpn():
         return False
 
 
-async def scrape_with_curl_cffi(limit: int):
+async def scrape_with_curl_cffi(limit: int, sport: str = None):
     """Fallback scraping using curl_cffi for fast parallel requests"""
     console.print("[yellow]Using curl_cffi for image URL scraping[/yellow]")
     
@@ -697,7 +698,7 @@ async def scrape_with_curl_cffi(limit: int):
     STALL_TIMEOUT = 15 * 60  # 15 minutes
 
     while True:
-        cards = db.get_cards_needing_images(500)
+        cards = db.get_cards_needing_images(500, sport=sport)
         if not cards or (limit > 0 and total_ok >= limit):
             break
             
@@ -882,10 +883,10 @@ async def run_full_pipeline_v3(sport: str = None, limit: int = 0):
     parse_csvs(sport)
 
     # Phase 4: Smart image URL discovery
-    await scrape_card_images_v3(limit)
+    await scrape_card_images_v3(limit, sport=sport)
 
     # Phase 5: Download images (reuse existing function but with curl_cffi)
-    await download_images_v3(limit)
+    await download_images_v3(limit, sport=sport)
 
     # Phase 6: Auto-retry errors until they stop decreasing
     max_retries = 10
@@ -922,15 +923,15 @@ async def run_full_pipeline_v3(sport: str = None, limit: int = 0):
         db.reset_errors()
 
         # Re-run phases 4 + 5 for the reset cards
-        await scrape_card_images_v3(limit)
-        await download_images_v3(limit)
+        await scrape_card_images_v3(limit, sport=sport)
+        await download_images_v3(limit, sport=sport)
 
     console.print("[bold green]Pipeline complete! Check stats with --stats[/bold green]")
 
 
-async def download_images_v3(limit: int = 0):
+async def download_images_v3(limit: int = 0, sport: str = None):
     """Download images using curl_cffi for maximum speed"""
-    cards = db.get_cards_needing_download()
+    cards = db.get_cards_needing_download(sport=sport)
     if not cards:
         console.print("[green]No images to download[/green]")
         return

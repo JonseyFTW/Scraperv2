@@ -351,36 +351,58 @@ def bulk_insert_cards(cards: list[dict]):
     put_connection(conn)
 
 
-def peek_cards_needing_images(limit: int = 10) -> list[dict]:
+def peek_cards_needing_images(limit: int = 10, sport: str = None) -> list[dict]:
     """Read a sample of pending cards WITHOUT claiming them (no status change)."""
     conn = get_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("""
-        SELECT * FROM cards WHERE status='pending'
-        ORDER BY set_slug DESC, id LIMIT %s
-    """, (limit,))
+    if sport:
+        cur.execute("""
+            SELECT c.* FROM cards c
+            JOIN sets s ON s.slug = c.set_slug
+            WHERE c.status='pending' AND s.sport = %s
+            ORDER BY c.set_slug DESC, c.id LIMIT %s
+        """, (sport, limit))
+    else:
+        cur.execute("""
+            SELECT * FROM cards WHERE status='pending'
+            ORDER BY set_slug DESC, id LIMIT %s
+        """, (limit,))
     rows = cur.fetchall()
     cur.close()
     put_connection(conn)
     return [dict(r) for r in rows]
 
 
-def get_cards_needing_images(limit: int = 500) -> list[dict]:
+def get_cards_needing_images(limit: int = 500, sport: str = None) -> list[dict]:
     """Atomically claim a batch of pending cards for image scraping.
     Uses FOR UPDATE SKIP LOCKED so multiple workers never get the same rows."""
     conn = get_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("""
-        UPDATE cards SET status='processing', worker_id=%s
-        WHERE id IN (
-            SELECT id FROM cards
-            WHERE status='pending'
-            ORDER BY set_slug DESC, id
-            LIMIT %s
-            FOR UPDATE SKIP LOCKED
-        )
-        RETURNING *
-    """, (WORKER_ID, limit))
+    if sport:
+        cur.execute("""
+            UPDATE cards SET status='processing', worker_id=%s
+            WHERE id IN (
+                SELECT c.id FROM cards c
+                JOIN sets s ON s.slug = c.set_slug
+                WHERE c.status='pending' AND s.sport = %s
+                ORDER BY c.set_slug DESC, c.id
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING *
+        """, (WORKER_ID, sport, limit))
+    else:
+        cur.execute("""
+            UPDATE cards SET status='processing', worker_id=%s
+            WHERE id IN (
+                SELECT id FROM cards
+                WHERE status='pending'
+                ORDER BY set_slug DESC, id
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING *
+        """, (WORKER_ID, limit))
     rows = cur.fetchall()
     conn.commit()
     cur.close()
@@ -399,21 +421,35 @@ def count_pending_images() -> int:
     return count
 
 
-def get_errored_cards(limit: int = 500) -> list[dict]:
+def get_errored_cards(limit: int = 500, sport: str = None) -> list[dict]:
     """Claim errored cards for retry. Uses SKIP LOCKED for concurrency."""
     conn = get_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("""
-        UPDATE cards SET status='processing', worker_id=%s
-        WHERE id IN (
-            SELECT id FROM cards
-            WHERE status='error'
-            ORDER BY set_slug DESC, id
-            LIMIT %s
-            FOR UPDATE SKIP LOCKED
-        )
-        RETURNING *
-    """, (WORKER_ID, limit))
+    if sport:
+        cur.execute("""
+            UPDATE cards SET status='processing', worker_id=%s
+            WHERE id IN (
+                SELECT c.id FROM cards c
+                JOIN sets s ON s.slug = c.set_slug
+                WHERE c.status='error' AND s.sport = %s
+                ORDER BY c.set_slug DESC, c.id
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING *
+        """, (WORKER_ID, sport, limit))
+    else:
+        cur.execute("""
+            UPDATE cards SET status='processing', worker_id=%s
+            WHERE id IN (
+                SELECT id FROM cards
+                WHERE status='error'
+                ORDER BY set_slug DESC, id
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING *
+        """, (WORKER_ID, limit))
     rows = cur.fetchall()
     conn.commit()
     cur.close()
@@ -421,21 +457,35 @@ def get_errored_cards(limit: int = 500) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_cards_needing_download(limit: int = 500) -> list[dict]:
+def get_cards_needing_download(limit: int = 500, sport: str = None) -> list[dict]:
     """Claim cards for image download. Uses SKIP LOCKED for concurrency."""
     conn = get_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("""
-        UPDATE cards SET status='downloading', worker_id=%s
-        WHERE id IN (
-            SELECT id FROM cards
-            WHERE status='image_found' AND image_url IS NOT NULL
-            ORDER BY id
-            LIMIT %s
-            FOR UPDATE SKIP LOCKED
-        )
-        RETURNING *
-    """, (WORKER_ID, limit))
+    if sport:
+        cur.execute("""
+            UPDATE cards SET status='downloading', worker_id=%s
+            WHERE id IN (
+                SELECT c.id FROM cards c
+                JOIN sets s ON s.slug = c.set_slug
+                WHERE c.status='image_found' AND c.image_url IS NOT NULL AND s.sport = %s
+                ORDER BY c.id
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING *
+        """, (WORKER_ID, sport, limit))
+    else:
+        cur.execute("""
+            UPDATE cards SET status='downloading', worker_id=%s
+            WHERE id IN (
+                SELECT id FROM cards
+                WHERE status='image_found' AND image_url IS NOT NULL
+                ORDER BY id
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING *
+        """, (WORKER_ID, limit))
     rows = cur.fetchall()
     conn.commit()
     cur.close()

@@ -89,9 +89,9 @@ async def run_phase_v3(phase: int, sport: str = None, limit: int = 0):
         from scraper import parse_csvs
         parse_csvs(sport)
     elif phase == 4:
-        await scraper_v3.scrape_card_images_v3(limit)
+        await scraper_v3.scrape_card_images_v3(limit, sport=sport)
     elif phase == 5:
-        await scraper_v3.download_images_v3(limit)
+        await scraper_v3.download_images_v3(limit, sport=sport)
     else:
         console.print("[red]Invalid phase[/red]")
 
