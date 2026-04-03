@@ -252,7 +252,7 @@ def bulk_upsert_sets(sets_data: list[tuple]):
     psycopg2.extras.execute_batch(cur, """
         INSERT INTO sets (slug, name, sport, url)
         VALUES (%s, %s, %s, %s)
-        ON CONFLICT(slug) DO UPDATE SET name=EXCLUDED.name
+        ON CONFLICT(slug) DO UPDATE SET name=EXCLUDED.name, sport=EXCLUDED.sport
     """, sets_data)
     conn.commit()
     cur.close()
