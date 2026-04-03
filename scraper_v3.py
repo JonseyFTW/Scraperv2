@@ -864,25 +864,67 @@ class RedisTaskQueue:
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def run_full_pipeline_v3(sport: str = None, limit: int = 0):
-    """Run optimized pipeline with all improvements"""
+    """Run optimized pipeline with all improvements.
+
+    After the initial run, automatically retries error cards until
+    no more errors can be recovered (errors stop decreasing).
+    """
     db.init_db()
-    
+
     # Phase 1: Discover sets
     await discover_sets_v3(sport)
-    
+
     # Phase 2: Download CSVs
     await download_csvs_v3(sport)
-    
+
     # Phase 3: Parse CSVs (reuse existing function)
     from scraper import parse_csvs
     parse_csvs()
-    
+
     # Phase 4: Smart image URL discovery
     await scrape_card_images_v3(limit)
-    
+
     # Phase 5: Download images (reuse existing function but with curl_cffi)
     await download_images_v3(limit)
-    
+
+    # Phase 6: Auto-retry errors until they stop decreasing
+    max_retries = 10
+    last_error_count = None
+
+    for attempt in range(1, max_retries + 1):
+        # Count remaining errors
+        conn = db.get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM cards WHERE status = 'error'")
+        error_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM cards WHERE status IN ('pending', 'image_found', 'downloading', 'processing')")
+        pending_count = cur.fetchone()[0]
+        cur.close()
+        db.put_connection(conn)
+
+        if error_count == 0:
+            console.print("[bold green]All cards processed, zero errors![/bold green]")
+            break
+
+        # Stop if errors aren't decreasing (they're permanent failures)
+        if last_error_count is not None and error_count >= last_error_count:
+            console.print(f"[yellow]Errors not decreasing ({error_count:,} remaining) — these are likely permanent failures (no_image, bad URLs, etc.)[/yellow]")
+            break
+
+        # Wait for in-flight work to finish before resetting
+        if pending_count > 0:
+            console.print(f"[dim]Waiting for {pending_count:,} in-flight cards to finish...[/dim]")
+            await asyncio.sleep(30)
+            continue
+
+        last_error_count = error_count
+        console.print(f"\n[bold cyan]Auto-retry {attempt}/{max_retries}: Resetting {error_count:,} errors to pending[/bold cyan]")
+        db.reset_errors()
+
+        # Re-run phases 4 + 5 for the reset cards
+        await scrape_card_images_v3(limit)
+        await download_images_v3(limit)
+
     console.print("[bold green]Pipeline complete! Check stats with --stats[/bold green]")
 
 
