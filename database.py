@@ -276,10 +276,13 @@ def get_sets_needing_csv(sport: str = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_sets_needing_parse() -> list[dict]:
+def get_sets_needing_parse(sport: str = None) -> list[dict]:
     conn = get_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM sets WHERE csv_status='downloaded' ORDER BY slug")
+    if sport:
+        cur.execute("SELECT * FROM sets WHERE csv_status='downloaded' AND sport=%s ORDER BY slug", (sport,))
+    else:
+        cur.execute("SELECT * FROM sets WHERE csv_status='downloaded' ORDER BY slug")
     rows = cur.fetchall()
     cur.close()
     put_connection(conn)
