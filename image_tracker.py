@@ -621,12 +621,13 @@ def workers_page():
         ORDER BY total DESC
     """)
 
-    # Which sports each worker has cards for
+    # Which sports each worker is actively processing
     worker_sports_rows = query("""
         SELECT COALESCE(c.worker_id, 'unassigned') AS worker, s.sport, COUNT(*) AS cnt
         FROM cards c
         JOIN sets s ON s.slug = c.set_slug
         WHERE s.sport IS NOT NULL
+          AND c.status IN ('processing', 'downloading', 'image_found')
         GROUP BY COALESCE(c.worker_id, 'unassigned'), s.sport
         ORDER BY cnt DESC
     """)
