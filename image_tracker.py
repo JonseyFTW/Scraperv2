@@ -621,6 +621,18 @@ def workers_page():
         ORDER BY total DESC
     """)
 
+    # Which sports each worker has cards for
+    worker_sports_rows = query("""
+        SELECT COALESCE(c.worker_id, 'unassigned') AS worker, s.sport, COUNT(*) AS cnt
+        FROM cards c
+        JOIN sets s ON s.slug = c.set_slug
+        GROUP BY c.worker_id, s.sport
+        ORDER BY cnt DESC
+    """)
+    worker_sports = {}
+    for row in worker_sports_rows:
+        worker_sports.setdefault(row["worker"], []).append(row["sport"])
+
     active_workers = sum(1 for w in workers if w["worker"] != "unassigned"
                          and ((w["processing"] or 0) + (w["downloading"] or 0)) > 0)
     total_workers = sum(1 for w in workers if w["worker"] != "unassigned")
@@ -631,6 +643,7 @@ def workers_page():
     return render_template_string(
         WORKERS_HTML,
         workers=workers, totals=totals, sport_stats=sport_stats,
+        worker_sports=worker_sports,
         active_workers=active_workers, total_workers=total_workers,
         done=done, pct=pct,
     )
@@ -1421,6 +1434,16 @@ WORKERS_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><me
   .auto-refresh { font-size:0.8rem; color:var(--text2); margin-left:1rem; }
   .active-badge { background:rgba(74,222,128,0.2); color:var(--green); padding:0.1rem 0.5rem;
     border-radius:99px; font-size:0.75rem; font-weight:600; margin-left:0.5rem; }
+  .sport-badge { display:inline-block; padding:0.1rem 0.45rem; border-radius:6px; font-size:0.7rem;
+    font-weight:600; margin:0.1rem 0.15rem; text-transform:capitalize; }
+  .sport-baseball { background:rgba(239,68,68,0.15); color:#f87171; }
+  .sport-football { background:rgba(74,222,128,0.15); color:#4ade80; }
+  .sport-basketball { background:rgba(251,146,60,0.15); color:#fb923c; }
+  .sport-hockey { background:rgba(96,165,250,0.15); color:#60a5fa; }
+  .sport-soccer { background:rgba(168,85,247,0.15); color:#a855f7; }
+  .sport-racing { background:rgba(250,204,21,0.15); color:#facc15; }
+  .sport-wrestling { background:rgba(244,114,182,0.15); color:#f472b6; }
+  .sport-ufc { background:rgba(248,113,113,0.15); color:#f87171; }
 </style>
 </head><body>""" + NAV + """
 <div class="container">
@@ -1465,7 +1488,7 @@ WORKERS_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><me
   <div id="workers-table">
   <table>
     <thead><tr>
-      <th>Container</th><th>Total</th><th>Processing</th><th>Downloading</th>
+      <th>Container</th><th>Sports</th><th>Total</th><th>Processing</th><th>Downloading</th>
       <th>Downloaded</th><th>Image Found</th><th>Errors</th><th>No Image</th>
     </tr></thead>
     <tbody>
@@ -1477,6 +1500,7 @@ WORKERS_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><me
         <span class="active-badge">ACTIVE</span>
         {% endif %}
       </td>
+      <td>{% for sp in worker_sports.get(w.worker, []) %}<span class="sport-badge sport-{{ sp }}">{{ sp }}</span>{% endfor %}</td>
       <td>{{ "{:,}".format(w.total) }}</td>
       <td style="color:var(--yellow)">{{ "{:,}".format(w.processing or 0) }}</td>
       <td style="color:var(--blue)">{{ "{:,}".format(w.downloading or 0) }}</td>
@@ -1489,6 +1513,7 @@ WORKERS_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><me
     </tbody>
     <tfoot><tr style="border-top:2px solid var(--accent);font-weight:700">
       <td>TOTAL</td>
+      <td></td>
       <td>{{ "{:,}".format(totals.total) }}</td>
       <td style="color:var(--yellow)">{{ "{:,}".format(totals.processing or 0) }}</td>
       <td style="color:var(--blue)">{{ "{:,}".format(totals.downloading or 0) }}</td>
