@@ -573,7 +573,7 @@ def _run_job(job_id: str, cmd: list[str]):
 
 @app.route("/workers")
 def workers_page():
-    """Show per-container scraper worker stats."""
+    """Show per-container scraper worker stats with per-sport breakdown."""
     # Per-worker breakdown (same query as lxc_stats.py)
     workers = query("""
         SELECT
@@ -606,8 +606,8 @@ def workers_page():
     # Per-sport breakdown
     sport_stats = query("""
         SELECT
-            s.sport,
-            COUNT(c.id) AS total,
+            COALESCE(s.sport, 'unknown') AS sport,
+            COUNT(*) AS total,
             SUM(CASE WHEN c.status = 'pending' THEN 1 ELSE 0 END) AS pending,
             SUM(CASE WHEN c.status = 'processing' THEN 1 ELSE 0 END) AS processing,
             SUM(CASE WHEN c.status = 'downloading' THEN 1 ELSE 0 END) AS downloading,
@@ -615,10 +615,10 @@ def workers_page():
             SUM(CASE WHEN c.status = 'image_found' THEN 1 ELSE 0 END) AS image_found,
             SUM(CASE WHEN c.status = 'error' THEN 1 ELSE 0 END) AS errors,
             SUM(CASE WHEN c.status = 'no_image' THEN 1 ELSE 0 END) AS no_image
-        FROM sets s
-        JOIN cards c ON c.set_slug = s.slug
+        FROM cards c
+        JOIN sets s ON c.set_slug = s.slug
         GROUP BY s.sport
-        ORDER BY COUNT(c.id) DESC
+        ORDER BY total DESC
     """)
 
     active_workers = sum(1 for w in workers if w["worker"] != "unassigned"
@@ -667,8 +667,8 @@ def api_workers():
     """, one=True)
     sport_stats = query("""
         SELECT
-            s.sport,
-            COUNT(c.id) AS total,
+            COALESCE(s.sport, 'unknown') AS sport,
+            COUNT(*) AS total,
             SUM(CASE WHEN c.status = 'pending' THEN 1 ELSE 0 END) AS pending,
             SUM(CASE WHEN c.status = 'processing' THEN 1 ELSE 0 END) AS processing,
             SUM(CASE WHEN c.status = 'downloading' THEN 1 ELSE 0 END) AS downloading,
@@ -676,10 +676,10 @@ def api_workers():
             SUM(CASE WHEN c.status = 'image_found' THEN 1 ELSE 0 END) AS image_found,
             SUM(CASE WHEN c.status = 'error' THEN 1 ELSE 0 END) AS errors,
             SUM(CASE WHEN c.status = 'no_image' THEN 1 ELSE 0 END) AS no_image
-        FROM sets s
-        JOIN cards c ON c.set_slug = s.slug
+        FROM cards c
+        JOIN sets s ON c.set_slug = s.slug
         GROUP BY s.sport
-        ORDER BY COUNT(c.id) DESC
+        ORDER BY total DESC
     """)
     return jsonify({"workers": workers, "totals": totals, "sport_stats": sport_stats})
 
