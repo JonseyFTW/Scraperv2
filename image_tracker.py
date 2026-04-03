@@ -627,7 +627,7 @@ def workers_page():
         FROM cards c
         JOIN sets s ON s.slug = c.set_slug
         WHERE s.sport IS NOT NULL
-          AND c.status IN ('processing', 'downloading', 'image_found')
+          AND c.status IN ('processing', 'downloading')
         GROUP BY COALESCE(c.worker_id, 'unassigned'), s.sport
         ORDER BY cnt DESC
     """)
