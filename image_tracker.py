@@ -626,12 +626,17 @@ def workers_page():
         SELECT COALESCE(c.worker_id, 'unassigned') AS worker, s.sport, COUNT(*) AS cnt
         FROM cards c
         JOIN sets s ON s.slug = c.set_slug
-        GROUP BY c.worker_id, s.sport
+        WHERE s.sport IS NOT NULL
+        GROUP BY COALESCE(c.worker_id, 'unassigned'), s.sport
         ORDER BY cnt DESC
     """)
     worker_sports = {}
     for row in worker_sports_rows:
-        worker_sports.setdefault(row["worker"], []).append(row["sport"])
+        w = row["worker"]
+        if w not in worker_sports:
+            worker_sports[w] = []
+        if row["sport"] not in worker_sports[w]:
+            worker_sports[w].append(row["sport"])
 
     active_workers = sum(1 for w in workers if w["worker"] != "unassigned"
                          and ((w["processing"] or 0) + (w["downloading"] or 0)) > 0)
