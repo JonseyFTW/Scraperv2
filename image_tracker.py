@@ -603,6 +603,24 @@ def workers_page():
         FROM cards
     """, one=True)
 
+    # Per-sport breakdown
+    sport_stats = query("""
+        SELECT
+            s.sport,
+            COUNT(c.id) AS total,
+            SUM(CASE WHEN c.status = 'pending' THEN 1 ELSE 0 END) AS pending,
+            SUM(CASE WHEN c.status = 'processing' THEN 1 ELSE 0 END) AS processing,
+            SUM(CASE WHEN c.status = 'downloading' THEN 1 ELSE 0 END) AS downloading,
+            SUM(CASE WHEN c.status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded,
+            SUM(CASE WHEN c.status = 'image_found' THEN 1 ELSE 0 END) AS image_found,
+            SUM(CASE WHEN c.status = 'error' THEN 1 ELSE 0 END) AS errors,
+            SUM(CASE WHEN c.status = 'no_image' THEN 1 ELSE 0 END) AS no_image
+        FROM sets s
+        JOIN cards c ON c.set_slug = s.slug
+        GROUP BY s.sport
+        ORDER BY COUNT(c.id) DESC
+    """)
+
     active_workers = sum(1 for w in workers if w["worker"] != "unassigned"
                          and ((w["processing"] or 0) + (w["downloading"] or 0)) > 0)
     total_workers = sum(1 for w in workers if w["worker"] != "unassigned")
@@ -612,7 +630,7 @@ def workers_page():
 
     return render_template_string(
         WORKERS_HTML,
-        workers=workers, totals=totals,
+        workers=workers, totals=totals, sport_stats=sport_stats,
         active_workers=active_workers, total_workers=total_workers,
         done=done, pct=pct,
     )
@@ -647,7 +665,23 @@ def api_workers():
             SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors
         FROM cards
     """, one=True)
-    return jsonify({"workers": workers, "totals": totals})
+    sport_stats = query("""
+        SELECT
+            s.sport,
+            COUNT(c.id) AS total,
+            SUM(CASE WHEN c.status = 'pending' THEN 1 ELSE 0 END) AS pending,
+            SUM(CASE WHEN c.status = 'processing' THEN 1 ELSE 0 END) AS processing,
+            SUM(CASE WHEN c.status = 'downloading' THEN 1 ELSE 0 END) AS downloading,
+            SUM(CASE WHEN c.status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded,
+            SUM(CASE WHEN c.status = 'image_found' THEN 1 ELSE 0 END) AS image_found,
+            SUM(CASE WHEN c.status = 'error' THEN 1 ELSE 0 END) AS errors,
+            SUM(CASE WHEN c.status = 'no_image' THEN 1 ELSE 0 END) AS no_image
+        FROM sets s
+        JOIN cards c ON c.set_slug = s.slug
+        GROUP BY s.sport
+        ORDER BY COUNT(c.id) DESC
+    """)
+    return jsonify({"workers": workers, "totals": totals, "sport_stats": sport_stats})
 
 
 # ── Actions ─────────────────────────────────────────────────────────────────
@@ -1402,6 +1436,32 @@ WORKERS_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><me
     <div class="stat-card"><div class="label">Completion</div><div class="value green">{{ "%.1f"|format(pct) }}%</div></div>
   </div>
 
+  <h2 style="margin-top:2rem">Stats by Sport</h2>
+  <table>
+    <thead><tr>
+      <th>Sport</th><th>Total</th><th>Pending</th><th>In Flight</th>
+      <th>Downloaded</th><th>Image Found</th><th>Errors</th><th>No Image</th><th>Completion</th>
+    </tr></thead>
+    <tbody>
+    {% for sp in sport_stats %}
+    {% set sp_done = (sp.downloaded or 0) + (sp.image_found or 0) + (sp.no_image or 0) %}
+    {% set sp_pct = (sp_done / sp.total * 100) if sp.total else 0 %}
+    <tr>
+      <td style="text-transform:capitalize;font-weight:600">{{ sp.sport }}</td>
+      <td>{{ "{:,}".format(sp.total) }}</td>
+      <td style="color:var(--yellow)">{{ "{:,}".format(sp.pending or 0) }}</td>
+      <td style="color:var(--blue)">{{ "{:,}".format((sp.processing or 0) + (sp.downloading or 0)) }}</td>
+      <td style="color:var(--green)">{{ "{:,}".format(sp.downloaded or 0) }}</td>
+      <td>{{ "{:,}".format(sp.image_found or 0) }}</td>
+      <td style="color:var(--red)">{{ "{:,}".format(sp.errors or 0) }}</td>
+      <td style="color:var(--text2)">{{ "{:,}".format(sp.no_image or 0) }}</td>
+      <td style="color:var(--green)">{{ "%.1f"|format(sp_pct) }}%</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2 style="margin-top:2rem">Workers by Container</h2>
   <div id="workers-table">
   <table>
     <thead><tr>
