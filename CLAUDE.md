@@ -35,8 +35,16 @@ SportsCardPro Scraper v2 — scrapes sports card data, downloads images, and gen
 
 ## Environment
 - Dev/generation machine: Windows with NVIDIA 4070 Super Ti (17.2GB VRAM)
-- Scrapers: LXC containers on Proxmox
+- Scrapers: LXC containers on Proxmox (containers 127, 128, 19, 130, 131, 132, 133)
 - PowerShell syntax: use `$env:VAR = "value"` not `export VAR=value`
+
+### Proxmox LXC Services
+- **Image Tracker** (container 133): `systemctl restart image-tracker`
+  - Code path: `/home/user/Scraperv2/image_tracker.py`
+  - Service file: `/etc/systemd/system/image-tracker.service`
+  - Runs on port 5000 (`http://192.168.1.119:5000`)
+  - Note: also has a stale copy at `/opt/scraperv2/` — the service uses `/home/user/Scraperv2/`
+- **Scraper workers**: updated via `pct exec <CTID> -- scraper update` then `systemctl restart scraper`
 
 ## Key Decisions
 - Local GPU for bulk embedding generation (21+ img/s) — RunPod endpoint only for search API
