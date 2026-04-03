@@ -87,7 +87,7 @@ async def run_phase_v3(phase: int, sport: str = None, limit: int = 0):
     elif phase == 3:
         # Reuse v2 CSV parser
         from scraper import parse_csvs
-        parse_csvs()
+        parse_csvs(sport)
     elif phase == 4:
         await scraper_v3.scrape_card_images_v3(limit)
     elif phase == 5:

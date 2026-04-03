@@ -879,7 +879,7 @@ async def run_full_pipeline_v3(sport: str = None, limit: int = 0):
 
     # Phase 3: Parse CSVs (reuse existing function)
     from scraper import parse_csvs
-    parse_csvs()
+    parse_csvs(sport)
 
     # Phase 4: Smart image URL discovery
     await scrape_card_images_v3(limit)

@@ -602,12 +602,12 @@ async def download_csvs(page: Page, sport: str = None):
 # Phase 3: Parse CSVs into database
 # ═══════════════════════════════════════════════════════════════════════════
 
-def parse_csvs():
+def parse_csvs(sport: str = None):
     """
     Parse all downloaded CSVs and insert card records into the database.
     No browser needed — pure file processing.
     """
-    pending = db.get_sets_needing_parse()
+    pending = db.get_sets_needing_parse(sport)
 
     # Also check for CSVs that exist on disk but aren't in DB yet
     existing_csvs = glob.glob(os.path.join(config.CSV_DIR, "*.csv"))
@@ -633,6 +633,7 @@ def parse_csvs():
                 db.mark_set_csv_parsed(s["slug"], 0)
         except Exception as e:
             console.print(f"  [red]Parse error {s['slug']}: {e}[/red]")
+            db.mark_set_csv_error(s["slug"])
 
     console.print(f"\n  Total cards parsed: [green]{total_cards}[/green]")
     db.log_event("phase3_complete", f"Parsed {total_cards} cards")
