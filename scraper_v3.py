@@ -485,7 +485,7 @@ async def get_auth_cookies_scrapling():
         # Fill login form
         page.fill('[name="email"]', config.LOGIN_EMAIL)
         page.fill('[name="password"]', config.LOGIN_PASSWORD)
-        page.click('button[type="submit"]')
+        page.click('[type="submit"]')
         
         # Wait for login to complete
         await asyncio.sleep(3)
@@ -515,7 +515,7 @@ async def get_auth_cookies_playwright():
             await page.goto(config.LOGIN_URL)
             await page.fill('[name="email"]', config.LOGIN_EMAIL)
             await page.fill('[name="password"]', config.LOGIN_PASSWORD)
-            await page.click('button[type="submit"]')
+            await page.click('[type="submit"]')
             await asyncio.sleep(3)
             
             # Extract cookies
