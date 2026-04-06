@@ -45,7 +45,7 @@ import database as db
 
 console = Console()
 
-COLLECTION_NAME = config.POKEMON_CHROMA_COLLECTION  # "pokemon_embeddings_dinov2"
+COLLECTION_NAME = "pokemon_embeddings_dinov2_finetuned"
 
 # Lazy-loaded model globals
 _model = None
