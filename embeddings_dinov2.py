@@ -42,10 +42,11 @@ COLLECTION_NAME = "card_embeddings_dinov2"
 _model = None
 _transform = None
 _device = None
+_checkpoint_path = None
 
 
 def _load_model():
-    """Load DINOv2-ViT-L/14 on GPU with fp16 for speed."""
+    """Load DINOv2-ViT-L/14 on GPU with fp16 for speed. Loads fine-tuned weights if --checkpoint was provided."""
     global _model, _transform, _device
     if _model is not None:
         return
@@ -61,7 +62,15 @@ def _load_model():
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     console.print(f"[cyan]Loading DINOv2-ViT-L/14 on {_device}...[/cyan]")
 
-    _model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14")
+    # Use register-token variant if loading fine-tuned weights (training uses dinov2_vitl14_reg)
+    if _checkpoint_path:
+        _model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14_reg")
+        console.print(f"[cyan]Loading fine-tuned weights from {_checkpoint_path}...[/cyan]")
+        state_dict = torch.load(_checkpoint_path, map_location=_device, weights_only=True)
+        _model.load_state_dict(state_dict, strict=False)
+        console.print(f"[green]Fine-tuned model loaded[/green]")
+    else:
+        _model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14")
     _model.eval()
     _model = _model.to(_device)
 
@@ -555,6 +564,8 @@ def main():
     gen_parser = subparsers.add_parser("generate", help="Generate DINOv2 embeddings for downloaded cards")
     gen_parser.add_argument("--limit", type=int, default=0, help="Max embeddings to generate (0=all)")
     gen_parser.add_argument("--batch", type=int, default=32, help="GPU batch size (default: 32)")
+    gen_parser.add_argument("--checkpoint", type=str, default=None,
+                            help="Path to fine-tuned model checkpoint (uses base DINOv2 if not specified)")
 
     img_parser = subparsers.add_parser("search", help="Search by image")
     img_parser.add_argument("image", help="Path to query image")
@@ -570,6 +581,9 @@ def main():
     args = parser.parse_args()
 
     if args.command == "generate":
+        if args.checkpoint:
+            global _checkpoint_path
+            _checkpoint_path = args.checkpoint
         generate_embeddings(args.limit, args.batch)
     elif args.command == "search":
         search_by_image(args.image, args.top)
