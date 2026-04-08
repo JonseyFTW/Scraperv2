@@ -570,6 +570,8 @@ def main():
     img_parser = subparsers.add_parser("search", help="Search by image")
     img_parser.add_argument("image", help="Path to query image")
     img_parser.add_argument("--top", type=int, default=10, help="Number of results")
+    img_parser.add_argument("--checkpoint", type=str, default=None,
+                            help="Path to fine-tuned model checkpoint (uses base DINOv2 if not specified)")
 
     subparsers.add_parser("stats", help="Show embedding stats")
     subparsers.add_parser("migrate", help="Migrate from old collection name (card_images_dinov2)")
@@ -580,10 +582,11 @@ def main():
 
     args = parser.parse_args()
 
+    global _checkpoint_path
+    if hasattr(args, "checkpoint") and args.checkpoint:
+        _checkpoint_path = args.checkpoint
+
     if args.command == "generate":
-        if args.checkpoint:
-            global _checkpoint_path
-            _checkpoint_path = args.checkpoint
         generate_embeddings(args.limit, args.batch)
     elif args.command == "search":
         search_by_image(args.image, args.top)
