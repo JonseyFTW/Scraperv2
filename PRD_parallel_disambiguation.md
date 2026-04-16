@@ -1,6 +1,6 @@
 # PRD: Parallel Disambiguation Infrastructure — Scraperv2 Implementation Plan
 
-**Status:** Draft
+**Status:** Implemented (Part A A1–A9 + Part B B1–B5) — pending backfill run + RunPod redeploy
 **Branch:** `claude/parallel-disambiguation-infrastructure-azdkF`
 **Scope:** Scraperv2 repo. **Includes classifier training (Part B) because the DINOv2 fine-tuning pipeline already lives here under `training/`.**
 **Out of scope:** CardScanner web-app changes (A.1/A.2) — those ship from the web-app repo.

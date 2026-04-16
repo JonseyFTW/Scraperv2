@@ -38,6 +38,32 @@ console = Console()
 
 COLLECTION_NAME = "card_embeddings_dinov2_finetuned"
 
+# Preprocessing contract shared between embedding, fine-tuning, variant-classifier
+# training, and the RunPod handler. The RunPod handler keeps its own copy for
+# zero-dependency deployment; any change here MUST be mirrored there AND requires
+# retraining checkpoints that embed this spec.
+PREPROCESS_SPEC = {
+    "size": 518,
+    "interpolation": "bicubic",
+    "crop": "center",
+    "mean": [0.485, 0.456, 0.406],
+    "std":  [0.229, 0.224, 0.225],
+}
+
+
+def build_preprocess():
+    """Return a torchvision transform matching PREPROCESS_SPEC."""
+    from torchvision import transforms
+    return transforms.Compose([
+        transforms.Resize(
+            PREPROCESS_SPEC["size"],
+            interpolation=transforms.InterpolationMode.BICUBIC,
+        ),
+        transforms.CenterCrop(PREPROCESS_SPEC["size"]),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=PREPROCESS_SPEC["mean"], std=PREPROCESS_SPEC["std"]),
+    ])
+
 # Lazy-loaded model globals
 _model = None
 _transform = None
@@ -99,13 +125,8 @@ def _load_model():
         _model = _model.half()
         console.print("[green]Using fp16 (half precision) for faster inference[/green]")
 
-    # DINOv2 expects 518x518 images (14px patches * 37 = 518)
-    _transform = transforms.Compose([
-        transforms.Resize(518, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(518),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    # DINOv2 expects 518x518 images (14px patches * 37 = 518) — shared with training + RunPod
+    _transform = build_preprocess()
 
     # Warm up
     dummy = torch.randn(1, 3, 518, 518).to(_device)
