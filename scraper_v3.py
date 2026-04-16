@@ -615,8 +615,9 @@ async def apply_cdn_pattern(pattern: str, cdn_engine: CDNPatternEngine, limit: i
                 image_url = pattern.format(hash=hashes[hash_idx], size='1600')
             else:
                 continue
-                
-            db.update_card_image_url(product_id, image_url)
+
+            gcs_full, gcs_thumb = gcs_urls_from_any(image_url)
+            db.update_card_image_url(product_id, image_url, gcs_full, gcs_thumb)
             total_processed += 1
             
         console.print(f"[green]Processed {total_processed} cards with CDN pattern[/green]")
@@ -732,7 +733,12 @@ async def scrape_with_curl_cffi(limit: int, sport: str = None):
                             total_error += 1
                             session_mgr.rate_limiter.on_error()
                         elif isinstance(result, FetchResult) and result.image_url:
-                            db.update_card_image_url(card['product_id'], result.image_url)
+                            db.update_card_image_url(
+                                card['product_id'],
+                                result.image_url,
+                                result.gcs_image_url,
+                                result.gcs_thumb_url,
+                            )
                             total_ok += 1
                             last_progress_time = time.time()
                             session_mgr.rate_limiter.on_success()
@@ -782,12 +788,34 @@ async def scrape_with_curl_cffi(limit: int, sport: str = None):
 
 class FetchResult:
     """Result of fetch_image_url — distinguishes success, no-image, and errors."""
-    __slots__ = ('image_url', 'error', 'no_image', 'status_code')
-    def __init__(self, image_url=None, error=None, no_image=False, status_code=0):
+    __slots__ = ('image_url', 'gcs_image_url', 'gcs_thumb_url', 'error', 'no_image', 'status_code')
+    def __init__(self, image_url=None, gcs_image_url=None, gcs_thumb_url=None,
+                 error=None, no_image=False, status_code=0):
         self.image_url = image_url
+        self.gcs_image_url = gcs_image_url
+        self.gcs_thumb_url = gcs_thumb_url
         self.error = error
         self.no_image = no_image
         self.status_code = status_code
+
+
+_GCS_HASH_RE = re.compile(
+    r"storage\.googleapis\.com/images\.pricecharting\.com/([^/\s\"'<>]+)"
+)
+
+
+def gcs_urls_from_any(url: str) -> tuple[Optional[str], Optional[str]]:
+    """Given any PriceCharting GCS URL (any size), return (1600_url, 240_url)."""
+    if not url:
+        return None, None
+    m = _GCS_HASH_RE.search(url)
+    if not m:
+        return None, None
+    h = m.group(1)
+    return (
+        f"https://storage.googleapis.com/images.pricecharting.com/{h}/1600.jpg",
+        f"https://storage.googleapis.com/images.pricecharting.com/{h}/240.jpg",
+    )
 
 
 async def fetch_image_url(session: AsyncSession, card: dict) -> FetchResult:
@@ -804,8 +832,12 @@ async def fetch_image_url(session: AsyncSession, card: dict) -> FetchResult:
         match = re.search(pattern, resp.text)
 
         if match:
-            image_url = f"https://storage.googleapis.com/images.pricecharting.com/{match.group(1)}/1600.jpg"
-            return FetchResult(image_url=image_url)
+            gcs_full, gcs_thumb = gcs_urls_from_any(match.group(0))
+            return FetchResult(
+                image_url=gcs_full,
+                gcs_image_url=gcs_full,
+                gcs_thumb_url=gcs_thumb,
+            )
 
         # Page loaded OK but genuinely no image on it
         return FetchResult(no_image=True)

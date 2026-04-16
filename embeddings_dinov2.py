@@ -45,6 +45,26 @@ _device = None
 _checkpoint_path = None
 
 
+def _build_card_metadata(card: dict) -> dict:
+    """Build the ChromaDB metadata dict for a card row.
+
+    ChromaDB requires scalar values — coerce None -> "" or 0 as appropriate.
+    The 0 sentinel for print_run means "unknown"; no real card has /0.
+    """
+    return {
+        "product_name":  card.get("product_name")  or "",
+        "set_slug":      card.get("set_slug")      or "",
+        "image_path":    card.get("image_path")    or "",
+        "gcs_image_url": card.get("gcs_image_url") or "",
+        "gcs_thumb_url": card.get("gcs_thumb_url") or "",
+        "card_number":   card.get("card_number")   or "",
+        "print_run":     int(card["print_run"]) if card.get("print_run") else 0,
+        "player_name":   (card.get("player_name") or "").lower(),
+        "variant_label": card.get("variant_label") or "",
+        "loose_price":   float(card.get("loose_price") or 0),
+    }
+
+
 def _load_model():
     """Load DINOv2-ViT-L/14 on GPU with fp16 for speed. Loads fine-tuned weights if --checkpoint was provided."""
     global _model, _transform, _device
@@ -295,12 +315,7 @@ def generate_embeddings(limit: int = 0, batch_size: int = 32):
                     if emb is not None:
                         chroma_ids.append(str(card["product_id"]))
                         chroma_embeddings.append(emb)
-                        chroma_metadatas.append({
-                            "product_name": card["product_name"] or "",
-                            "set_slug": card["set_slug"] or "",
-                            "image_path": card["image_path"] or "",
-                            "loose_price": float(card["loose_price"] or 0),
-                        })
+                        chroma_metadatas.append(_build_card_metadata(card))
                         total += 1
 
                 if chroma_ids:

@@ -26,6 +26,7 @@ SportsCardPro Scraper v2 — scrapes sports card data, downloads images, and gen
 - ChromaDB for vector embeddings (local at `config.CHROMA_DIR`, separate instance on RunPod volume)
 - Card statuses: `image_found` → `downloading` → `downloaded` → (embedding generated separately)
 - To reset error cards: `UPDATE cards SET status = 'image_found' WHERE status = 'error'`
+- Parallel-disambiguation columns on `cards` (added via idempotent `ALTER`): `gcs_image_url`, `gcs_thumb_url`, `card_number`, `print_run`, `player_name`, `variant_label`. New rows populate automatically via `scraper.py` (CSV parse) + `scraper_v3.py` (image phase). Backfill existing rows with `python backfill_card_metadata.py --pass 1` (SQL + in-proc parse) then `python backfill_chroma_metadata.py` (in-place ChromaDB update, no re-embedding).
 
 ### Config
 - `config.py` holds all settings: DB URL, paths, RunPod credentials
