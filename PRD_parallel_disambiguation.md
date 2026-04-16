@@ -2,20 +2,26 @@
 
 **Status:** Draft
 **Branch:** `claude/parallel-disambiguation-infrastructure-azdkF`
-**Scope:** Scraperv2 repo only. CardScanner web-app + RunPod classifier training are tracked separately.
+**Scope:** Scraperv2 repo. **Includes classifier training (Part B) because the DINOv2 fine-tuning pipeline already lives here under `training/`.**
+**Out of scope:** CardScanner web-app changes (A.1/A.2) — those ship from the web-app repo.
 **Source PRD:** Parent "Parallel Disambiguation Infrastructure" PRD (Parts A + B).
 
 ---
 
 ## 0. Summary
 
-Six new columns on `cards`, parsing at scrape time, a two-pass backfill for the ~2M existing rows, and updated ChromaDB metadata (local + RunPod). That's the entire Scraperv2 surface area.
+**Part A — data plumbing:** six new columns on `cards`, parsing at scrape time, a two-pass backfill for the ~2M existing rows, and updated ChromaDB metadata (local + RunPod).
 
-The CardScanner consumer work (A.1 reference-image lookup, A.2 hint matching, B.1–B.4 classifier) is out of scope here — this PRD only guarantees that the data those features need is present and correct.
+**Part B — foil-pattern classifier:** new training scripts alongside the existing DINOv2 fine-tuner in `training/`, reusing its manifest/orchestration conventions. Plus a new `classify_variant` action on the RunPod handler so the web-app can hit it.
 
-Optional Scraperv2 work that enables downstream features:
+**Out of scope (tracked in the web-app repo):**
+- A.1 — replace SCP scrape with `gcs_image_url` read in `dinov2-disambig.ts`
+- A.2 — structured hint matching on `card_number` / `print_run`
+- B.2/B.3 — shadow-mode logging and Gemini-gating on scan requests
+
+Optional Scraperv2 work:
 - **A.3**: add `where` filter support to the RunPod handler's `search` action.
-- **B**: export `variant_label` ground-truth tables for offline classifier training (trivial SQL; no code changes needed).
+- **B.4**: ingest user-pick data exported from the web-app's `ScanLog` for continuous-learning retrains (needs web-app to emit the export).
 
 ---
 
@@ -277,26 +283,235 @@ This is the only required server-side change for A.3; the web-app builds the `wh
 
 ---
 
+## Part B — Foil-Pattern Classifier
+
+### 2.8 Approach
+
+Reuse the existing DINOv2 ViT-L/14-reg backbone (loaded the same way as in `training/02_finetune_dinov2.py:304` and `embeddings_dinov2.py:67-73`) and train **a classification head on top of frozen features**. This is a ~5 MB model that ships alongside the existing fine-tuned backbone on RunPod and adds ~10 ms per inference.
+
+Why a head on frozen features, not an end-to-end classifier:
+- DINOv2 features are already high-quality for fine-grained visual tasks.
+- A linear probe or 2-layer MLP can be trained on a laptop in an hour and updated weekly.
+- It composes cleanly with the existing fine-tuned backbone — at inference time we compute the DINOv2 feature once and reuse it for both similarity search AND variant classification.
+
+Model shape, smallest-first:
+
+1. **V1 — Linear probe.** `nn.Linear(1024, num_classes)`. Train in ~30 min. Expected ~80–85% top-1.
+2. **V2 — Small MLP.** `Linear(1024, 256) → GELU → Dropout(0.1) → Linear(256, num_classes)`. Train in ~1 h. Expected ~88–92%.
+3. **V3 — Crop-stack averaging.** Run V2 on 5 crops per card (4 corners + center stripe, border-biased) and average logits. Train once on the crop stack with random-crop augmentation. Expected 90%+ top-1, ≥98% top-3.
+
+Ship V1 first to validate the pipeline end-to-end; iterate to V2/V3 only if eval numbers miss the target.
+
+### 2.9 Class taxonomy
+
+Per the parent PRD's Open Questions, start with **raw `variant_label` strings, prefixed by `set_slug`**:
+
+```
+class_key = f"{set_slug}::{variant_label.strip().lower()}"
+```
+
+- Filters out nulls and ultra-rare classes (<10 examples) — record them but route to a single `__rare__` bucket at train time.
+- Keeps the `panini-prizm` "Silver" distinct from `panini-phoenix` "Silver" (different foils).
+- Canonicalization (typos, casing) deferred to V2 if accuracy suffers on common classes.
+
+Store the label map in the checkpoint so inference always has a deterministic index-to-label mapping.
+
+### 2.10 `training/04_export_variant_training_data.py` — new
+
+Mirrors `01_export_training_data.py` but groups by `variant_label` instead of character name.
+
+```python
+# pseudocode
+cur.execute("""
+    SELECT product_id, set_slug, variant_label, image_path, product_name
+      FROM cards
+     WHERE status = 'downloaded'
+       AND image_path IS NOT NULL
+       AND variant_label IS NOT NULL
+       AND variant_label <> ''
+""")
+rows = cur.fetchall()
+
+class_counts = Counter(f"{r.set_slug}::{r.variant_label.lower().strip()}" for r in rows)
+kept = {k for k, c in class_counts.items() if c >= MIN_SAMPLES_PER_CLASS}  # e.g. 10
+
+manifest = []
+for r in rows:
+    key = f"{r.set_slug}::{r.variant_label.lower().strip()}"
+    label = key if key in kept else "__rare__"
+    manifest.append({
+        "product_id": r.product_id,
+        "image_path": r.image_path,
+        "set_slug":   r.set_slug,
+        "variant_label": r.variant_label,
+        "class":      label,
+    })
+
+# Stratified 90/10 split, seeded
+# Emit: variant_manifest_train.jsonl, variant_manifest_val.jsonl, label_map.json
+```
+
+Outputs dropped in `./training_data/variant_classifier/` next to the existing Pokemon/Sports exports.
+
+Success metric for this script: ≥ 100 classes with ≥ 100 samples each, covering ≥ 80% of all scraped `variant_label` values.
+
+### 2.11 `training/05_train_variant_classifier.py` — new
+
+```python
+# Load the *same* backbone the inference-time path uses
+model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14_reg")
+if args.finetuned_backbone:
+    model.load_state_dict(torch.load(args.finetuned_backbone, weights_only=True))
+model.eval()
+for p in model.parameters(): p.requires_grad = False
+model = model.to(device)
+
+# V1 head
+head = nn.Linear(1024, num_classes).to(device)
+
+# fp16 feature extraction, fp32 head, CE with label smoothing 0.1
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+optim = torch.optim.AdamW(head.parameters(), lr=1e-3, weight_decay=1e-4)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
+```
+
+Training loop:
+
+- Image load + transform: identical preprocessing to `embeddings_dinov2.py:83-88` (518×518, bicubic, ImageNet norm). Matches RunPod inference.
+- Augmentation: reuse the phone-camera augmentation from `02_finetune_dinov2.py:46-189` (perspective, rotation ±5°, brightness/contrast, glare, JPEG). **Don't** augment borders away with aggressive random-crop in V1; the foil pattern often lives there.
+- Batch size: 128 on a 4070 Super Ti with fp16 features.
+- Epochs: 10–20 for the head (loss plateaus fast on frozen features).
+- Eval: top-1 and top-3 per epoch on the val set. Save best checkpoint.
+
+Checkpoint format (single `.pt`):
+
+```python
+torch.save({
+    "head_state_dict": head.state_dict(),
+    "label_map":       list_of_class_names,  # index -> string
+    "backbone":        "dinov2_vitl14_reg",
+    "finetuned_backbone_sha": hash_of_backbone_checkpoint_or_None,
+    "arch":            "linear",             # or "mlp_256"
+    "input_dim":       1024,
+    "preprocess":      {"size": 518, "crop": "center"},
+    "trained_at":      iso_timestamp,
+    "train_samples":   len(train_set),
+    "val_top1":        best_top1,
+    "val_top3":        best_top3,
+}, "./checkpoints/variant_classifier_v1.pt")
+```
+
+Including the preprocess spec and the backbone identifier in the checkpoint means the RunPod handler can refuse to load mismatched versions — a small guardrail against silent drift.
+
+### 2.12 `runpod_handler/handler.py` — new `classify_variant` action
+
+```python
+elif action == "classify_variant":
+    image_b64        = input_data["image"]
+    candidate_labels = input_data.get("candidate_labels")  # optional short-list
+
+    feat = embed_image(image_bytes)  # reuses the existing DINOv2 path
+
+    logits = _variant_head(torch.from_numpy(feat).to(_device))
+    probs  = torch.softmax(logits, dim=-1).cpu().numpy()
+    scores = {_label_map[i]: float(probs[i]) for i in range(len(_label_map))}
+
+    if candidate_labels:
+        # Restrict + renormalize over the candidates the web-app supplied.
+        # (Web-app passes the labels of the DINOv2 top-K candidates.)
+        scores = {k: scores.get(k, 0.0) for k in candidate_labels}
+        total = sum(scores.values()) or 1.0
+        scores = {k: v / total for k, v in scores.items()}
+
+    top = max(scores, key=scores.get)
+    return {"scores": scores, "top": top, "top_score": scores[top]}
+```
+
+Model loading happens once at cold start, next to the existing backbone load. The head is a few MB; download time negligible.
+
+Handler response matches the parent PRD:
+
+```json
+{"scores": {"Yellow Pyramids": 0.87, "Teal Pyramids": 0.12}, "top": "Yellow Pyramids", "top_score": 0.87}
+```
+
+### 2.13 Pipeline integration — `run_full_pipeline.py`
+
+Add two steps to the existing 7-step pipeline (orchestration at `run_full_pipeline.py:514-549`):
+
+- **Step 8:** `04_export_variant_training_data.py`
+- **Step 9:** `05_train_variant_classifier.py`
+- **Step 5 (existing) extended:** upload the variant classifier checkpoint to RunPod S3 alongside the DINOv2 checkpoint.
+
+New CLI flags:
+
+- `--skip-variant-classifier` (symmetry with `--skip-training`)
+- `--variant-arch {linear,mlp}` (default `linear` for V1)
+- `--variant-min-samples 10`
+
+Resumable in the same way every existing step is.
+
+### 2.14 Evaluation harness
+
+Single script: `training/06_eval_variant_classifier.py`. Reads the val manifest, runs the checkpoint, reports:
+
+- Overall top-1 / top-3.
+- Per-class precision/recall (sorted by support) — surfaces which foil patterns are learned well and which aren't.
+- Confusion matrix dumped to CSV for the top N confusions.
+- A head-to-head sample: for 100 random ambiguous DINOv2 clusters (≥2 candidates within 0.02 similarity), does the classifier pick the same variant as `product_name` ground truth?
+
+This is what determines whether we promote V1 → V2 → V3, and later whether the classifier is good enough to gate Gemini calls in the web app.
+
+### 2.15 Continuous learning (B.4, deferred)
+
+Placeholder — no implementation in this PR, just an interface:
+
+- Web-app exports user picks from `ScanLog.rawResponse` where `method="dinov2-disambig-user-pick"` as JSONL: `{image_url_or_bytes, chosen_product_id, rejected_product_ids, timestamp}`.
+- Scraperv2 ingests the JSONL, joins `chosen_product_id` → `cards.variant_label`, adds to the training manifest with a `source: "user_pick"` tag and higher sample weight.
+- Retrain script extended to honor `sample_weight`.
+
+Ship this once shadow-mode (B.2, web-app side) produces enough picks to be worth retraining on. Target: weekly retrain cadence.
+
+---
+
 ## 3. Rollout Order
+
+**Part A — data plumbing** (one PR, then run backfill separately):
 
 | # | Change | Risk | Reversible? |
 |---|---|---|---|
-| 1 | Schema additions (`database.py`) + indexes | Low — nullable columns, idempotent `ALTER` | Yes — drop columns |
-| 2 | `card_name_parser.py` + unit tests | None | Yes |
-| 3 | Scraper write-path updates (Phase 3 + Phase 4) | Low — new rows only | Yes — new columns ignored |
-| 4 | `embeddings_dinov2.py` metadata expansion | Low — only affects newly-embedded cards | Yes |
-| 5 | `backfill_card_metadata.py` Pass 1 (SQL + in-proc parse) | Low — pure `UPDATE ... WHERE IS NULL` | Yes — set new cols back to NULL |
-| 6 | `backfill_chroma_metadata.py` (`collection.update`) | Low — metadata-only, no embeddings touched | Yes — re-run from DB |
-| 7 | `sync` to RunPod | Low — existing command | Yes |
-| 8 | Pass 2 network backfill (long-running) | Medium — hits SCP at scale; follow existing rate limits | Yes — kill + resume |
-| 9 | (Opt.) RunPod handler `where` support | Low — additive param | Yes — old image |
+| A1 | Schema additions (`database.py`) + indexes | Low — nullable columns, idempotent `ALTER` | Yes — drop columns |
+| A2 | `card_name_parser.py` + unit tests | None | Yes |
+| A3 | Scraper write-path updates (Phase 3 + Phase 4) | Low — new rows only | Yes — new columns ignored |
+| A4 | `embeddings_dinov2.py` metadata expansion | Low — only affects newly-embedded cards | Yes |
+| A5 | `backfill_card_metadata.py` Pass 1 (SQL + in-proc parse) | Low — pure `UPDATE ... WHERE IS NULL` | Yes — set new cols back to NULL |
+| A6 | `backfill_chroma_metadata.py` (`collection.update`) | Low — metadata-only, no embeddings touched | Yes — re-run from DB |
+| A7 | `sync` to RunPod | Low — existing command | Yes |
+| A8 | Pass 2 network backfill (long-running) | Medium — hits SCP at scale; follow existing rate limits | Yes — kill + resume |
+| A9 | (Opt.) RunPod handler `where` support | Low — additive param | Yes — old image |
 
-Ship 1–7 as one PR. Run 8 in a screen session on a scraper LXC and monitor. Land 9 independently once A.1/A.2 on the web-app side actually need it.
+Ship A1–A7 as one PR. Run A8 in a screen session on a scraper LXC and monitor. Land A9 independently once the web-app needs it.
+
+**Part B — foil-pattern classifier** (blocks on A completing):
+
+| # | Change | Risk | Reversible? |
+|---|---|---|---|
+| B1 | `training/04_export_variant_training_data.py` | None — read-only export | Yes |
+| B2 | `training/05_train_variant_classifier.py` (V1 linear probe) | None — offline, produces a new checkpoint file | Yes |
+| B3 | `training/06_eval_variant_classifier.py` + per-class report | None | Yes |
+| B4 | `run_full_pipeline.py` steps 8–9 integration | Low — gated by `--skip-variant-classifier` | Yes |
+| B5 | `runpod_handler/handler.py` — `classify_variant` action + checkpoint load at cold-start | Medium — adds cold-start time, new code path; ship behind handler version bump | Yes — revert handler image |
+| B6 | Upload checkpoint to RunPod S3, deploy new handler release | Medium — must match inference-time preprocessing exactly | Yes — roll back release |
+| B7 | Iterate to V2 (MLP) and V3 (crop-stack) if V1 misses the 90% top-1 / 98% top-3 bar | None (offline) | Yes |
+| B8 | (Deferred) B.4 continuous-learning ingestion from web-app user-pick export | None until web-app emits the export | Yes |
+
+Ship B1–B3 as a second PR once A has completed and Pass 1 of the backfill has populated `variant_label` across the table. B4–B6 ship as a third PR gated on eval results.
 
 ---
 
 ## 4. Acceptance Criteria
 
+**Part A:**
 1. `\d+ cards` in `psql` shows `gcs_image_url`, `gcs_thumb_url`, `card_number`, `print_run`, `player_name`, `variant_label` columns; three new indexes visible.
 2. `pytest tests/test_card_name_parser.py` passes all ~8 cases above.
 3. A freshly-scraped set shows non-null `player_name` / `card_number` / `variant_label` / `gcs_*_url` on ≥95% of rows (100% for GCS URLs when the image actually exists).
@@ -306,10 +521,20 @@ Ship 1–7 as one PR. Run 8 in a screen session on a scraper LXC and monitor. La
 7. Existing `embeddings_dinov2.py search <img>` keeps working with unchanged latency and top-1 result (no regression in similarity ranking — metadata doesn't affect the ANN index).
 8. (If A.3 shipped) `curl` to the RunPod handler with `{"action":"search","image":..., "where":{"print_run":185}}` returns only matches with `print_run: 185` in their metadata.
 
+**Part B:**
+9. `04_export_variant_training_data.py` emits `variant_manifest_{train,val}.jsonl` + `label_map.json` with ≥ 100 classes, each with ≥ 100 samples, and an `__rare__` bucket for the tail.
+10. `05_train_variant_classifier.py` produces a checkpoint at `./checkpoints/variant_classifier_v1.pt` containing `head_state_dict`, `label_map`, `backbone`, `arch`, `preprocess`, and validation metrics.
+11. V1 linear-probe validation top-1 ≥ 80% on the held-out stratified split. V3 (if needed) ≥ 90% top-1, ≥ 98% top-3.
+12. `06_eval_variant_classifier.py` produces a per-class precision/recall CSV and a top-N confusion CSV.
+13. RunPod `classify_variant` action returns scores summing to ~1.0 when `candidate_labels` is supplied; returns full distribution when not.
+14. End-to-end cold-start time on the RunPod worker doesn't regress by more than 500 ms (classifier head should add well under that).
+15. `run_full_pipeline.py --step 8` runs the export; `--step 9` runs training; `--skip-variant-classifier` short-circuits both — no regression to the existing 7-step DINOv2 flow.
+
 ---
 
 ## 5. Risks & Mitigations
 
+**Part A:**
 - **`image_url` containing non-GCS URLs.** Pass 1's `WHERE image_url LIKE '%googleapis%'` skips them; Pass 2 handles them via HTTP. If a meaningful fraction is non-GCS, investigate before running Pass 2 at full scale.
 - **ChromaDB memory during Pass 3.** `collection.get()` with no filter returns every ID; for 600K IDs that's fine (~50 MB of strings), but if we ever hit 10M+ we need paginated `get(limit=N, offset=M)`. Flag for future.
 - **Regex false positives.** `"Upper Deck #1/1000"` — is `1/1000` a print run or `#1 of 1000`? Our rule says `print_run=1000`, `card_number="1"`. That's correct for SCP's convention; document it in the parser's docstring and add it to the test suite.
@@ -317,20 +542,29 @@ Ship 1–7 as one PR. Run 8 in a screen session on a scraper LXC and monitor. La
 - **Backfill hitting SCP too hard.** Pass 2 reuses `SessionManager`'s existing delays (`REQUEST_DELAY_MIN/MAX`, `IMAGE_CONCURRENT_DOWNLOADS`) — same budget as normal scrapes. If SCP rate-limits, the existing error-handling paths take over.
 - **Column name collision with `tcgplayer_cards.card_number`.** Different table, no collision; just note it in passing so future readers aren't confused.
 
+**Part B:**
+- **Class imbalance.** The long tail of rare variants (`/10`, `/5`, 1-of-1s) will starve the classifier. Route everything below MIN_SAMPLES to `__rare__` at train time; at inference time, rare-class predictions are low-confidence and fall through to Gemini. Document this as *expected* behavior.
+- **Train/inference preprocessing drift.** The #1 silent-failure mode for this class of model. Mitigation: both paths share one helper (`preprocess_for_dinov2(img) -> tensor`) living in `embeddings_dinov2.py`. Training imports it. RunPod handler imports it. Checkpoint stores the preprocess spec and refuses to load on mismatch.
+- **Backbone mismatch between train and serve.** The RunPod worker currently runs a fine-tuned DINOv2 checkpoint. The classifier head must be trained against the same checkpoint (hash stored in `finetuned_backbone_sha`). Retrain the head any time the backbone is retrained.
+- **Scraped labels don't match user-uploaded scans.** The reference photos are clean studio shots; scans have glare and crops. That's exactly what the phone-camera augmentation from `02_finetune_dinov2.py:46-189` is designed to close, and why we reuse it.
+- **Shadow-mode data not available yet.** We can't evaluate real-world accuracy until the web-app ships B.2. Workaround: for V1, evaluate on a held-out stratified split of scraped labels. Promote gating to a separate PR once shadow data lands.
+- **Cold-start regression.** Loading the head is cheap (~5 MB), but the label_map and preprocess checks add a few hundred ms. If cold-start time is a concern, lazy-load the head on the first `classify_variant` call rather than at worker boot.
+
 ---
 
-## 6. Out of Scope (tracked elsewhere)
+## 6. Out of Scope (tracked in the web-app repo)
 
 - **A.1 web-app**: replace SCP scrape with `gcs_image_url` read.
 - **A.2 web-app**: structured hint matching + "skip DINOv2 if print_run hint can't match" gate.
-- **B.1 classifier training**: ResNet/DINOv2-head over `variant_label`-labeled crops.
-- **B.2–B.4**: shadow mode, promotion, continuous learning from disambig picks.
-
-These unblock as soon as this PR lands and the backfill finishes.
+- **B.2 web-app**: shadow-mode logging (classifier result vs. Gemini result on every ambiguous scan).
+- **B.3 web-app**: gate the Gemini call on `classifier_top_score < threshold`.
+- **B.4 web-app**: export user picks from `ScanLog` as training data (Scraperv2 consumes on the other end once available).
 
 ---
 
 ## 7. File Change Map
+
+**Part A:**
 
 | File | Change |
 |---|---|
@@ -339,10 +573,24 @@ These unblock as soon as this PR lands and the backfill finishes.
 | `tests/test_card_name_parser.py` | **new** — ~60 LOC |
 | `scraper.py` (`parse_csvs` ~:670) | call parser, pass 4 new fields into insert dict |
 | `scraper_v3.py` | +`gcs_urls_from_any` helper; update `fetch_image_url` return shape; update DB write to store both URLs |
-| `embeddings_dinov2.py:298-303` | expand metadata dict (+6 keys) |
+| `embeddings_dinov2.py` | expand metadata dict (+6 keys); factor preprocessing into a reusable helper that both training and RunPod can import |
 | `backfill_card_metadata.py` | **new** — Pass 1 (SQL + in-proc parse), Pass 2 (network) |
 | `backfill_chroma_metadata.py` | **new** — Pass 3 (`collection.update`) |
-| `runpod_handler/handler.py` (optional) | accept `where` in `search` action |
+| `runpod_handler/handler.py` | (optional A.3) accept `where` in `search` action |
 | `CLAUDE.md` | append a line under "Database" documenting the new columns + backfill commands |
 
-Estimated net diff: ~400 LOC added, ~20 LOC changed.
+**Part B:**
+
+| File | Change |
+|---|---|
+| `training/04_export_variant_training_data.py` | **new** — ~150 LOC. Emits `variant_manifest_{train,val}.jsonl` + `label_map.json`. |
+| `training/05_train_variant_classifier.py` | **new** — ~350 LOC. Linear-probe (V1) + MLP (V2) + crop-stack (V3) switches. |
+| `training/06_eval_variant_classifier.py` | **new** — ~200 LOC. Top-1/top-3, per-class P/R, confusion CSV. |
+| `training/requirements.txt` | add `scikit-learn` (stratified split, classification report) |
+| `training/run_full_pipeline.py` | +2 steps (export + train variant classifier), +3 CLI flags (`--skip-variant-classifier`, `--variant-arch`, `--variant-min-samples`); extend step-5 S3 upload to include the variant checkpoint |
+| `runpod_handler/handler.py` | +`classify_variant` action; cold-start head loader with label-map + preprocess-spec validation |
+| `runpod_handler/requirements.txt` | no change (head is pure `nn.Linear` on existing torch) |
+| `embeddings_dinov2.py` | expose a `preprocess_image(img) -> tensor` helper so training and serving share one code path |
+| `CLAUDE.md` | append a "Foil-pattern classifier" subsection under "Architecture" |
+
+Estimated net diff: Part A ~400 LOC, Part B ~750 LOC.
