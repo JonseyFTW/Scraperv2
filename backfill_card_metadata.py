@@ -86,23 +86,28 @@ def pass_1a():
 def pass_1b(chunk_size: int = 10_000):
     console.print("[bold]Pass 1b:[/bold] parse product_name -> player/card_number/print_run/variant_label")
     total = 0
+    # Cursor-based pagination by id so rows where the parser yields player_name=None
+    # (e.g. product_names starting with '#' or '[') don't get re-selected forever.
+    last_id = 0
     while True:
         conn = db.get_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
             SELECT id, product_name FROM cards
-             WHERE player_name IS NULL
+             WHERE id > %s
+               AND player_name IS NULL
                AND product_name IS NOT NULL
                AND product_name <> ''
              ORDER BY id
              LIMIT %s
-        """, (chunk_size,))
+        """, (last_id, chunk_size))
         rows = cur.fetchall()
         cur.close()
 
         if not rows:
             db.put_connection(conn)
             break
+        last_id = rows[-1]["id"]
 
         updates = []
         for r in rows:
