@@ -7,10 +7,10 @@ SportsCardPro Scraper v2 — scrapes sports card data, downloads images, and gen
 
 ### Embedding Pipeline
 - **`embeddings.py`** — Original CLIP ViT-B-32 embeddings (512-dim). Uses `open-clip-torch`. Collection: `card_images`
-- **`embeddings_dinov2.py`** — DINOv2 ViT-L/14 embeddings (1024-dim). Runs locally on GPU with batched fp16 inference. Collection: `card_embeddings_dinov2`
+- **`embeddings_dinov2.py`** — DINOv2 ViT-L/14 embeddings (1024-dim). Runs locally on GPU with batched fp16 inference. Collection: `card_embeddings_dinov2_finetuned`
   - Supports `generate`, `search`, `stats`, `migrate` commands
   - `--batch` flag controls GPU batch size (default 32, 64 works well on 4070 Super Ti)
-  - `migrate` command copies embeddings from old `card_images_dinov2` collection to `card_embeddings_dinov2`
+  - `migrate` command copies embeddings from old `card_images_dinov2` collection to the current canonical name
   - DINOv2 is vision-only — no text search (use CLIP for that)
 
 ### RunPod Serverless Endpoint
@@ -18,7 +18,7 @@ SportsCardPro Scraper v2 — scrapes sports card data, downloads images, and gen
 - Docker image: `ghcr.io/jonseyftw/dinov2-cardscanner:latest`
 - Handler source: `runpod_handler/handler.py`
 - Handler actions: `search` (triple-query majority vote, supports optional `where` metadata filter), `embed` (raw 1024-dim vector), `classify_variant` (foil-pattern classifier; scores + top label), `upsert`, `health`
-- ChromaDB collection on RunPod: `card_embeddings_dinov2` (must match local)
+- ChromaDB collection on RunPod: `card_embeddings_dinov2_finetuned` (must match local). Set via the `COLLECTION_NAME` env var on the RunPod endpoint — the handler falls back to `card_embeddings_dinov2` if the env var is missing, which would point at an empty collection in production.
 - Variant classifier weights path (env `VARIANT_CLASSIFIER_WEIGHTS`, default `/runpod-volume/variant_classifier.pt`). Checkpoint stores preprocess spec — handler refuses to load on mismatch.
 - To redeploy: rebuild Docker image in `C:\Scripts\CardScanner\dinov2-service\`, push to GHCR, trigger new release in RunPod dashboard
 
@@ -58,4 +58,4 @@ SportsCardPro Scraper v2 — scrapes sports card data, downloads images, and gen
 ## Key Decisions
 - Local GPU for bulk embedding generation (21+ img/s) — RunPod endpoint only for search API
 - fp16 half precision enabled for ~2x GPU speedup
-- Collection name `card_embeddings_dinov2` is canonical — must match between local and RunPod
+- Collection name `card_embeddings_dinov2_finetuned` is canonical — must match between local and RunPod (RunPod endpoint sets `COLLECTION_NAME` env var)
