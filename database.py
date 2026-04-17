@@ -138,6 +138,22 @@ def init_db():
         END $$;
     """)
 
+    # Parallel-disambiguation columns (PRD_parallel_disambiguation.md)
+    for col, ddl in (
+        ("gcs_image_url", "ALTER TABLE cards ADD COLUMN gcs_image_url TEXT"),
+        ("gcs_thumb_url", "ALTER TABLE cards ADD COLUMN gcs_thumb_url TEXT"),
+        ("card_number",   "ALTER TABLE cards ADD COLUMN card_number TEXT"),
+        ("print_run",     "ALTER TABLE cards ADD COLUMN print_run INTEGER"),
+        ("player_name",   "ALTER TABLE cards ADD COLUMN player_name TEXT"),
+        ("variant_label", "ALTER TABLE cards ADD COLUMN variant_label TEXT"),
+    ):
+        cur.execute(f"""
+            DO $$ BEGIN
+                {ddl};
+            EXCEPTION WHEN duplicate_column THEN NULL;
+            END $$;
+        """)
+
     # ── Pokemon TCG tables ───────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pokemon_sets (
@@ -211,6 +227,9 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_set ON cards(set_slug)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_worker ON cards(worker_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_print_run ON cards(print_run)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_card_number ON cards(card_number)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cards_player_lower ON cards(lower(player_name))")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_sets_csv ON sets(csv_status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_sets_img ON sets(img_status)")
     conn.commit()
@@ -334,16 +353,28 @@ def mark_set_images_scraped(slug: str):
 # ── Card operations ───────────────────────────────────────────────────────
 
 def bulk_insert_cards(cards: list[dict]):
-    """Insert cards from CSV parse. Each dict has CSV column data."""
+    """Insert cards from CSV parse. Each dict has CSV column data.
+
+    Optional keys populated by card_name_parser.parse_product_name:
+      player_name, card_number, print_run, variant_label — default to NULL if missing.
+    """
     conn = get_connection()
     cur = conn.cursor()
+    # Ensure every row carries the parsed-name keys so execute_batch doesn't KeyError.
+    for c in cards:
+        c.setdefault("player_name",   None)
+        c.setdefault("card_number",   None)
+        c.setdefault("print_run",     None)
+        c.setdefault("variant_label", None)
     psycopg2.extras.execute_batch(cur, """
         INSERT INTO cards
             (product_id, set_slug, product_name, console_name,
-             card_url_slug, full_url, loose_price, cib_price, new_price)
+             card_url_slug, full_url, loose_price, cib_price, new_price,
+             player_name, card_number, print_run, variant_label)
         VALUES
             (%(product_id)s, %(set_slug)s, %(product_name)s, %(console_name)s,
-             %(card_url_slug)s, %(full_url)s, %(loose_price)s, %(cib_price)s, %(new_price)s)
+             %(card_url_slug)s, %(full_url)s, %(loose_price)s, %(cib_price)s, %(new_price)s,
+             %(player_name)s, %(card_number)s, %(print_run)s, %(variant_label)s)
         ON CONFLICT (product_id) DO NOTHING
     """, cards)
     conn.commit()
@@ -493,12 +524,23 @@ def get_cards_needing_download(limit: int = 500, sport: str = None) -> list[dict
     return [dict(r) for r in rows]
 
 
-def update_card_image_url(product_id: str, image_url: str):
+def update_card_image_url(
+    product_id: str,
+    image_url: str,
+    gcs_image_url: str = None,
+    gcs_thumb_url: str = None,
+):
+    """Store scraped image URL + canonical GCS 1600/240 variants when available."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        UPDATE cards SET image_url=%s, status='image_found' WHERE product_id=%s
-    """, (image_url, product_id))
+        UPDATE cards
+           SET image_url=%s,
+               gcs_image_url=COALESCE(%s, gcs_image_url),
+               gcs_thumb_url=COALESCE(%s, gcs_thumb_url),
+               status='image_found'
+         WHERE product_id=%s
+    """, (image_url, gcs_image_url, gcs_thumb_url, product_id))
     conn.commit()
     cur.close()
     put_connection(conn)

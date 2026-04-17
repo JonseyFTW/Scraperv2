@@ -38,11 +38,57 @@ console = Console()
 
 COLLECTION_NAME = "card_embeddings_dinov2_finetuned"
 
+# Preprocessing contract shared between embedding, fine-tuning, variant-classifier
+# training, and the RunPod handler. The RunPod handler keeps its own copy for
+# zero-dependency deployment; any change here MUST be mirrored there AND requires
+# retraining checkpoints that embed this spec.
+PREPROCESS_SPEC = {
+    "size": 518,
+    "interpolation": "bicubic",
+    "crop": "center",
+    "mean": [0.485, 0.456, 0.406],
+    "std":  [0.229, 0.224, 0.225],
+}
+
+
+def build_preprocess():
+    """Return a torchvision transform matching PREPROCESS_SPEC."""
+    from torchvision import transforms
+    return transforms.Compose([
+        transforms.Resize(
+            PREPROCESS_SPEC["size"],
+            interpolation=transforms.InterpolationMode.BICUBIC,
+        ),
+        transforms.CenterCrop(PREPROCESS_SPEC["size"]),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=PREPROCESS_SPEC["mean"], std=PREPROCESS_SPEC["std"]),
+    ])
+
 # Lazy-loaded model globals
 _model = None
 _transform = None
 _device = None
 _checkpoint_path = None
+
+
+def _build_card_metadata(card: dict) -> dict:
+    """Build the ChromaDB metadata dict for a card row.
+
+    ChromaDB requires scalar values — coerce None -> "" or 0 as appropriate.
+    The 0 sentinel for print_run means "unknown"; no real card has /0.
+    """
+    return {
+        "product_name":  card.get("product_name")  or "",
+        "set_slug":      card.get("set_slug")      or "",
+        "image_path":    card.get("image_path")    or "",
+        "gcs_image_url": card.get("gcs_image_url") or "",
+        "gcs_thumb_url": card.get("gcs_thumb_url") or "",
+        "card_number":   card.get("card_number")   or "",
+        "print_run":     int(card["print_run"]) if card.get("print_run") else 0,
+        "player_name":   (card.get("player_name") or "").lower(),
+        "variant_label": card.get("variant_label") or "",
+        "loose_price":   float(card.get("loose_price") or 0),
+    }
 
 
 def _load_model():
@@ -79,13 +125,8 @@ def _load_model():
         _model = _model.half()
         console.print("[green]Using fp16 (half precision) for faster inference[/green]")
 
-    # DINOv2 expects 518x518 images (14px patches * 37 = 518)
-    _transform = transforms.Compose([
-        transforms.Resize(518, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(518),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    # DINOv2 expects 518x518 images (14px patches * 37 = 518) — shared with training + RunPod
+    _transform = build_preprocess()
 
     # Warm up
     dummy = torch.randn(1, 3, 518, 518).to(_device)
@@ -295,12 +336,7 @@ def generate_embeddings(limit: int = 0, batch_size: int = 32):
                     if emb is not None:
                         chroma_ids.append(str(card["product_id"]))
                         chroma_embeddings.append(emb)
-                        chroma_metadatas.append({
-                            "product_name": card["product_name"] or "",
-                            "set_slug": card["set_slug"] or "",
-                            "image_path": card["image_path"] or "",
-                            "loose_price": float(card["loose_price"] or 0),
-                        })
+                        chroma_metadatas.append(_build_card_metadata(card))
                         total += 1
 
                 if chroma_ids:

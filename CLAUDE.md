@@ -17,8 +17,9 @@ SportsCardPro Scraper v2 — scrapes sports card data, downloads images, and gen
 - Endpoint ID: `m5et95n0vtnnmv` (env: `RUNPOD_ENDPOINT_ID`)
 - Docker image: `ghcr.io/jonseyftw/dinov2-cardscanner:latest`
 - Handler source: `runpod_handler/handler.py`
-- Handler actions: `search` (triple-query majority vote), `embed` (raw 1024-dim vector), `health`
+- Handler actions: `search` (triple-query majority vote, supports optional `where` metadata filter), `embed` (raw 1024-dim vector), `classify_variant` (foil-pattern classifier; scores + top label), `upsert`, `health`
 - ChromaDB collection on RunPod: `card_embeddings_dinov2` (must match local)
+- Variant classifier weights path (env `VARIANT_CLASSIFIER_WEIGHTS`, default `/runpod-volume/variant_classifier.pt`). Checkpoint stores preprocess spec — handler refuses to load on mismatch.
 - To redeploy: rebuild Docker image in `C:\Scripts\CardScanner\dinov2-service\`, push to GHCR, trigger new release in RunPod dashboard
 
 ### Database
@@ -26,6 +27,7 @@ SportsCardPro Scraper v2 — scrapes sports card data, downloads images, and gen
 - ChromaDB for vector embeddings (local at `config.CHROMA_DIR`, separate instance on RunPod volume)
 - Card statuses: `image_found` → `downloading` → `downloaded` → (embedding generated separately)
 - To reset error cards: `UPDATE cards SET status = 'image_found' WHERE status = 'error'`
+- Parallel-disambiguation columns on `cards` (added via idempotent `ALTER`): `gcs_image_url`, `gcs_thumb_url`, `card_number`, `print_run`, `player_name`, `variant_label`. New rows populate automatically via `scraper.py` (CSV parse) + `scraper_v3.py` (image phase). Backfill existing rows with `python backfill_card_metadata.py --pass 1` (SQL + in-proc parse) then `python backfill_chroma_metadata.py` (in-place ChromaDB update, no re-embedding).
 
 ### Config
 - `config.py` holds all settings: DB URL, paths, RunPod credentials
@@ -45,6 +47,13 @@ SportsCardPro Scraper v2 — scrapes sports card data, downloads images, and gen
   - Runs on port 5000 (`http://192.168.1.119:5000`)
   - Note: also has a stale copy at `/opt/scraperv2/` — the service uses `/home/user/Scraperv2/`
 - **Scraper workers**: updated via `pct exec <CTID> -- scraper update` then `systemctl restart scraper`
+
+### Foil-Pattern Classifier (Part B)
+- Training: `training/04_export_variant_training_data.py` → `05_train_variant_classifier.py` → `06_eval_variant_classifier.py`. Integrated into `run_full_pipeline.py` as steps 8–9.
+- Architecture: classification head (linear probe or small MLP) on frozen DINOv2 ViT-L/14-reg features. Reuses `embeddings_dinov2.PREPROCESS_SPEC` / `build_preprocess()` so train + serve can't drift.
+- Class keys: `"<set_slug>::<variant_label_lower>"`. Classes with fewer than `--variant-min-samples` route to `__rare__`.
+- Checkpoint stored at `./checkpoints/variant_classifier_{linear,mlp}.pt`; uploaded by `step5_upload_weights` alongside the DINOv2 backbone when present.
+- Quick run: `python training/run_full_pipeline.py --step 8 --skip-training` to go straight to Part B after a backfill.
 
 ## Key Decisions
 - Local GPU for bulk embedding generation (21+ img/s) — RunPod endpoint only for search API

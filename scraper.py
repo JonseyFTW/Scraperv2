@@ -24,6 +24,7 @@ from pathlib import Path
 
 import aiohttp
 import aiofiles
+from card_name_parser import parse_product_name
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, MofNCompleteColumn
@@ -689,6 +690,8 @@ def parse_single_csv(csv_path: str, set_slug: str) -> list[dict]:
             cib = safe_price(norm.get("cib_price", norm.get("graded_price", "0")))
             new = safe_price(norm.get("new_price", norm.get("psa_10", "0")))
 
+            parsed = parse_product_name(product_name)
+
             cards.append({
                 "product_id": product_id,
                 "set_slug": set_slug,
@@ -699,6 +702,10 @@ def parse_single_csv(csv_path: str, set_slug: str) -> list[dict]:
                 "loose_price": loose,
                 "cib_price": cib,
                 "new_price": new,
+                "player_name":   parsed.player_name,
+                "card_number":   parsed.card_number,
+                "print_run":     parsed.print_run,
+                "variant_label": parsed.variant_label,
             })
 
     return cards

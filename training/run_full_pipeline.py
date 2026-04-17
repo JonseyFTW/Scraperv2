@@ -327,10 +327,25 @@ def step5_upload_weights() -> bool:
         )
         elapsed = time.time() - start
         console.print(f"\n  [green]Uploaded in {elapsed:.0f}s[/green]")
-        return True
     except Exception as e:
         console.print(f"\n  [red]Upload failed: {e}[/red]")
         return False
+
+    # Also upload variant classifier checkpoint if it exists (Part B).
+    for fname in ("variant_classifier_linear.pt", "variant_classifier_mlp.pt"):
+        v_ckpt = os.path.join(PROJECT_DIR, "checkpoints", fname)
+        if not os.path.exists(v_ckpt):
+            continue
+        v_size = os.path.getsize(v_ckpt) / (1024 ** 2)
+        console.print(f"\n  [cyan]Uploading variant classifier {fname} ({v_size:.1f} MB)...[/cyan]")
+        try:
+            s3.upload_file(v_ckpt, config.RUNPOD_S3_BUCKET, fname,
+                           Callback=_S3ProgressCallback(v_size))
+            console.print(f"\n  [green]Uploaded {fname}[/green]")
+        except Exception as e:
+            console.print(f"\n  [yellow]Variant classifier upload failed (non-fatal): {e}[/yellow]")
+
+    return True
 
 
 class _S3ProgressCallback:
@@ -437,6 +452,41 @@ def step7_cleanup(collections: list[dict], chromadb_path: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Step 8 (Part B): Export variant-classifier training data
+# ══════════════════════════════════════════════════════════════════════════
+
+def step8_export_variants(min_samples: int) -> bool:
+    console.print(Panel("[bold]Step 8: Export Variant-Classifier Training Data[/bold]", border_style="cyan"))
+    cmd = [
+        sys.executable, os.path.join(SCRIPT_DIR, "04_export_variant_training_data.py"),
+        "--min-samples", str(min_samples),
+    ]
+    return run_command(cmd, "Export variant-classifier data")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Step 9 (Part B): Train variant classifier
+# ══════════════════════════════════════════════════════════════════════════
+
+def step9_train_variant_classifier(arch: str, epochs: int, batch: int, lr: float) -> bool:
+    console.print(Panel(f"[bold]Step 9: Train Variant Classifier ({arch})[/bold]", border_style="cyan"))
+
+    finetuned_backbone = os.path.join(PROJECT_DIR, "checkpoints", "dinov2_finetuned_backbone.pt")
+    cmd = [
+        sys.executable, os.path.join(SCRIPT_DIR, "05_train_variant_classifier.py"),
+        "--arch", arch,
+        "--epochs", str(epochs),
+        "--batch", str(batch),
+        "--lr", str(lr),
+    ]
+    if os.path.exists(finetuned_backbone):
+        cmd += ["--finetuned-backbone", finetuned_backbone]
+    else:
+        console.print(f"  [yellow]No fine-tuned backbone at {finetuned_backbone} — training on base DINOv2 features.[/yellow]")
+    return run_command(cmd, "Train variant classifier")
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -471,11 +521,20 @@ Examples:
     parser.add_argument("--lr", type=float, default=1e-5,
                         help="Learning rate (default: 1e-5)")
     parser.add_argument("--step", type=int, default=1,
-                        help="Resume from this step number (1-7)")
+                        help="Resume from this step number (1-9)")
     parser.add_argument("--skip-training", action="store_true",
                         help="Skip training, use existing checkpoint for re-embedding + deploy")
     parser.add_argument("--skip-export", action="store_true",
                         help="Skip export, use existing training data")
+    parser.add_argument("--skip-variant-classifier", action="store_true",
+                        help="Skip Part B steps 8-9 (variant-classifier export + train)")
+    parser.add_argument("--variant-arch", choices=["linear", "mlp"], default="linear",
+                        help="Variant classifier head architecture (default: linear)")
+    parser.add_argument("--variant-min-samples", type=int, default=10,
+                        help="Min samples per class to keep as its own label (default: 10)")
+    parser.add_argument("--variant-epochs", type=int, default=10)
+    parser.add_argument("--variant-batch", type=int, default=128)
+    parser.add_argument("--variant-lr", type=float, default=1e-3)
     parser.add_argument("--dry-run", action="store_true",
                         help="Show plan without executing")
 
@@ -547,6 +606,19 @@ Examples:
     # ── Step 7: Cleanup ───────────────────────────────────────────────
     if args.step <= 7:
         step7_cleanup(collections, chromadb_path)
+
+    # ── Step 8 (Part B): Export variant-classifier training data ──────
+    if args.step <= 8 and not args.skip_variant_classifier:
+        if not step8_export_variants(args.variant_min_samples):
+            console.print("[yellow]Step 8 failed — skipping Part B[/yellow]")
+            args.skip_variant_classifier = True
+
+    # ── Step 9 (Part B): Train variant classifier ────────────────────
+    if args.step <= 9 and not args.skip_variant_classifier:
+        if not step9_train_variant_classifier(
+            args.variant_arch, args.variant_epochs, args.variant_batch, args.variant_lr,
+        ):
+            console.print("[yellow]Step 9 failed — continuing[/yellow]")
 
     # ── Done ──────────────────────────────────────────────────────────
     total_time = time.time() - start_time

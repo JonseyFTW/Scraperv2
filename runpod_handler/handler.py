@@ -30,11 +30,32 @@ SQLITE_PATH = os.environ.get("SQLITE_PATH", "/runpod-volume/sportscards.db")
 COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "card_embeddings_dinov2")
 TOP_K = int(os.environ.get("DINOV2_TOP_K", "5"))
 
+# --- Preprocess spec (must match embeddings_dinov2.PREPROCESS_SPEC) ---
+PREPROCESS_SPEC = {
+    "size": 518,
+    "interpolation": "bicubic",
+    "crop": "center",
+    "mean": [0.485, 0.456, 0.406],
+    "std":  [0.229, 0.224, 0.225],
+}
+
+# --- Variant-classifier config (Part B) ---
+VARIANT_WEIGHTS_PATH = os.environ.get(
+    "VARIANT_CLASSIFIER_WEIGHTS", "/runpod-volume/variant_classifier.pt"
+)
+
 # --- Global state (loaded once on cold start) ---
 model = None
 transform = None
 device = None
 collection = None
+
+# Variant classifier — lazy-loaded on first classify_variant call
+variant_head = None
+variant_labels = None  # list[str] — index -> label
+variant_label_to_idx = None  # dict[str, int]
+variant_arch = None
+_variant_load_error = None
 
 
 def load_model():
@@ -156,21 +177,30 @@ def create_augmented_variants(image_bytes: bytes) -> list[Image.Image]:
 
 
 def triple_query_majority_vote(
-    image_bytes: bytes, n_results: int
+    image_bytes: bytes, n_results: int, where: dict | None = None
 ) -> tuple[list[str], list[float], list[dict]]:
-    """Run 3 embedding queries (original + 2 augmented) and pick winner by majority vote."""
+    """Run 3 embedding queries (original + 2 augmented) and pick winner by majority vote.
+
+    Optional `where` is a ChromaDB metadata filter (e.g. {"print_run": 185}) applied
+    to every sub-query.
+    """
     variants = create_augmented_variants(image_bytes)
 
     all_query_results = []
     for variant in variants:
         query_vec = embed_pil_image(variant)
-        result = collection.query(
-            query_embeddings=[query_vec],
-            n_results=n_results,
-        )
+        query_kwargs = {"query_embeddings": [query_vec], "n_results": n_results}
+        if where:
+            query_kwargs["where"] = where
+        result = collection.query(**query_kwargs)
         all_query_results.append(result)
 
-    # Count #1 results across all 3 runs
+    # Drop runs that returned nothing (can happen when `where` is strict).
+    all_query_results = [r for r in all_query_results if r["ids"] and r["ids"][0]]
+    if not all_query_results:
+        return [], [], []
+
+    # Count #1 results across all remaining runs
     top1_ids = [r["ids"][0][0] for r in all_query_results]
     top1_counts = Counter(top1_ids)
 
@@ -213,25 +243,88 @@ def get_or_create_collection(name: str):
     )
 
 
+def _build_variant_head(arch: str, input_dim: int, num_classes: int):
+    """Mirrors training/05_train_variant_classifier.build_head."""
+    import torch.nn as nn
+    if arch == "linear":
+        return nn.Linear(input_dim, num_classes)
+    if arch == "mlp":
+        return nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, num_classes),
+        )
+    raise ValueError(f"Unknown variant arch: {arch}")
+
+
+def load_variant_classifier():
+    """Load the variant classifier head from the RunPod volume.
+
+    Fails loudly if the checkpoint's preprocess spec doesn't match the handler's —
+    that would silently produce garbage predictions.
+    """
+    global variant_head, variant_labels, variant_label_to_idx, variant_arch, _variant_load_error
+
+    if variant_head is not None or _variant_load_error is not None:
+        return
+
+    if not os.path.exists(VARIANT_WEIGHTS_PATH):
+        _variant_load_error = f"weights not found at {VARIANT_WEIGHTS_PATH}"
+        print(f"[Variant] {_variant_load_error}")
+        return
+
+    try:
+        print(f"[Variant] Loading classifier from {VARIANT_WEIGHTS_PATH}...")
+        ckpt = torch.load(VARIANT_WEIGHTS_PATH, map_location=device, weights_only=False)
+
+        stored_spec = ckpt.get("preprocess")
+        if stored_spec and stored_spec != PREPROCESS_SPEC:
+            _variant_load_error = (
+                f"preprocess mismatch — ckpt {stored_spec} vs handler {PREPROCESS_SPEC}"
+            )
+            print(f"[Variant] REFUSING TO LOAD: {_variant_load_error}")
+            return
+
+        variant_labels = ckpt["label_map"]
+        variant_label_to_idx = {lab: i for i, lab in enumerate(variant_labels)}
+        variant_arch = ckpt.get("arch", "linear")
+        head = _build_variant_head(variant_arch, ckpt.get("input_dim", 1024), len(variant_labels))
+        head.load_state_dict(ckpt["head_state_dict"])
+        head.eval().to(device)
+        variant_head = head
+
+        print(
+            f"[Variant] Ready — arch={variant_arch}, labels={len(variant_labels)}, "
+            f"val_top1={ckpt.get('val_top1')}"
+        )
+    except Exception as e:
+        _variant_load_error = f"load failed: {e}"
+        print(f"[Variant] {_variant_load_error}")
+
+
 def handler(event):
     """
     RunPod serverless handler.
 
     Input (event["input"]):
-      - action: "search" | "embed" | "health" | "upsert"
-      - image: base64-encoded image (for search/embed)
+      - action: "search" | "embed" | "health" | "upsert" | "classify_variant"
+      - image: base64-encoded image (for search/embed/classify_variant)
       - mime_type: "image/jpeg" (optional)
       - top_k: number of results (optional, default 5)
+      - where: ChromaDB metadata filter for search (optional), e.g. {"print_run": 185}
+      - candidate_labels: shortlist for classify_variant (optional)
       - collection: collection name (for upsert, defaults to COLLECTION_NAME)
       - ids: list of IDs (for upsert)
       - embeddings: list of 1024-dim vectors (for upsert)
       - metadatas: list of metadata dicts (for upsert)
 
     Returns:
-      search  → matches, embedding_count, query_time_ms
-      embed   → embedding (1024-dim float list)
-      health  → status info
-      upsert  → upserted count, collection, total count
+      search           → matches, embedding_count, query_time_ms
+      embed            → embedding (1024-dim float list)
+      health           → status info (incl. variant classifier state)
+      upsert           → upserted count, collection, total count
+      classify_variant → scores, top, top_score, inference_ms
     """
     if model is None:
         load_model()
@@ -254,6 +347,8 @@ def handler(event):
         finetuned_weights = os.environ.get(
             "FINETUNED_WEIGHTS", "/runpod-volume/dinov2_finetuned_backbone.pt"
         )
+        # Attempt variant-classifier load once for health reporting
+        load_variant_classifier()
         return {
             "status": "ok",
             "model": "DINOv2-ViT-L/14-reg (1024-dim)",
@@ -263,6 +358,13 @@ def handler(event):
             "embedding_count": count,
             "collections": all_collections,
             "sqlite_available": os.path.exists(SQLITE_PATH),
+            "variant_classifier": {
+                "loaded":     variant_head is not None,
+                "arch":       variant_arch,
+                "num_labels": len(variant_labels) if variant_labels else 0,
+                "weights_path": VARIANT_WEIGHTS_PATH,
+                "error":      _variant_load_error,
+            },
         }
 
     if action == "embed":
@@ -298,14 +400,15 @@ def handler(event):
             return {"error": "Invalid base64 image data"}
 
         top_k = input_data.get("top_k", TOP_K)
+        where = input_data.get("where")  # optional ChromaDB metadata filter
         count = collection.count()
         n_results = min(top_k, count)
 
         if n_results == 0:
             return {"matches": [], "embedding_count": 0, "query_time_ms": 0}
 
-        # Triple-query majority vote search
-        ids, distances, metadatas = triple_query_majority_vote(image_bytes, n_results)
+        # Triple-query majority vote search (optionally metadata-filtered)
+        ids, distances, metadatas = triple_query_majority_vote(image_bytes, n_results, where)
 
         # Build response with SQLite enrichment
         matches = []
@@ -349,6 +452,52 @@ def handler(event):
             "matches": matches,
             "embedding_count": count,
             "query_time_ms": round(elapsed_ms, 1),
+        }
+
+    if action == "classify_variant":
+        load_variant_classifier()
+        if variant_head is None:
+            return {"error": f"variant classifier unavailable: {_variant_load_error}"}
+
+        image_b64 = input_data.get("image")
+        if not image_b64:
+            return {"error": "Missing 'image' field (base64-encoded)"}
+        try:
+            image_bytes = base64.b64decode(image_b64)
+        except Exception:
+            return {"error": "Invalid base64 image data"}
+
+        candidate_labels = input_data.get("candidate_labels")
+
+        start = time.monotonic()
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img_tensor = transform(img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            features = model(img_tensor)
+            features = features / features.norm(dim=-1, keepdim=True)
+            logits = variant_head(features.float())
+            probs = torch.softmax(logits, dim=-1).cpu().numpy().flatten()
+
+        scores = {variant_labels[i]: float(probs[i]) for i in range(len(variant_labels))}
+
+        if candidate_labels:
+            # Restrict + renormalize over the supplied shortlist.
+            restricted = {k: scores.get(k, 0.0) for k in candidate_labels}
+            total = sum(restricted.values())
+            if total > 0:
+                restricted = {k: v / total for k, v in restricted.items()}
+            scores = restricted
+
+        if not scores:
+            return {"error": "No matching labels in scores"}
+
+        top = max(scores, key=scores.get)
+        elapsed_ms = (time.monotonic() - start) * 1000
+        return {
+            "scores":       scores,
+            "top":          top,
+            "top_score":    scores[top],
+            "inference_ms": round(elapsed_ms, 1),
         }
 
     if action == "upsert":
