@@ -56,6 +56,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
+    # Idempotent — makes sure the new columns exist before we SELECT them.
+    db.init_db()
+
     collection = get_collection()
     total_in_collection = collection.count()
     console.print(f"[bold]Collection:[/bold] {collection.name} ({total_in_collection:,} items)")

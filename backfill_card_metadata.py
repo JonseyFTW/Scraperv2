@@ -33,6 +33,18 @@ from card_name_parser import parse_product_name
 console = Console()
 
 
+def ensure_schema():
+    """Idempotently add the parallel-disambiguation columns if they don't exist yet.
+
+    The service's `database.init_db()` adds them, but this script can be run
+    standalone on a fresh checkout where init_db() hasn't been called since the
+    schema additions shipped. Calling init_db() is safe — every statement is
+    guarded with IF NOT EXISTS / DO $$ ... duplicate_column.
+    """
+    console.print("[dim]Ensuring schema is up to date (idempotent init_db)...[/dim]")
+    db.init_db()
+
+
 # ── Pass 1a: SQL-only GCS URL derivation ──────────────────────────────────
 
 GCS_LIKE = "%storage.googleapis.com/images.pricecharting.com/%"
@@ -222,6 +234,9 @@ def main():
     ap.add_argument("--concurrency", type=int, default=20, help="Pass 2 concurrency")
     ap.add_argument("--stats", action="store_true")
     args = ap.parse_args()
+
+    # Every path below touches the new columns, so make sure they exist.
+    ensure_schema()
 
     if args.phase in ("1", "1a"):
         pass_1a()
