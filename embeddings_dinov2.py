@@ -562,12 +562,19 @@ def sync_to_runpod(limit: int = 0, batch_size: int = 500):
             if not ids:
                 break
 
+            # Chroma returns embeddings as numpy arrays; requests' JSON encoder
+            # can't handle ndarray, so flatten to native Python lists.
+            embeddings = [
+                e.tolist() if hasattr(e, "tolist") else list(e)
+                for e in results["embeddings"]
+            ]
+
             payload = {
                 "input": {
                     "action": "upsert",
                     "collection": COLLECTION_NAME,
                     "ids": ids,
-                    "embeddings": results["embeddings"],
+                    "embeddings": embeddings,
                     "metadatas": results["metadatas"],
                 }
             }
