@@ -475,7 +475,11 @@ def step8_export_variants(min_samples: int) -> bool:
 def step9_train_variant_classifier(arch: str, epochs: int, batch: int, lr: float) -> bool:
     console.print(Panel(f"[bold]Step 9: Train Variant Classifier ({arch})[/bold]", border_style="cyan"))
 
-    finetuned_backbone = os.path.join(PROJECT_DIR, "checkpoints", "dinov2_finetuned_backbone.pt")
+    # Same fallback order as step 4: prefer _best, then _backbone.
+    best_ckpt     = os.path.join(PROJECT_DIR, "checkpoints", "dinov2_finetuned_best.pt")
+    backbone_ckpt = os.path.join(PROJECT_DIR, "checkpoints", "dinov2_finetuned_backbone.pt")
+    finetuned_backbone = best_ckpt if os.path.exists(best_ckpt) else backbone_ckpt
+
     cmd = [
         sys.executable, os.path.join(SCRIPT_DIR, "05_train_variant_classifier.py"),
         "--arch", arch,
@@ -484,9 +488,10 @@ def step9_train_variant_classifier(arch: str, epochs: int, batch: int, lr: float
         "--lr", str(lr),
     ]
     if os.path.exists(finetuned_backbone):
+        console.print(f"  Using fine-tuned backbone: [cyan]{finetuned_backbone}[/cyan]")
         cmd += ["--finetuned-backbone", finetuned_backbone]
     else:
-        console.print(f"  [yellow]No fine-tuned backbone at {finetuned_backbone} — training on base DINOv2 features.[/yellow]")
+        console.print(f"  [yellow]No fine-tuned backbone found — training on base DINOv2 features.[/yellow]")
     return run_command(cmd, "Train variant classifier")
 
 
