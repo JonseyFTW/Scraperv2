@@ -32,6 +32,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.table import Table
 
 import config
+from embeddings_dinov2 import COLLECTION_NAME  # single source of truth
 
 console = Console()
 
@@ -230,7 +231,7 @@ def verify():
         if result.get("status") == "COMPLETED":
             output = result.get("output", {})
             remote_count = output.get("embedding_count", 0)
-            remote_collection = output.get("collection", "card_embeddings_dinov2")
+            remote_collection = output.get("collection", COLLECTION_NAME)
             console.print(f"[green]RunPod endpoint is healthy ({output.get('device', 'unknown')})[/green]")
         else:
             console.print(f"[yellow]RunPod status: {result.get('status')} — endpoint may be cold starting[/yellow]")
@@ -246,7 +247,7 @@ def verify():
     table.add_column("Status", style="white")
 
     for name, local_count in sorted(local_collections.items()):
-        if name == "card_embeddings_dinov2" and remote_count is not None:
+        if name == COLLECTION_NAME and remote_count is not None:
             diff = local_count - remote_count
             if diff == 0:
                 status = "[green]In sync[/green]"
@@ -261,7 +262,7 @@ def verify():
 
     console.print(table)
 
-    if remote_count is not None and local_collections.get("card_embeddings_dinov2", 0) != remote_count:
+    if remote_count is not None and local_collections.get(COLLECTION_NAME, 0) != remote_count:
         console.print(f"\n[yellow]To fix: run 'python sync_to_runpod.py' to re-upload, "
                        "then restart RunPod workers.[/yellow]")
     console.print()
