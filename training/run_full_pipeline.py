@@ -112,9 +112,9 @@ def show_plan(collections: list[dict], chromadb_path: str, args):
     console.print(f"  Checkpoint:   [cyan]./checkpoints/dinov2_finetuned_best.pt[/cyan]")
 
     steps = []
-    if args.step <= 1:
+    if args.step <= 1 and not args.skip_export:
         steps.append("1. Export training data from each collection")
-    if args.step <= 2:
+    if args.step <= 2 and not args.skip_export:
         steps.append("2. Merge training manifests")
     if args.step <= 3 and not args.skip_training:
         steps.append("3. Fine-tune DINOv2 on combined dataset")
@@ -126,6 +126,10 @@ def show_plan(collections: list[dict], chromadb_path: str, args):
         steps.append("6. Sync ChromaDB to RunPod (S3)")
     if args.step <= 7:
         steps.append("7. Clean up old collections")
+    if args.step <= 8 and not args.skip_variant_classifier:
+        steps.append("8. Export variant-classifier training data (Part B)")
+    if args.step <= 9 and not args.skip_variant_classifier:
+        steps.append(f"9. Train variant classifier ({args.variant_arch}) (Part B)")
 
     console.print(f"\n[bold]Steps to run:[/bold]")
     for s in steps:
