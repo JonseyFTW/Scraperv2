@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rich.console import Console
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+from PIL import Image
 
 from embeddings_dinov2 import PREPROCESS_SPEC, build_preprocess
 
@@ -63,8 +64,6 @@ class VariantDataset:
     """PyTorch Dataset returning (image_tensor, label_idx)."""
 
     def __init__(self, records: list[dict], transform):
-        from PIL import Image
-        self._Image = Image
         self.records = records
         self.transform = transform
 
@@ -74,7 +73,7 @@ class VariantDataset:
     def __getitem__(self, idx):
         rec = self.records[idx]
         try:
-            img = self._Image.open(rec["image_path"]).convert("RGB")
+            img = Image.open(rec["image_path"]).convert("RGB")
         except Exception:
             return None
         return self.transform(img), int(rec["label_idx"])
