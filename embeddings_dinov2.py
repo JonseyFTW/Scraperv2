@@ -511,9 +511,10 @@ def migrate_collection():
     console.print(f"[dim]Deleted old collection '{OLD_NAME}'[/dim]")
 
 
-def sync_to_runpod(limit: int = 0, batch_size: int = 500):
+def sync_to_runpod(limit: int = 0, batch_size: int = 500, start_offset: int = 0):
     """Push local sports card embeddings to RunPod ChromaDB via the serverless upsert action."""
     import requests
+    import time
 
     if not config.RUNPOD_API_KEY:
         console.print("[red]RUNPOD_API_KEY not set. Export it first.[/red]")
@@ -533,7 +534,8 @@ def sync_to_runpod(limit: int = 0, batch_size: int = 500):
     console.print(f"  Endpoint:   [cyan]{config.RUNPOD_ENDPOINT_ID}[/cyan]")
     console.print(f"  Collection: [cyan]{COLLECTION_NAME}[/cyan]")
     console.print(f"  Local count: [cyan]{total_count}[/cyan]")
-    console.print(f"  Batch size: [cyan]{batch_size}[/cyan]\n")
+    console.print(f"  Batch size: [cyan]{batch_size}[/cyan]")
+    console.print(f"  Start offset: [cyan]{start_offset}[/cyan]\n")
 
     endpoint_url = f"https://api.runpod.ai/v2/{config.RUNPOD_ENDPOINT_ID}/runsync"
     headers = {
@@ -542,14 +544,16 @@ def sync_to_runpod(limit: int = 0, batch_size: int = 500):
     }
 
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-    offset = 0
+    offset = start_offset
     sent = 0
+    MAX_RETRIES = 5
 
     with Progress(
         SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
         BarColumn(), TaskProgressColumn(), console=console,
     ) as progress:
-        task = progress.add_task("Syncing", total=min(to_send, total_count))
+        remaining = max(0, min(to_send, total_count - start_offset))
+        task = progress.add_task("Syncing", total=remaining)
 
         while offset < total_count and sent < to_send:
             chunk = min(batch_size, to_send - sent)
@@ -579,23 +583,42 @@ def sync_to_runpod(limit: int = 0, batch_size: int = 500):
                 }
             }
 
-            try:
-                resp = requests.post(endpoint_url, json=payload, headers=headers, timeout=120)
-                resp.raise_for_status()
-                result = resp.json()
-                if result.get("status") == "COMPLETED":
-                    sent += len(ids)
-                else:
-                    console.print(f"[yellow]RunPod status: {result.get('status')} — continuing[/yellow]")
-                    sent += len(ids)
-            except requests.RequestException as e:
-                console.print(f"[red]RunPod request failed: {e}[/red]")
-                console.print("[yellow]Tip: You can also rsync the ChromaDB dir via a temporary GPU Pod.[/yellow]")
-                break
+            # Retry on transient network errors (connection reset, timeout, 5xx)
+            # with exponential backoff. RunPod serverless frequently drops
+            # long-lived connections during multi-hour syncs.
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    resp = requests.post(endpoint_url, json=payload, headers=headers, timeout=120)
+                    resp.raise_for_status()
+                    result = resp.json()
+                    status = result.get("status")
+                    if status == "COMPLETED":
+                        sent += len(ids)
+                    else:
+                        console.print(f"[yellow]RunPod status: {status} — continuing[/yellow]")
+                        sent += len(ids)
+                    break
+                except requests.RequestException as e:
+                    if attempt == MAX_RETRIES:
+                        console.print(
+                            f"[red]RunPod request failed after {MAX_RETRIES} attempts "
+                            f"at offset {offset}: {e}[/red]"
+                        )
+                        console.print(
+                            f"[yellow]Resume with: python embeddings_dinov2.py sync "
+                            f"--start-offset {offset}[/yellow]"
+                        )
+                        return
+                    backoff = 2 ** attempt  # 2, 4, 8, 16, 32
+                    console.print(
+                        f"[yellow]Network error at offset {offset} "
+                        f"(attempt {attempt}/{MAX_RETRIES}): {e} — retrying in {backoff}s[/yellow]"
+                    )
+                    time.sleep(backoff)
 
             offset += len(ids)
             progress.update(task, advance=len(ids),
-                            description=f"Sent {sent}/{min(to_send, total_count)}")
+                            description=f"Sent {sent} (offset {offset})")
 
     console.print(f"\n[green]Synced {sent} embeddings to RunPod[/green]")
 
@@ -622,6 +645,8 @@ def main():
     sync_parser = subparsers.add_parser("sync", help="Push embeddings to RunPod ChromaDB")
     sync_parser.add_argument("--limit", type=int, default=0, help="Max embeddings to sync (0=all)")
     sync_parser.add_argument("--batch", type=int, default=500, help="Batch size per API request (default: 500)")
+    sync_parser.add_argument("--start-offset", type=int, default=0,
+                             help="Resume from this collection offset (e.g. after a network error)")
 
     args = parser.parse_args()
 
@@ -638,7 +663,7 @@ def main():
     elif args.command == "migrate":
         migrate_collection()
     elif args.command == "sync":
-        sync_to_runpod(limit=args.limit, batch_size=args.batch)
+        sync_to_runpod(limit=args.limit, batch_size=args.batch, start_offset=args.start_offset)
     else:
         parser.print_help()
 
