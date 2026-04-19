@@ -187,9 +187,36 @@ def train(args):
     best_top3 = -1.0
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = out_dir / f"variant_classifier_{args.arch}.pt"
+    ckpt_path      = out_dir / f"variant_classifier_{args.arch}.pt"
+    last_ckpt_path = out_dir / f"variant_classifier_{args.arch}_last.pt"
 
-    for epoch in range(1, args.epochs + 1):
+    # Resume from last completed epoch if requested. Auto-discover the last
+    # checkpoint file unless --resume /explicit/path was passed.
+    start_epoch = 1
+    if args.resume:
+        resume_path = args.resume if args.resume != "auto" else str(last_ckpt_path)
+        if os.path.exists(resume_path):
+            console.print(f"[cyan]Resuming from {resume_path}[/cyan]")
+            state = torch.load(resume_path, map_location=device, weights_only=False)
+            head.load_state_dict(state["head_state_dict"])
+            if "optimizer_state_dict" in state:
+                optim.load_state_dict(state["optimizer_state_dict"])
+            if "scheduler_state_dict" in state:
+                sched.load_state_dict(state["scheduler_state_dict"])
+            start_epoch = int(state.get("epoch", 0)) + 1
+            best_top1 = float(state.get("best_top1", -1.0))
+            best_top3 = float(state.get("best_top3", -1.0))
+            console.print(
+                f"  Resumed at epoch {start_epoch}/{args.epochs}  "
+                f"best val@1 so far: {best_top1:.3f}"
+            )
+            if start_epoch > args.epochs:
+                console.print("[yellow]All epochs already completed — nothing to do.[/yellow]")
+                return
+        else:
+            console.print(f"[yellow]--resume specified but {resume_path} not found; starting fresh.[/yellow]")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         head.train()
         t0 = time.time()
         running_loss = 0.0
@@ -273,6 +300,29 @@ def train(args):
             }, ckpt_path)
             console.print(f"    [green]saved best -> {ckpt_path} (top1={best_top1:.3f})[/green]")
 
+        # Always save a rolling "last" checkpoint with full training state so
+        # --resume can pick up after Ctrl+C (gaming break, power loss, etc.).
+        torch.save({
+            "head_state_dict":        head.state_dict(),
+            "optimizer_state_dict":   optim.state_dict(),
+            "scheduler_state_dict":   sched.state_dict(),
+            "label_map":              labels,
+            "backbone":               "dinov2_vitl14_reg",
+            "finetuned_backbone":     args.finetuned_backbone,
+            "finetuned_backbone_sha": sha256_of_file(args.finetuned_backbone),
+            "arch":                   args.arch,
+            "input_dim":              1024,
+            "preprocess":             PREPROCESS_SPEC,
+            "trained_at":             datetime.now(timezone.utc).isoformat(),
+            "train_samples":          len(train_records),
+            "val_samples":            len(val_records),
+            "val_top1":               val_top1,
+            "val_top3":               val_top3,
+            "best_top1":              best_top1,
+            "best_top3":              best_top3,
+            "epoch":                  epoch,
+        }, last_ckpt_path)
+
     console.print(f"\n[bold green]Done.[/bold green] best val@1={best_top1:.3f}  val@3={best_top3:.3f}")
     console.print(f"Checkpoint: [cyan]{ckpt_path}[/cyan]")
 
@@ -288,6 +338,9 @@ def main():
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--resume", default=None, nargs="?", const="auto",
+                    help="Resume from checkpoint. Bare --resume uses variant_classifier_{arch}_last.pt; "
+                         "pass an explicit path to use a different file.")
     args = ap.parse_args()
 
     train(args)
