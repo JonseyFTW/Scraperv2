@@ -472,7 +472,7 @@ def step8_export_variants(min_samples: int) -> bool:
 # Step 9 (Part B): Train variant classifier
 # ══════════════════════════════════════════════════════════════════════════
 
-def step9_train_variant_classifier(arch: str, epochs: int, batch: int, lr: float) -> bool:
+def step9_train_variant_classifier(arch: str, epochs: int, batch: int, lr: float, resume: bool) -> bool:
     console.print(Panel(f"[bold]Step 9: Train Variant Classifier ({arch})[/bold]", border_style="cyan"))
 
     # Same fallback order as step 4: prefer _best, then _backbone.
@@ -492,6 +492,8 @@ def step9_train_variant_classifier(arch: str, epochs: int, batch: int, lr: float
         cmd += ["--finetuned-backbone", finetuned_backbone]
     else:
         console.print(f"  [yellow]No fine-tuned backbone found — training on base DINOv2 features.[/yellow]")
+    if resume:
+        cmd += ["--resume"]  # auto-discovers the last checkpoint
     return run_command(cmd, "Train variant classifier")
 
 
@@ -544,6 +546,8 @@ Examples:
     parser.add_argument("--variant-epochs", type=int, default=10)
     parser.add_argument("--variant-batch", type=int, default=128)
     parser.add_argument("--variant-lr", type=float, default=1e-3)
+    parser.add_argument("--variant-resume", action="store_true",
+                        help="Resume variant-classifier training from the last saved epoch")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show plan without executing")
 
@@ -626,6 +630,7 @@ Examples:
     if args.step <= 9 and not args.skip_variant_classifier:
         if not step9_train_variant_classifier(
             args.variant_arch, args.variant_epochs, args.variant_batch, args.variant_lr,
+            args.variant_resume,
         ):
             console.print("[yellow]Step 9 failed — continuing[/yellow]")
 
