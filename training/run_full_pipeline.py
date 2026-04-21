@@ -472,8 +472,8 @@ def step8_export_variants(min_samples: int) -> bool:
 # Step 9 (Part B): Train variant classifier
 # ══════════════════════════════════════════════════════════════════════════
 
-def step9_train_variant_classifier(arch: str, epochs: int, batch: int, lr: float, resume: bool) -> bool:
-    console.print(Panel(f"[bold]Step 9: Train Variant Classifier ({arch})[/bold]", border_style="cyan"))
+def step9_train_variant_classifier(args) -> bool:
+    console.print(Panel(f"[bold]Step 9: Train Variant Classifier ({args.variant_arch})[/bold]", border_style="cyan"))
 
     # Same fallback order as step 4: prefer _best, then _backbone.
     best_ckpt     = os.path.join(PROJECT_DIR, "checkpoints", "dinov2_finetuned_best.pt")
@@ -482,17 +482,25 @@ def step9_train_variant_classifier(arch: str, epochs: int, batch: int, lr: float
 
     cmd = [
         sys.executable, os.path.join(SCRIPT_DIR, "05_train_variant_classifier.py"),
-        "--arch", arch,
-        "--epochs", str(epochs),
-        "--batch", str(batch),
-        "--lr", str(lr),
+        "--arch", args.variant_arch,
+        "--epochs", str(args.variant_epochs),
+        "--batch", str(args.variant_batch),
+        "--lr", str(args.variant_lr),
+        "--sampler", args.variant_sampler,
+        "--sets-per-batch", str(args.variant_sets_per_batch),
+        "--scheduler", args.variant_scheduler,
+        "--scheduler-t0", str(args.variant_scheduler_t0),
     ]
+    if not args.variant_use_cache:
+        cmd += ["--no-cache"]
+    if args.variant_hierarchical:
+        cmd += ["--hierarchical"]
     if os.path.exists(finetuned_backbone):
         console.print(f"  Using fine-tuned backbone: [cyan]{finetuned_backbone}[/cyan]")
         cmd += ["--finetuned-backbone", finetuned_backbone]
     else:
         console.print(f"  [yellow]No fine-tuned backbone found — training on base DINOv2 features.[/yellow]")
-    if resume:
+    if args.variant_resume:
         cmd += ["--resume"]  # auto-discovers the last checkpoint
     return run_command(cmd, "Train variant classifier")
 
@@ -543,11 +551,36 @@ Examples:
                         help="Variant classifier head architecture (default: linear)")
     parser.add_argument("--variant-min-samples", type=int, default=10,
                         help="Min samples per class to keep as its own label (default: 10)")
-    parser.add_argument("--variant-epochs", type=int, default=10)
-    parser.add_argument("--variant-batch", type=int, default=128)
+    parser.add_argument("--variant-epochs", type=int, default=30,
+                        help="With feature caching, 30-50 epochs is trivial (default: 30).")
+    parser.add_argument("--variant-batch", type=int, default=4096,
+                        help="Head-training batch size (default: 4096, safe on cached features).")
     parser.add_argument("--variant-lr", type=float, default=1e-3)
     parser.add_argument("--variant-resume", action="store_true",
                         help="Resume variant-classifier training from the last saved epoch")
+    parser.add_argument("--variant-use-cache", dest="variant_use_cache",
+                        action="store_true", default=True,
+                        help="Precompute DINOv2 features to disk before training (default).")
+    parser.add_argument("--variant-no-cache", dest="variant_use_cache",
+                        action="store_false",
+                        help="Disable feature cache; run DINOv2 every step (slow).")
+    parser.add_argument("--variant-sampler",
+                        choices=["random", "set_stratified", "class_balanced"],
+                        default="set_stratified",
+                        help="Batch composition. 'set_stratified' (default) is the big "
+                             "quality win for fine-grained foil-pattern discrimination.")
+    parser.add_argument("--variant-sets-per-batch", type=int, default=8,
+                        help="K sets per batch when --variant-sampler=set_stratified.")
+    parser.add_argument("--variant-scheduler",
+                        choices=["cosine", "cosine_warm_restarts"],
+                        default="cosine_warm_restarts",
+                        help="LR schedule for the variant head (default: cosine_warm_restarts).")
+    parser.add_argument("--variant-scheduler-t0", type=int, default=5,
+                        help="Initial cycle length (epochs) for cosine_warm_restarts.")
+    parser.add_argument("--variant-hierarchical", action="store_true",
+                        help="Train with per-sample masked softmax — loss restricted to "
+                             "classes belonging to the sample's set. Matches the inference "
+                             "flow (search picks set → head ranks variants).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show plan without executing")
 
@@ -628,10 +661,7 @@ Examples:
 
     # ── Step 9 (Part B): Train variant classifier ────────────────────
     if args.step <= 9 and not args.skip_variant_classifier:
-        if not step9_train_variant_classifier(
-            args.variant_arch, args.variant_epochs, args.variant_batch, args.variant_lr,
-            args.variant_resume,
-        ):
+        if not step9_train_variant_classifier(args):
             console.print("[yellow]Step 9 failed — continuing[/yellow]")
 
     # ── Done ──────────────────────────────────────────────────────────

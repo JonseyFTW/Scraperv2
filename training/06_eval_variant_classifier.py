@@ -9,6 +9,11 @@ the held-out val manifest, and writes three reports:
     top_confusions.csv      (true_label, pred_label, count)
     summary.json            (top1, top3, macro_f1, etc.)
 
+When the checkpoint was trained with --hierarchical, the evaluator applies the
+same per-sample set mask so reported metrics reflect the masked softmax the
+model was actually trained to produce (and that the RunPod handler applies at
+inference via ``candidate_labels``).
+
 Run from repo root:
     python training/06_eval_variant_classifier.py
     python training/06_eval_variant_classifier.py --checkpoint ./checkpoints/variant_classifier_linear.pt
@@ -23,28 +28,23 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-# Repo root importable
+# Repo root importable + also expose training/ for the shared lib import.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from rich.console import Console
 
 from embeddings_dinov2 import PREPROCESS_SPEC, build_preprocess
-
-# 05 is prefixed with a digit so it can't be imported as a normal module —
-# use importlib to reach into it.
-import importlib.util as _iu
-_SPEC = _iu.spec_from_file_location(
-    "train_variant",
-    os.path.join(os.path.dirname(__file__), "05_train_variant_classifier.py"),
+from variant_classifier_lib import (
+    ImageDataset,
+    collate_image_skip_none,
+    setup_backbone,
+    extract_features,
+    build_head,
+    load_jsonl,
+    derive_set_labels,
+    build_set_class_mask,
 )
-_TRAIN_MOD = _iu.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_TRAIN_MOD)
-VariantDataset   = _TRAIN_MOD.VariantDataset
-collate_skip_none = _TRAIN_MOD.collate_skip_none
-setup_backbone   = _TRAIN_MOD.setup_backbone
-extract_features = _TRAIN_MOD.extract_features
-build_head       = _TRAIN_MOD.build_head
-load_jsonl       = _TRAIN_MOD.load_jsonl
 
 console = Console()
 
@@ -74,16 +74,41 @@ def evaluate(args):
         console.print(f"[red]Val manifest missing: {val_path}[/red]")
         sys.exit(1)
     val_records = load_jsonl(str(val_path))
-    console.print(f"  Val records: [cyan]{len(val_records):,}[/cyan]   labels: [cyan]{len(labels)}[/cyan]")
+
+    # Resolve set labels: prefer the checkpoint's copy (trained ordering), fall
+    # back to the manifest, then derive from records as a last resort.
+    set_labels = ckpt.get("set_labels")
+    if not set_labels:
+        lm_path = Path(args.data_dir) / "label_map.json"
+        if lm_path.exists():
+            set_labels = json.loads(lm_path.read_text()).get("set_labels")
+    if not set_labels:
+        set_labels, _ = derive_set_labels(val_records)
+    set_to_idx = {s: i for i, s in enumerate(set_labels)}
+
+    # Backfill set_idx for older manifests that didn't carry it.
+    for rec in val_records:
+        if "set_idx" not in rec:
+            rec["set_idx"] = set_to_idx.get((rec.get("set_slug") or "").strip().lower(), 0)
+
+    console.print(f"  Val records: [cyan]{len(val_records):,}[/cyan]   labels: [cyan]{len(labels)}[/cyan]   sets: [cyan]{len(set_labels)}[/cyan]")
+
+    hierarchical = bool(ckpt.get("hierarchical", False)) or args.force_hierarchical
+    class_set_mask = None
+    if hierarchical:
+        class_set_mask = build_set_class_mask(labels, set_labels).to(device)
+        console.print(f"[cyan]Hierarchical eval:[/cyan] applying per-sample set mask")
 
     transform = build_preprocess()
-    ds = VariantDataset(val_records, transform)
-    loader = DataLoader(ds, batch_size=args.batch, shuffle=False,
-                        num_workers=args.workers, pin_memory=True,
-                        collate_fn=collate_skip_none,
-                        persistent_workers=args.workers > 0)
+    ds = ImageDataset(val_records, transform, set_to_idx)
+    loader = DataLoader(
+        ds, batch_size=args.batch, shuffle=False,
+        num_workers=args.workers, pin_memory=True,
+        collate_fn=collate_image_skip_none,
+        persistent_workers=args.workers > 0,
+    )
 
-    backbone = setup_backbone(device, ckpt.get("finetuned_backbone"))
+    backbone = setup_backbone(device, ckpt.get("finetuned_backbone"), console=console)
     head = build_head(arch, input_dim, len(labels)).to(device)
     head.load_state_dict(ckpt["head_state_dict"])
     head.eval()
@@ -91,7 +116,7 @@ def evaluate(args):
     tp = Counter()
     fp = Counter()
     fn = Counter()
-    confusions: Counter = Counter()  # (true_idx, pred_idx) -> count
+    confusions: Counter = Counter()
     total = 0
     top1_correct = 0
     top3_correct = 0
@@ -100,11 +125,14 @@ def evaluate(args):
         for batch in loader:
             if batch is None:
                 continue
-            imgs, gold = batch
+            imgs, gold, set_idxs = batch
             imgs = imgs.to(device, non_blocking=True)
             gold = gold.to(device, non_blocking=True)
+            set_idxs = set_idxs.to(device, non_blocking=True)
             feats = extract_features(backbone, imgs, device)
             logits = head(feats)
+            if class_set_mask is not None:
+                logits = logits.masked_fill(~class_set_mask[set_idxs], float("-inf"))
             k = min(3, len(labels))
             topk = logits.topk(k, dim=-1).indices
             pred = topk[:, 0]
@@ -124,7 +152,6 @@ def evaluate(args):
     top1 = top1_correct / max(total, 1)
     top3 = top3_correct / max(total, 1)
 
-    # Per-class metrics
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -156,13 +183,17 @@ def evaluate(args):
         "checkpoint":     str(ckpt_path),
         "n_val":          total,
         "n_labels":       len(labels),
+        "n_sets":         len(set_labels),
         "top1":           top1,
         "top3":           top3,
         "macro_f1":       macro_f1,
         "arch":           arch,
+        "hierarchical":   hierarchical,
         "trained_at":     ckpt.get("trained_at"),
         "backbone":       ckpt.get("backbone"),
         "finetuned_sha":  ckpt.get("finetuned_backbone_sha"),
+        "sampler":        ckpt.get("sampler"),
+        "scheduler":      ckpt.get("scheduler"),
     }
     summary_path.write_text(json.dumps(summary, indent=2))
 
@@ -185,6 +216,10 @@ def main():
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--top-confusions", type=int, default=50)
+    ap.add_argument("--force-hierarchical", action="store_true",
+                    help="Apply per-sample set mask at eval time even if the checkpoint "
+                         "wasn't trained hierarchically. Simulates the inference-time "
+                         "candidate_labels shortlist.")
     args = ap.parse_args()
 
     evaluate(args)

@@ -128,6 +128,15 @@ def export(output_dir: str, min_samples: int, val_ratio: float, seed: int,
     label_list = sorted(by_class.keys())
     label_map = {name: idx for idx, name in enumerate(label_list)}
 
+    # Set-index table, used by the hierarchical variant classifier and the
+    # set-stratified batch sampler. Derived here rather than at train time so
+    # the checkpoint embeds a stable set ordering.
+    set_labels = sorted({
+        (rec["set_slug"] or "").strip().lower()
+        for recs in by_class.values() for rec in recs
+    })
+    set_to_idx = {s: i for i, s in enumerate(set_labels)}
+
     os.makedirs(output_dir, exist_ok=True)
 
     train_path = os.path.join(output_dir, "variant_manifest_train.jsonl")
@@ -139,6 +148,9 @@ def export(output_dir: str, min_samples: int, val_ratio: float, seed: int,
             for rec in records:
                 rec = dict(rec)
                 rec["label_idx"] = label_map[rec["class"]]
+                rec["set_idx"]   = set_to_idx.get(
+                    (rec.get("set_slug") or "").strip().lower(), 0
+                )
                 f.write(json.dumps(rec) + "\n")
 
     _dump(train, train_path)
@@ -147,9 +159,11 @@ def export(output_dir: str, min_samples: int, val_ratio: float, seed: int,
     with open(lm_path, "w") as f:
         json.dump({
             "labels": label_list,
+            "set_labels": set_labels,
             "rare_class": RARE_CLASS,
             "min_samples": min_samples,
             "num_classes": len(label_list),
+            "num_sets": len(set_labels),
         }, f, indent=2)
 
     console.print(f"\n  [green]Wrote {train_path}[/green]  ({len(train):,} rows)")

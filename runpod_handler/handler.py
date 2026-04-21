@@ -55,6 +55,7 @@ variant_head = None
 variant_labels = None  # list[str] — index -> label
 variant_label_to_idx = None  # dict[str, int]
 variant_arch = None
+variant_set_to_classes: dict[str, list[str]] | None = None
 _variant_load_error = None
 
 
@@ -264,7 +265,8 @@ def load_variant_classifier():
     Fails loudly if the checkpoint's preprocess spec doesn't match the handler's —
     that would silently produce garbage predictions.
     """
-    global variant_head, variant_labels, variant_label_to_idx, variant_arch, _variant_load_error
+    global variant_head, variant_labels, variant_label_to_idx, variant_arch, \
+        variant_set_to_classes, _variant_load_error
 
     if variant_head is not None or _variant_load_error is not None:
         return
@@ -294,8 +296,21 @@ def load_variant_classifier():
         head.eval().to(device)
         variant_head = head
 
+        # Build set_slug -> [class_label, ...] index so clients can pass
+        # ``set_slug`` instead of the full candidate_labels shortlist.
+        # Class keys are "<set_slug>::<variant>"; __rare__ is allowed for
+        # every set to match the hierarchical training-time mask.
+        variant_set_to_classes = {}
+        for lab in variant_labels:
+            if lab == "__rare__":
+                continue
+            set_slug = lab.split("::", 1)[0]
+            variant_set_to_classes.setdefault(set_slug, []).append(lab)
+
         print(
             f"[Variant] Ready — arch={variant_arch}, labels={len(variant_labels)}, "
+            f"sets={len(variant_set_to_classes)}, "
+            f"hierarchical={ckpt.get('hierarchical', False)}, "
             f"val_top1={ckpt.get('val_top1')}"
         )
     except Exception as e:
@@ -468,6 +483,14 @@ def handler(event):
             return {"error": "Invalid base64 image data"}
 
         candidate_labels = input_data.get("candidate_labels")
+        # Convenience: ``set_slug`` auto-expands to that set's class labels
+        # (plus __rare__). Equivalent to passing candidate_labels yourself,
+        # and matches the hierarchical training-time set mask.
+        set_slug = input_data.get("set_slug")
+        if set_slug and not candidate_labels and variant_set_to_classes is not None:
+            candidate_labels = list(variant_set_to_classes.get(set_slug, []))
+            if "__rare__" in variant_label_to_idx:
+                candidate_labels.append("__rare__")
 
         start = time.monotonic()
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
