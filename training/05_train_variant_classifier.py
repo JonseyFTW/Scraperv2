@@ -6,21 +6,35 @@ Head-on-frozen-DINOv2 architecture. The backbone (DINOv2 ViT-L/14-reg, optionall
 with the fine-tuned weights from Step 2) computes 1024-dim features; a small
 classification head learns to map those features to variant classes.
 
-V1 — linear probe       (--arch linear)   Linear(1024, C)
-V2 — small MLP          (--arch mlp)      Linear(1024,256) -> GELU -> Dropout -> Linear(256,C)
+Architectures:
+    V1 — linear probe   (--arch linear)   Linear(1024, C)
+    V2 — small MLP      (--arch mlp)      Linear(1024,256) -> GELU -> Dropout -> Linear(256,C)
+
+Key training optimizations (all opt-in via flags, all on by default where safe):
+    - Feature caching (--cache / --no-cache): precompute DINOv2 features once
+      to disk so training is just a Linear head on cached tensors. ~300x
+      per-epoch speedup.
+    - Set-stratified batching (--sampler set_stratified, default): each batch
+      draws K sets and N variants per set — puts the fine-grained foil-vs-base
+      gradient signal where it belongs. Alternative: class_balanced / random.
+    - Warm-restart cosine scheduler (--scheduler cosine_warm_restarts).
+    - Hierarchical masked loss (--hierarchical): training loss is restricted
+      per-sample to the classes belonging to that sample's set. At inference,
+      the client supplies the per-set candidate shortlist (the existing
+      ``candidate_labels`` RunPod handler param).
 
 The produced checkpoint embeds the preprocess spec and backbone identifier so
 the RunPod handler can refuse mismatched loads.
 
-Run from repo root so config/embeddings_dinov2 import:
+Run from repo root:
     python training/05_train_variant_classifier.py
-    python training/05_train_variant_classifier.py --arch mlp --epochs 20 --batch 128
-    python training/05_train_variant_classifier.py --finetuned-backbone ./checkpoints/dinov2_finetuned_backbone.pt
+    python training/05_train_variant_classifier.py --arch mlp --epochs 30 --batch 4096
+    python training/05_train_variant_classifier.py --hierarchical --sampler set_stratified \\
+        --scheduler cosine_warm_restarts --finetuned-backbone ./checkpoints/dinov2_finetuned_backbone.pt
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -30,120 +44,45 @@ from pathlib import Path
 
 # Make repo root importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Also expose the training/ directory so ``variant_classifier_lib`` imports work
+# regardless of whether training/ is treated as a package.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import numpy as np
 from rich.console import Console
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
-from PIL import Image
 
 from embeddings_dinov2 import PREPROCESS_SPEC, build_preprocess
+
+# Shared library (same directory).
+from variant_classifier_lib import (  # noqa: E402
+    RARE_CLASS,
+    sha256_of_file,
+    load_jsonl,
+    derive_set_labels,
+    ImageDataset,
+    collate_image_skip_none,
+    CachedFeatureDataset,
+    collate_features,
+    cache_features_if_needed,
+    load_cached_meta,
+    SetStratifiedBatchSampler,
+    build_class_balanced_sampler,
+    build_head,
+    setup_backbone,
+    extract_features,
+    build_set_class_mask,
+    masked_cross_entropy,
+)
 
 console = Console()
 
 
-def sha256_of_file(path: str | None) -> str | None:
-    if not path or not os.path.exists(path):
-        return None
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
-
-def load_jsonl(path: str) -> list[dict]:
-    rows = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
-
-
-class VariantDataset:
-    """PyTorch Dataset returning (image_tensor, label_idx)."""
-
-    def __init__(self, records: list[dict], transform):
-        self.records = records
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.records)
-
-    def __getitem__(self, idx):
-        rec = self.records[idx]
-        try:
-            img = Image.open(rec["image_path"]).convert("RGB")
-        except Exception:
-            return None
-        return self.transform(img), int(rec["label_idx"])
-
-
-def collate_skip_none(batch):
-    import torch
-    batch = [b for b in batch if b is not None]
-    if not batch:
-        return None
-    imgs = torch.stack([b[0] for b in batch])
-    labels = torch.tensor([b[1] for b in batch], dtype=torch.long)
-    return imgs, labels
-
-
-def build_head(arch: str, input_dim: int, num_classes: int):
-    import torch.nn as nn
-    if arch == "linear":
-        return nn.Linear(input_dim, num_classes)
-    if arch == "mlp":
-        return nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, num_classes),
-        )
-    raise ValueError(f"Unknown arch: {arch}")
-
-
-def setup_backbone(device, finetuned_path: str | None):
-    import torch
-    console.print("[cyan]Loading DINOv2-ViT-L/14-reg (frozen)...[/cyan]")
-    model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14_reg")
-    if finetuned_path:
-        console.print(f"[cyan]Loading fine-tuned backbone from {finetuned_path}...[/cyan]")
-        state_dict = torch.load(finetuned_path, map_location=device, weights_only=True)
-        model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad = False
-    model = model.to(device)
-    if device == "cuda":
-        model = model.half()
-    return model
-
-
-def extract_features(backbone, imgs, device):
-    import torch
-    if device == "cuda":
-        imgs = imgs.half()
-    with torch.no_grad():
-        feats = backbone(imgs)
-        feats = feats / feats.norm(dim=-1, keepdim=True)
-    return feats.float()
-
-
-def train(args):
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import DataLoader
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cuda":
-        gpu = torch.cuda.get_device_name(0)
-        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
-        console.print(f"[green]GPU: {gpu} ({vram:.1f}GB VRAM)[/green]")
-    else:
-        console.print("[yellow]WARNING: CPU training will be very slow[/yellow]")
-
-    data_dir = Path(args.data_dir)
+def _load_manifests(data_dir: Path):
     label_map_path = data_dir / "label_map.json"
     train_path = data_dir / "variant_manifest_train.jsonl"
     val_path   = data_dir / "variant_manifest_val.jsonl"
@@ -154,33 +93,222 @@ def train(args):
 
     label_map = json.loads(label_map_path.read_text())
     labels = label_map["labels"]
-    num_classes = len(labels)
-    console.print(f"  Labels: [cyan]{num_classes}[/cyan]")
-
     train_records = load_jsonl(str(train_path))
     val_records   = load_jsonl(str(val_path))
-    console.print(f"  Train: [cyan]{len(train_records):,}[/cyan]   Val: [cyan]{len(val_records):,}[/cyan]")
 
-    transform = build_preprocess()
-    train_ds = VariantDataset(train_records, transform)
-    val_ds   = VariantDataset(val_records, transform)
+    # set_labels was added by the refactor — older manifests didn't emit it,
+    # so derive from the records themselves in that case.
+    set_labels = label_map.get("set_labels")
+    if not set_labels:
+        combined = train_records + val_records
+        set_labels, _ = derive_set_labels(combined)
+    set_to_idx = {s: i for i, s in enumerate(set_labels)}
 
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch, shuffle=True,
-        num_workers=args.workers, pin_memory=True,
-        collate_fn=collate_skip_none, drop_last=False, persistent_workers=args.workers > 0,
+    # Backfill set_idx onto manifest records that pre-date the refactor, so
+    # everything downstream can assume it exists.
+    for rec in train_records:
+        if "set_idx" not in rec:
+            rec["set_idx"] = set_to_idx.get((rec.get("set_slug") or "").strip().lower(), 0)
+    for rec in val_records:
+        if "set_idx" not in rec:
+            rec["set_idx"] = set_to_idx.get((rec.get("set_slug") or "").strip().lower(), 0)
+
+    return labels, set_labels, set_to_idx, train_records, val_records
+
+
+# ---------------------------------------------------------------------------
+# Loader construction
+# ---------------------------------------------------------------------------
+
+def _build_loaders_cached(
+    cache_dir: Path,
+    train_features: Path,
+    val_features: Path,
+    args,
+):
+    """Construct DataLoaders over the fp16 feature cache."""
+    import torch
+    from torch.utils.data import DataLoader, RandomSampler
+
+    train_labels, train_set_idxs = load_cached_meta(cache_dir / "train_meta.npz")
+    val_labels,   val_set_idxs   = load_cached_meta(cache_dir / "val_meta.npz")
+
+    train_ds = CachedFeatureDataset(str(train_features), train_labels, train_set_idxs)
+    val_ds   = CachedFeatureDataset(str(val_features),   val_labels,   val_set_idxs)
+
+    train_loader_kwargs = dict(
+        num_workers=args.workers,
+        pin_memory=True,
+        collate_fn=collate_features,
+        persistent_workers=args.workers > 0,
     )
+
+    if args.sampler == "set_stratified":
+        # Interpret --batch as the effective batch size; decompose into k*n.
+        k = max(1, args.sets_per_batch)
+        n = max(1, args.batch // k)
+        batch_sampler = SetStratifiedBatchSampler(
+            train_set_idxs,
+            k_sets_per_batch=k,
+            n_per_set=n,
+            num_batches=max(1, len(train_ds) // (k * n)),
+            seed=args.seed,
+        )
+        console.print(
+            f"[cyan]Sampler:[/cyan] set_stratified  "
+            f"(k_sets={k}, n_per_set={n}, batch={batch_sampler.batch_size}, "
+            f"batches/epoch={len(batch_sampler):,})"
+        )
+        train_loader = DataLoader(train_ds, batch_sampler=batch_sampler, **train_loader_kwargs)
+    elif args.sampler == "class_balanced":
+        sampler = build_class_balanced_sampler(train_labels)
+        console.print(f"[cyan]Sampler:[/cyan] class_balanced (WeightedRandomSampler)")
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch, sampler=sampler, drop_last=False, **train_loader_kwargs
+        )
+    else:
+        console.print(f"[cyan]Sampler:[/cyan] random")
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch, shuffle=True, drop_last=False, **train_loader_kwargs
+        )
+
     val_loader = DataLoader(
         val_ds, batch_size=args.batch, shuffle=False,
         num_workers=args.workers, pin_memory=True,
-        collate_fn=collate_skip_none, persistent_workers=args.workers > 0,
+        collate_fn=collate_features, persistent_workers=args.workers > 0,
     )
+    return train_loader, val_loader
 
-    backbone = setup_backbone(device, args.finetuned_backbone)
+
+def _build_loaders_image(train_records, val_records, set_to_idx, args):
+    """Fallback path: load images on the fly (slow, ~one DINOv2 pass per epoch)."""
+    from torch.utils.data import DataLoader
+
+    transform = build_preprocess()
+    train_ds = ImageDataset(train_records, transform, set_to_idx)
+    val_ds   = ImageDataset(val_records,   transform, set_to_idx)
+
+    if args.sampler == "set_stratified":
+        set_arr = np.array([r["set_idx"] for r in train_records], dtype=np.int64)
+        k = max(1, args.sets_per_batch)
+        n = max(1, args.batch // k)
+        batch_sampler = SetStratifiedBatchSampler(
+            set_arr, k_sets_per_batch=k, n_per_set=n,
+            num_batches=max(1, len(train_ds) // (k * n)), seed=args.seed,
+        )
+        console.print(
+            f"[cyan]Sampler:[/cyan] set_stratified "
+            f"(k_sets={k}, n_per_set={n}, batch={batch_sampler.batch_size})"
+        )
+        train_loader = DataLoader(
+            train_ds, batch_sampler=batch_sampler,
+            num_workers=args.workers, pin_memory=True,
+            collate_fn=collate_image_skip_none,
+            persistent_workers=args.workers > 0,
+        )
+    elif args.sampler == "class_balanced":
+        label_arr = np.array([r["label_idx"] for r in train_records], dtype=np.int64)
+        sampler = build_class_balanced_sampler(label_arr)
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch, sampler=sampler,
+            num_workers=args.workers, pin_memory=True,
+            collate_fn=collate_image_skip_none,
+            persistent_workers=args.workers > 0,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch, shuffle=True,
+            num_workers=args.workers, pin_memory=True,
+            collate_fn=collate_image_skip_none, drop_last=False,
+            persistent_workers=args.workers > 0,
+        )
+
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch, shuffle=False,
+        num_workers=args.workers, pin_memory=True,
+        collate_fn=collate_image_skip_none, persistent_workers=args.workers > 0,
+    )
+    return train_loader, val_loader
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
+def _build_scheduler(optim, args):
+    import torch
+    if args.scheduler == "cosine_warm_restarts":
+        console.print(
+            f"[cyan]Scheduler:[/cyan] CosineAnnealingWarmRestarts "
+            f"(T_0={args.scheduler_t0}, T_mult={args.scheduler_tmult})"
+        )
+        return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optim, T_0=args.scheduler_t0, T_mult=args.scheduler_tmult
+        )
+    console.print(f"[cyan]Scheduler:[/cyan] CosineAnnealingLR (T_max={args.epochs})")
+    return torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
+
+
+def train(args):
+    import torch
+    import torch.nn as nn
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        gpu = torch.cuda.get_device_name(0)
+        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+        console.print(f"[green]GPU: {gpu} ({vram:.1f}GB VRAM)[/green]")
+    else:
+        console.print("[yellow]WARNING: CPU training will be very slow[/yellow]")
+
+    data_dir = Path(args.data_dir)
+    labels, set_labels, set_to_idx, train_records, val_records = _load_manifests(data_dir)
+    num_classes = len(labels)
+    num_sets = len(set_labels)
+    console.print(f"  Labels: [cyan]{num_classes}[/cyan]   Sets: [cyan]{num_sets}[/cyan]")
+    console.print(f"  Train: [cyan]{len(train_records):,}[/cyan]   Val: [cyan]{len(val_records):,}[/cyan]")
+
+    # ── Feature cache (Tier 1.1) ─────────────────────────────────────────
+    use_cache = args.cache and device == "cuda"
+    if args.cache and device != "cuda":
+        console.print("[yellow]Feature caching requires CUDA — falling back to image dataset[/yellow]")
+
+    backbone = None
+    if use_cache:
+        _, train_feat, val_feat = cache_features_if_needed(
+            data_dir=data_dir,
+            records_train=train_records,
+            records_val=val_records,
+            set_to_idx=set_to_idx,
+            finetuned_backbone=args.finetuned_backbone,
+            device=device,
+            batch_size=args.cache_batch,
+            num_workers=args.workers,
+            console=console,
+        )
+        cache_dir = train_feat.parent
+        train_loader, val_loader = _build_loaders_cached(
+            cache_dir, train_feat, val_feat, args
+        )
+    else:
+        backbone = setup_backbone(device, args.finetuned_backbone, console=console)
+        train_loader, val_loader = _build_loaders_image(
+            train_records, val_records, set_to_idx, args
+        )
+
+    # ── Hierarchical mask (Tier 3.7) ─────────────────────────────────────
+    class_set_mask = None
+    if args.hierarchical:
+        class_set_mask = build_set_class_mask(labels, set_labels)
+        console.print(
+            f"[cyan]Hierarchical mode:[/cyan] per-sample masked softmax "
+            f"(mask shape={tuple(class_set_mask.shape)})"
+        )
+
+    # ── Head + optimizer + scheduler ─────────────────────────────────────
     head = build_head(args.arch, 1024, num_classes).to(device)
-
     optim = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
+    sched = _build_scheduler(optim, args)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     best_top1 = -1.0
@@ -190,8 +318,6 @@ def train(args):
     ckpt_path      = out_dir / f"variant_classifier_{args.arch}.pt"
     last_ckpt_path = out_dir / f"variant_classifier_{args.arch}_last.pt"
 
-    # Resume from last completed epoch if requested. Auto-discover the last
-    # checkpoint file unless --resume /explicit/path was passed.
     start_epoch = 1
     if args.resume:
         resume_path = args.resume if args.resume != "auto" else str(last_ckpt_path)
@@ -202,7 +328,10 @@ def train(args):
             if "optimizer_state_dict" in state:
                 optim.load_state_dict(state["optimizer_state_dict"])
             if "scheduler_state_dict" in state:
-                sched.load_state_dict(state["scheduler_state_dict"])
+                try:
+                    sched.load_state_dict(state["scheduler_state_dict"])
+                except Exception as e:
+                    console.print(f"[yellow]Scheduler resume skipped ({e})[/yellow]")
             start_epoch = int(state.get("epoch", 0)) + 1
             best_top1 = float(state.get("best_top1", -1.0))
             best_top3 = float(state.get("best_top3", -1.0))
@@ -214,7 +343,23 @@ def train(args):
                 console.print("[yellow]All epochs already completed — nothing to do.[/yellow]")
                 return
         else:
-            console.print(f"[yellow]--resume specified but {resume_path} not found; starting fresh.[/yellow]")
+            console.print(
+                f"[yellow]--resume specified but {resume_path} not found; starting fresh.[/yellow]"
+            )
+
+    def _forward(batch):
+        """Unpack a batch and return (logits, labels, set_idxs). Cache path
+        yields features directly; image path runs a DINOv2 pass first."""
+        if use_cache:
+            feats, labels_t, set_idxs_t = batch
+            feats = feats.to(device, non_blocking=True)
+        else:
+            imgs, labels_t, set_idxs_t = batch
+            imgs = imgs.to(device, non_blocking=True)
+            feats = extract_features(backbone, imgs, device)
+        labels_t   = labels_t.to(device, non_blocking=True)
+        set_idxs_t = set_idxs_t.to(device, non_blocking=True)
+        return head(feats), labels_t, set_idxs_t
 
     for epoch in range(start_epoch, args.epochs + 1):
         head.train()
@@ -223,36 +368,51 @@ def train(args):
         n_seen = 0
         n_correct = 0
 
-        with Progress(TextColumn(f"Epoch {epoch}/{args.epochs}"), BarColumn(),
-                      TextColumn("{task.completed}/{task.total}"),
-                      TextColumn("loss={task.fields[loss]:.4f}"),
-                      TimeRemainingColumn()) as progress:
+        with Progress(
+            TextColumn(f"Epoch {epoch}/{args.epochs}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TextColumn("loss={task.fields[loss]:.4f}"),
+            TimeRemainingColumn(),
+        ) as progress:
             task = progress.add_task("train", total=len(train_loader), loss=0.0)
             for batch in train_loader:
                 if batch is None:
                     progress.advance(task); continue
-                imgs, labels_t = batch
-                imgs = imgs.to(device, non_blocking=True)
-                labels_t = labels_t.to(device, non_blocking=True)
 
-                feats = extract_features(backbone, imgs, device)
-                logits = head(feats)
-                loss = criterion(logits, labels_t)
+                logits, labels_t, set_idxs_t = _forward(batch)
+
+                if args.hierarchical:
+                    loss = masked_cross_entropy(
+                        logits, labels_t, set_idxs_t, class_set_mask,
+                        label_smoothing=0.1,
+                    )
+                    # For top-1 accuracy we also mask at training time so the
+                    # reported metric matches the loss we're optimizing.
+                    pred = logits.masked_fill(
+                        ~class_set_mask.to(logits.device)[set_idxs_t], float("-inf")
+                    ).argmax(-1)
+                else:
+                    loss = criterion(logits, labels_t)
+                    pred = logits.argmax(-1)
 
                 optim.zero_grad()
                 loss.backward()
                 optim.step()
 
-                running_loss += loss.item() * imgs.size(0)
-                n_seen += imgs.size(0)
-                n_correct += (logits.argmax(-1) == labels_t).sum().item()
+                bs = labels_t.size(0)
+                running_loss += loss.item() * bs
+                n_seen += bs
+                n_correct += (pred == labels_t).sum().item()
                 progress.update(task, advance=1, loss=running_loss / max(n_seen, 1))
 
+        # Step once per epoch. Warm-restart variant also accepts a float step,
+        # but per-epoch is the common convention and matches the legacy path.
         sched.step()
         train_loss = running_loss / max(n_seen, 1)
         train_top1 = n_correct / max(n_seen, 1)
 
-        # Eval
+        # ── Eval ─────────────────────────────────────────────────────────
         head.eval()
         v_seen = 0
         v_top1 = 0
@@ -261,13 +421,14 @@ def train(args):
             for batch in val_loader:
                 if batch is None:
                     continue
-                imgs, labels_t = batch
-                imgs = imgs.to(device, non_blocking=True)
-                labels_t = labels_t.to(device, non_blocking=True)
-                feats = extract_features(backbone, imgs, device)
-                logits = head(feats)
-                topk = logits.topk(min(3, num_classes), dim=-1).indices
-                v_seen += imgs.size(0)
+                logits, labels_t, set_idxs_t = _forward(batch)
+                if args.hierarchical:
+                    logits = logits.masked_fill(
+                        ~class_set_mask.to(logits.device)[set_idxs_t], float("-inf")
+                    )
+                k = min(3, num_classes)
+                topk = logits.topk(k, dim=-1).indices
+                v_seen += labels_t.size(0)
                 v_top1 += (topk[:, 0] == labels_t).sum().item()
                 v_top3 += (topk == labels_t.unsqueeze(-1)).any(-1).sum().item()
 
@@ -279,34 +440,11 @@ def train(args):
             f"train@1 {train_top1:.3f}  val@1 {val_top1:.3f}  val@3 {val_top3:.3f}  ({dt:.0f}s)"
         )
 
-        if val_top1 > best_top1:
-            best_top1 = val_top1
-            best_top3 = val_top3
-            torch.save({
-                "head_state_dict":        head.state_dict(),
-                "label_map":              labels,
-                "backbone":               "dinov2_vitl14_reg",
-                "finetuned_backbone":     args.finetuned_backbone,
-                "finetuned_backbone_sha": sha256_of_file(args.finetuned_backbone),
-                "arch":                   args.arch,
-                "input_dim":              1024,
-                "preprocess":             PREPROCESS_SPEC,
-                "trained_at":             datetime.now(timezone.utc).isoformat(),
-                "train_samples":          len(train_records),
-                "val_samples":            len(val_records),
-                "val_top1":               best_top1,
-                "val_top3":               best_top3,
-                "epoch":                  epoch,
-            }, ckpt_path)
-            console.print(f"    [green]saved best -> {ckpt_path} (top1={best_top1:.3f})[/green]")
-
-        # Always save a rolling "last" checkpoint with full training state so
-        # --resume can pick up after Ctrl+C (gaming break, power loss, etc.).
-        torch.save({
+        # ── Checkpointing ────────────────────────────────────────────────
+        base_payload = {
             "head_state_dict":        head.state_dict(),
-            "optimizer_state_dict":   optim.state_dict(),
-            "scheduler_state_dict":   sched.state_dict(),
             "label_map":              labels,
+            "set_labels":             set_labels,
             "backbone":               "dinov2_vitl14_reg",
             "finetuned_backbone":     args.finetuned_backbone,
             "finetuned_backbone_sha": sha256_of_file(args.finetuned_backbone),
@@ -316,16 +454,41 @@ def train(args):
             "trained_at":             datetime.now(timezone.utc).isoformat(),
             "train_samples":          len(train_records),
             "val_samples":            len(val_records),
-            "val_top1":               val_top1,
-            "val_top3":               val_top3,
-            "best_top1":              best_top1,
-            "best_top3":              best_top3,
+            "hierarchical":           args.hierarchical,
+            "sampler":                args.sampler,
+            "scheduler":              args.scheduler,
             "epoch":                  epoch,
-        }, last_ckpt_path)
+        }
+
+        if val_top1 > best_top1:
+            best_top1 = val_top1
+            best_top3 = val_top3
+            torch.save(
+                {**base_payload, "val_top1": best_top1, "val_top3": best_top3},
+                ckpt_path,
+            )
+            console.print(f"    [green]saved best -> {ckpt_path} (top1={best_top1:.3f})[/green]")
+
+        torch.save(
+            {
+                **base_payload,
+                "optimizer_state_dict": optim.state_dict(),
+                "scheduler_state_dict": sched.state_dict(),
+                "val_top1":             val_top1,
+                "val_top3":             val_top3,
+                "best_top1":            best_top1,
+                "best_top3":            best_top3,
+            },
+            last_ckpt_path,
+        )
 
     console.print(f"\n[bold green]Done.[/bold green] best val@1={best_top1:.3f}  val@3={best_top3:.3f}")
     console.print(f"Checkpoint: [cyan]{ckpt_path}[/cyan]")
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
@@ -334,10 +497,49 @@ def main():
     ap.add_argument("--arch", choices=["linear", "mlp"], default="linear")
     ap.add_argument("--finetuned-backbone", default=None,
                     help="Optional path to a fine-tuned DINOv2 backbone .pt from step 2")
-    ap.add_argument("--epochs", type=int, default=10)
-    ap.add_argument("--batch", type=int, default=128)
+
+    ap.add_argument("--epochs", type=int, default=30,
+                    help="With feature caching, 30-50 epochs is trivial.")
+    ap.add_argument("--batch", type=int, default=4096,
+                    help="Head-training batch size. With cached features the head "
+                         "is just a Linear, so 4096-8192 fits comfortably on a 4070.")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--seed", type=int, default=42)
+
+    # Feature cache
+    ap.add_argument("--cache", dest="cache", action="store_true", default=True,
+                    help="Precompute DINOv2 features once and train the head on "
+                         "cached fp16 tensors (default).")
+    ap.add_argument("--no-cache", dest="cache", action="store_false",
+                    help="Disable feature cache; run DINOv2 every step (slow).")
+    ap.add_argument("--cache-batch", type=int, default=64,
+                    help="DINOv2 batch size used while building the cache.")
+
+    # Sampler
+    ap.add_argument("--sampler", choices=["random", "set_stratified", "class_balanced"],
+                    default="set_stratified",
+                    help="Batch composition. 'set_stratified' (default) draws K sets "
+                         "and N variants per set to focus gradients on same-set discrimination.")
+    ap.add_argument("--sets-per-batch", type=int, default=8,
+                    help="K in the set-stratified sampler. N is inferred from --batch.")
+
+    # Scheduler
+    ap.add_argument("--scheduler", choices=["cosine", "cosine_warm_restarts"],
+                    default="cosine_warm_restarts",
+                    help="LR schedule. Warm restarts prevent the LR from collapsing "
+                         "to zero once extended training makes it useful.")
+    ap.add_argument("--scheduler-t0", type=int, default=5,
+                    help="Initial cycle length (epochs) for cosine_warm_restarts.")
+    ap.add_argument("--scheduler-tmult", type=int, default=2,
+                    help="Cycle multiplier for cosine_warm_restarts.")
+
+    # Hierarchical
+    ap.add_argument("--hierarchical", action="store_true",
+                    help="Train variant head with per-sample masked softmax — loss "
+                         "restricted to the classes belonging to that sample's set. "
+                         "Matches the inference flow: search picks set, head ranks variants.")
+
     ap.add_argument("--resume", default=None, nargs="?", const="auto",
                     help="Resume from checkpoint. Bare --resume uses variant_classifier_{arch}_last.pt; "
                          "pass an explicit path to use a different file.")
