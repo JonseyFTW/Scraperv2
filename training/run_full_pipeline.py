@@ -490,6 +490,12 @@ def step9_train_variant_classifier(args) -> bool:
         "--sets-per-batch", str(args.variant_sets_per_batch),
         "--scheduler", args.variant_scheduler,
         "--scheduler-t0", str(args.variant_scheduler_t0),
+        "--weight-decay", str(args.variant_weight_decay),
+        "--label-smoothing", str(args.variant_label_smoothing),
+        "--dropout", str(args.variant_dropout),
+        "--hidden-dim", str(args.variant_hidden_dim),
+        "--feat-dropout", str(args.variant_feat_dropout),
+        "--patience", str(args.variant_patience),
     ]
     if not args.variant_use_cache:
         cmd += ["--no-cache"]
@@ -581,6 +587,18 @@ Examples:
                         help="Train with per-sample masked softmax — loss restricted to "
                              "classes belonging to the sample's set. Matches the inference "
                              "flow (search picks set → head ranks variants).")
+    parser.add_argument("--variant-weight-decay", type=float, default=1e-4,
+                        help="AdamW weight decay. Bump to 5e-4 or 1e-3 when overfitting.")
+    parser.add_argument("--variant-label-smoothing", type=float, default=0.1,
+                        help="Cross-entropy label smoothing (correctly masked in hierarchical mode).")
+    parser.add_argument("--variant-dropout", type=float, default=0.1,
+                        help="Dropout in the MLP head. Ignored for --variant-arch linear.")
+    parser.add_argument("--variant-hidden-dim", type=int, default=256,
+                        help="Hidden width of the MLP head. Ignored for --variant-arch linear.")
+    parser.add_argument("--variant-feat-dropout", type=float, default=0.0,
+                        help="Dropout on cached DINOv2 features before the head (regularizer).")
+    parser.add_argument("--variant-patience", type=int, default=0,
+                        help="Early-stop after N epochs without val@1 improvement. 0 disables.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show plan without executing")
 

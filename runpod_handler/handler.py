@@ -244,17 +244,22 @@ def get_or_create_collection(name: str):
     )
 
 
-def _build_variant_head(arch: str, input_dim: int, num_classes: int):
-    """Mirrors training/05_train_variant_classifier.build_head."""
+def _build_variant_head(arch: str, input_dim: int, num_classes: int,
+                        hidden_dim: int = 256, dropout: float = 0.1):
+    """Mirrors training/variant_classifier_lib.build_head.
+
+    ``hidden_dim`` / ``dropout`` come from the checkpoint so that an MLP
+    trained with non-default width loads correctly.
+    """
     import torch.nn as nn
     if arch == "linear":
         return nn.Linear(input_dim, num_classes)
     if arch == "mlp":
         return nn.Sequential(
-            nn.Linear(input_dim, 256),
+            nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, num_classes),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes),
         )
     raise ValueError(f"Unknown variant arch: {arch}")
 
@@ -291,7 +296,13 @@ def load_variant_classifier():
         variant_labels = ckpt["label_map"]
         variant_label_to_idx = {lab: i for i, lab in enumerate(variant_labels)}
         variant_arch = ckpt.get("arch", "linear")
-        head = _build_variant_head(variant_arch, ckpt.get("input_dim", 1024), len(variant_labels))
+        head = _build_variant_head(
+            variant_arch,
+            ckpt.get("input_dim", 1024),
+            len(variant_labels),
+            hidden_dim=ckpt.get("hidden_dim", 256),
+            dropout=ckpt.get("dropout", 0.1),
+        )
         head.load_state_dict(ckpt["head_state_dict"])
         head.eval().to(device)
         variant_head = head

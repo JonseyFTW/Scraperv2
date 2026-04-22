@@ -306,13 +306,22 @@ def train(args):
         )
 
     # ── Head + optimizer + scheduler ─────────────────────────────────────
-    head = build_head(args.arch, 1024, num_classes).to(device)
-    optim = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=1e-4)
+    head = build_head(
+        args.arch, 1024, num_classes,
+        hidden_dim=args.hidden_dim, dropout=args.dropout,
+    ).to(device)
+    optim = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = _build_scheduler(optim, args)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    console.print(
+        f"[cyan]Regularization:[/cyan] weight_decay={args.weight_decay:.0e}  "
+        f"label_smoothing={args.label_smoothing}  dropout={args.dropout}  "
+        f"feat_dropout={args.feat_dropout}  hidden_dim={args.hidden_dim}"
+    )
 
     best_top1 = -1.0
     best_top3 = -1.0
+    epochs_without_improve = 0
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path      = out_dir / f"variant_classifier_{args.arch}.pt"
@@ -347,9 +356,15 @@ def train(args):
                 f"[yellow]--resume specified but {resume_path} not found; starting fresh.[/yellow]"
             )
 
-    def _forward(batch):
+    def _forward(batch, training: bool):
         """Unpack a batch and return (logits, labels, set_idxs). Cache path
-        yields features directly; image path runs a DINOv2 pass first."""
+        yields features directly; image path runs a DINOv2 pass first.
+
+        ``feat_dropout`` applies stochastic feature dropout before the head —
+        cheap feature-space regularization when image augmentation isn't an
+        option (cached features are a single fixed view per image).
+        """
+        import torch.nn.functional as F
         if use_cache:
             feats, labels_t, set_idxs_t = batch
             feats = feats.to(device, non_blocking=True)
@@ -357,6 +372,8 @@ def train(args):
             imgs, labels_t, set_idxs_t = batch
             imgs = imgs.to(device, non_blocking=True)
             feats = extract_features(backbone, imgs, device)
+        if training and args.feat_dropout > 0.0:
+            feats = F.dropout(feats, p=args.feat_dropout, training=True)
         labels_t   = labels_t.to(device, non_blocking=True)
         set_idxs_t = set_idxs_t.to(device, non_blocking=True)
         return head(feats), labels_t, set_idxs_t
@@ -380,12 +397,12 @@ def train(args):
                 if batch is None:
                     progress.advance(task); continue
 
-                logits, labels_t, set_idxs_t = _forward(batch)
+                logits, labels_t, set_idxs_t = _forward(batch, training=True)
 
                 if args.hierarchical:
                     loss = masked_cross_entropy(
                         logits, labels_t, set_idxs_t, class_set_mask,
-                        label_smoothing=0.1,
+                        label_smoothing=args.label_smoothing,
                     )
                     # For top-1 accuracy we also mask at training time so the
                     # reported metric matches the loss we're optimizing.
@@ -421,7 +438,7 @@ def train(args):
             for batch in val_loader:
                 if batch is None:
                     continue
-                logits, labels_t, set_idxs_t = _forward(batch)
+                logits, labels_t, set_idxs_t = _forward(batch, training=False)
                 if args.hierarchical:
                     logits = logits.masked_fill(
                         ~class_set_mask.to(logits.device)[set_idxs_t], float("-inf")
@@ -449,6 +466,11 @@ def train(args):
             "finetuned_backbone":     args.finetuned_backbone,
             "finetuned_backbone_sha": sha256_of_file(args.finetuned_backbone),
             "arch":                   args.arch,
+            "hidden_dim":             args.hidden_dim,
+            "dropout":                args.dropout,
+            "feat_dropout":           args.feat_dropout,
+            "weight_decay":           args.weight_decay,
+            "label_smoothing":        args.label_smoothing,
             "input_dim":              1024,
             "preprocess":             PREPROCESS_SPEC,
             "trained_at":             datetime.now(timezone.utc).isoformat(),
@@ -463,11 +485,14 @@ def train(args):
         if val_top1 > best_top1:
             best_top1 = val_top1
             best_top3 = val_top3
+            epochs_without_improve = 0
             torch.save(
                 {**base_payload, "val_top1": best_top1, "val_top3": best_top3},
                 ckpt_path,
             )
             console.print(f"    [green]saved best -> {ckpt_path} (top1={best_top1:.3f})[/green]")
+        else:
+            epochs_without_improve += 1
 
         torch.save(
             {
@@ -481,6 +506,15 @@ def train(args):
             },
             last_ckpt_path,
         )
+
+        # Early stopping: bail once val@1 has plateaued for --patience epochs.
+        # Safe for long runs so they don't waste compute past convergence.
+        if args.patience > 0 and epochs_without_improve >= args.patience:
+            console.print(
+                f"[yellow]Early stopping at epoch {epoch}: "
+                f"no val@1 improvement for {args.patience} epochs.[/yellow]"
+            )
+            break
 
     console.print(f"\n[bold green]Done.[/bold green] best val@1={best_top1:.3f}  val@3={best_top3:.3f}")
     console.print(f"Checkpoint: [cyan]{ckpt_path}[/cyan]")
@@ -506,6 +540,26 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
+
+    # Regularization
+    ap.add_argument("--weight-decay", type=float, default=1e-4,
+                    help="AdamW weight decay. Bump to 5e-4 or 1e-3 when the head "
+                         "is overfitting (train@1 >> val@1).")
+    ap.add_argument("--label-smoothing", type=float, default=0.1,
+                    help="Cross-entropy label smoothing. In hierarchical mode the "
+                         "smoothing is correctly distributed over the per-sample "
+                         "allowed classes only.")
+    ap.add_argument("--dropout", type=float, default=0.1,
+                    help="Dropout inside the MLP head. Ignored for --arch linear.")
+    ap.add_argument("--hidden-dim", type=int, default=256,
+                    help="Hidden-layer width of the MLP head. Ignored for --arch linear.")
+    ap.add_argument("--feat-dropout", type=float, default=0.0,
+                    help="Stochastic dropout on cached DINOv2 features before the head. "
+                         "Cheap regularizer for the fixed-features regime where image "
+                         "augmentation isn't available.")
+    ap.add_argument("--patience", type=int, default=0,
+                    help="Early-stop after N epochs without val@1 improvement. "
+                         "0 (default) disables early stopping.")
 
     # Feature cache
     ap.add_argument("--cache", dest="cache", action="store_true", default=True,
