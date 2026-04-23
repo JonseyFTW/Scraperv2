@@ -1,0 +1,261 @@
+{
+  "_description": "Default overnight sweep for the variant classifier. Designed around the data point that val@1=0.498 was reached with hidden_dim=512, dropout=0.4, feat_dropout=0.1, wd=1e-3, ls=0.15. That run was overfitting (train@1=0.88) so most of these experiments push regularization harder, explore capacity both up and down, try the alternate sampler, and verify the top configs with different seeds. ~30 experiments * ~25-45 min each = ~15-20 hours total. Edit freely — only 'name' is required per entry.",
+  "_notes": {
+    "finetuned_backbone": "Path is relative to the project root (where you run `python training/sweep_variant_classifier.py`). Change if your checkpoint lives elsewhere.",
+    "resume": "Re-running the sweep skips names already marked 'completed' in results.csv. Delete a row to re-run that experiment.",
+    "naming_scheme": "<group>_<axis>_<variant> — groups: baseline, reg_* (regularization), cap_* (capacity), sampler_*, seed_* (seed verification)."
+  },
+  "experiments": [
+    {
+      "name": "baseline_linear_hierarchical",
+      "_why": "Linear probe with hierarchical training — quick floor check.",
+      "arch": "linear",
+      "epochs": 40,
+      "patience": 10,
+      "weight_decay": 1e-4,
+      "label_smoothing": 0.1,
+      "sampler": "set_stratified",
+      "scheduler": "cosine_warm_restarts",
+      "hierarchical": true,
+      "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+    {
+      "name": "baseline_mlp512_d4_fd1_wd1e-3_ls15",
+      "_why": "Recreate the current best result as a sweep row for easy comparison.",
+      "arch": "mlp",
+      "hidden_dim": 512,
+      "dropout": 0.4,
+      "feat_dropout": 0.1,
+      "weight_decay": 1e-3,
+      "label_smoothing": 0.15,
+      "epochs": 100,
+      "patience": 15,
+      "sampler": "set_stratified",
+      "scheduler": "cosine_warm_restarts",
+      "hierarchical": true,
+      "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+
+    {
+      "name": "reg_mlp512_d5_fd15_wd2e-3_ls15",
+      "_why": "Push regularization past the current best to chase the train/val gap.",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.5, "feat_dropout": 0.15,
+      "weight_decay": 2e-3, "label_smoothing": 0.15,
+      "epochs": 100, "patience": 15,
+      "sampler": "set_stratified", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+    {
+      "name": "reg_mlp512_d5_fd2_wd3e-3_ls2",
+      "_why": "Aggressive regularization — expect smaller gap, maybe lower val@1.",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.5, "feat_dropout": 0.2,
+      "weight_decay": 3e-3, "label_smoothing": 0.2,
+      "epochs": 100, "patience": 15,
+      "sampler": "set_stratified", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+    {
+      "name": "reg_mlp512_d6_fd25_wd3e-3_ls2",
+      "_why": "Even heavier dropout — is there a cliff?",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.6, "feat_dropout": 0.25,
+      "weight_decay": 3e-3, "label_smoothing": 0.2,
+      "epochs": 100, "patience": 15,
+      "sampler": "set_stratified", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+    {
+      "name": "reg_mlp512_d3_fd05_wd5e-4_ls1",
+      "_why": "Lighter regularization — confirms the current best isn't over-regularized.",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.3, "feat_dropout": 0.05,
+      "weight_decay": 5e-4, "label_smoothing": 0.1,
+      "epochs": 100, "patience": 15,
+      "sampler": "set_stratified", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+
+    {
+      "name": "cap_mlp256_d4_fd1_wd1e-3_ls15",
+      "_why": "Smaller MLP — does less capacity help the gap?",
+      "arch": "mlp", "hidden_dim": 256,
+      "dropout": 0.4, "feat_dropout": 0.1,
+      "weight_decay": 1e-3, "label_smoothing": 0.15,
+      "epochs": 100, "patience": 15,
+      "sampler": "set_stratified", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+    {
+      "name": "cap_mlp768_d5_fd15_wd2e-3_ls15",
+      "_why": "Bigger MLP with proportional regularization.",
+      "arch": "mlp", "hidden_dim": 768,
+      "dropout": 0.5, "feat_dropout": 0.15,
+      "weight_decay": 2e-3, "label_smoothing": 0.15,
+      "epochs": 100, "patience": 15,
+      "sampler": "set_stratified", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+    {
+      "name": "cap_mlp1024_d5_fd2_wd3e-3_ls2",
+      "_why": "Widest MLP, heaviest regularization — capacity ceiling check.",
+      "arch": "mlp", "hidden_dim": 1024,
+      "dropout": 0.5, "feat_dropout": 0.2,
+      "weight_decay": 3e-3, "label_smoothing": 0.2,
+      "epochs": 120, "patience": 20,
+      "sampler": "set_stratified", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+
+    {
+      "name": "sampler_cb_mlp512_d5_fd15_wd2e-3",
+      "_why": "Class-balanced sampler — should lift rare-class F1, maybe lower val@1.",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.5, "feat_dropout": 0.15,
+      "weight_decay": 2e-3, "label_smoothing": 0.15,
+      "epochs": 100, "patience": 15,
+      "sampler": "class_balanced", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+    {
+      "name": "sampler_cb_linear",
+      "_why": "Class-balanced with a linear head — cheap rare-class-only probe.",
+      "arch": "linear",
+      "weight_decay": 1e-3, "label_smoothing": 0.1,
+      "epochs": 40, "patience": 10,
+      "sampler": "class_balanced", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+    {
+      "name": "sampler_random_mlp512",
+      "_why": "Random sampler — confirms set_stratified is actually helping.",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.4, "feat_dropout": 0.1,
+      "weight_decay": 1e-3, "label_smoothing": 0.15,
+      "epochs": 100, "patience": 15,
+      "sampler": "random", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+
+    {
+      "name": "sched_cosine_mlp512",
+      "_why": "Plain cosine instead of warm restarts — does the LR dip help or hurt?",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.4, "feat_dropout": 0.1,
+      "weight_decay": 1e-3, "label_smoothing": 0.15,
+      "epochs": 100, "patience": 15,
+      "sampler": "set_stratified", "scheduler": "cosine",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+    {
+      "name": "sched_wr_t3_mlp512",
+      "_why": "Tighter warm-restart cycles (T_0=3 instead of 5).",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.4, "feat_dropout": 0.1,
+      "weight_decay": 1e-3, "label_smoothing": 0.15,
+      "epochs": 100, "patience": 15,
+      "sampler": "set_stratified", "scheduler": "cosine_warm_restarts", "scheduler_t0": 3,
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+
+    {
+      "name": "lr_high_mlp512",
+      "_why": "Higher LR (3e-3) — sometimes escapes overfitting plateau.",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.5, "feat_dropout": 0.15,
+      "weight_decay": 2e-3, "label_smoothing": 0.15,
+      "lr": 3e-3,
+      "epochs": 100, "patience": 15,
+      "sampler": "set_stratified", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+    {
+      "name": "lr_low_mlp512",
+      "_why": "Lower LR (3e-4) with more epochs — slow-and-steady convergence.",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.4, "feat_dropout": 0.1,
+      "weight_decay": 1e-3, "label_smoothing": 0.15,
+      "lr": 3e-4,
+      "epochs": 150, "patience": 25,
+      "sampler": "set_stratified", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+
+    {
+      "name": "long_mlp512_d5_fd15_wd2e-3",
+      "_why": "Long run (200 epochs) on a regularized config to find the true ceiling.",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.5, "feat_dropout": 0.15,
+      "weight_decay": 2e-3, "label_smoothing": 0.15,
+      "epochs": 200, "patience": 30,
+      "sampler": "set_stratified", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+
+    {
+      "name": "k16_mlp512_d4_fd1",
+      "_why": "Wider per-batch set coverage (k=16) — more cross-set gradient mass.",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.4, "feat_dropout": 0.1,
+      "weight_decay": 1e-3, "label_smoothing": 0.15,
+      "epochs": 100, "patience": 15,
+      "sampler": "set_stratified", "sets_per_batch": 16,
+      "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+    {
+      "name": "k4_mlp512_d4_fd1",
+      "_why": "Tighter per-batch set focus (k=4) — more within-set gradient.",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.4, "feat_dropout": 0.1,
+      "weight_decay": 1e-3, "label_smoothing": 0.15,
+      "epochs": 100, "patience": 15,
+      "sampler": "set_stratified", "sets_per_batch": 4,
+      "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 42,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+
+    {
+      "name": "seed_A_mlp512_best",
+      "_why": "Seed verification for the best regularized config (seed 17).",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.5, "feat_dropout": 0.15,
+      "weight_decay": 2e-3, "label_smoothing": 0.15,
+      "epochs": 100, "patience": 15,
+      "sampler": "set_stratified", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 17,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    },
+    {
+      "name": "seed_B_mlp512_best",
+      "_why": "Seed verification (seed 2024).",
+      "arch": "mlp", "hidden_dim": 512,
+      "dropout": 0.5, "feat_dropout": 0.15,
+      "weight_decay": 2e-3, "label_smoothing": 0.15,
+      "epochs": 100, "patience": 15,
+      "sampler": "set_stratified", "scheduler": "cosine_warm_restarts",
+      "hierarchical": true, "seed": 2024,
+      "finetuned_backbone": "./checkpoints/dinov2_finetuned_best.pt"
+    }
+  ]
+}
