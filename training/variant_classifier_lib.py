@@ -545,3 +545,146 @@ def masked_cross_entropy(
 
     loss = -(smoothed_target * log_probs).sum(dim=-1)
     return loss.mean()
+
+
+# ---------------------------------------------------------------------------
+# Evaluation core (shared by step 5 auto-eval and step 6 standalone eval)
+# ---------------------------------------------------------------------------
+
+def evaluate_head(
+    head,
+    val_loader,
+    labels: list[str],
+    class_set_mask=None,
+    device: str = "cuda",
+    backbone=None,
+    use_cache: bool = True,
+    top_confusions: int = 50,
+):
+    """Run a full pass over ``val_loader`` and compute metrics + confusions.
+
+    ``val_loader`` may yield either cached features (use_cache=True) or images
+    that need DINOv2 forwarding (use_cache=False, ``backbone`` required).
+
+    Returns a dict with:
+        top1, top3, macro_f1, n_val,
+        per_class:  list[(label, support, prec, rec, f1)]
+        confusions: list[(true_label, pred_label, count)]  truncated to top_confusions
+    """
+    import torch
+    from collections import Counter
+
+    head.eval()
+    tp: Counter = Counter()
+    fp: Counter = Counter()
+    fn: Counter = Counter()
+    confusions: Counter = Counter()
+    total = 0
+    top1_correct = 0
+    top3_correct = 0
+
+    if class_set_mask is not None:
+        class_set_mask = class_set_mask.to(device)
+
+    num_classes = len(labels)
+
+    with torch.no_grad():
+        for batch in val_loader:
+            if batch is None:
+                continue
+            if use_cache:
+                feats, gold, set_idxs = batch
+                feats = feats.to(device, non_blocking=True)
+            else:
+                imgs, gold, set_idxs = batch
+                imgs = imgs.to(device, non_blocking=True)
+                feats = extract_features(backbone, imgs, device)
+            gold = gold.to(device, non_blocking=True)
+            set_idxs = set_idxs.to(device, non_blocking=True)
+
+            logits = head(feats)
+            if class_set_mask is not None:
+                logits = logits.masked_fill(~class_set_mask[set_idxs], float("-inf"))
+            k = min(3, num_classes)
+            topk = logits.topk(k, dim=-1).indices
+            pred = topk[:, 0]
+
+            total += gold.size(0)
+            top1_correct += (pred == gold).sum().item()
+            top3_correct += (topk == gold.unsqueeze(-1)).any(-1).sum().item()
+
+            for g, p in zip(gold.cpu().tolist(), pred.cpu().tolist()):
+                if g == p:
+                    tp[g] += 1
+                else:
+                    fp[p] += 1
+                    fn[g] += 1
+                    confusions[(g, p)] += 1
+
+    top1 = top1_correct / max(total, 1)
+    top3 = top3_correct / max(total, 1)
+
+    per_class = []
+    f1s = []
+    for idx, label in enumerate(labels):
+        support = tp[idx] + fn[idx]
+        prec = tp[idx] / (tp[idx] + fp[idx]) if (tp[idx] + fp[idx]) else 0.0
+        rec  = tp[idx] / support if support else 0.0
+        f1   = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+        if support:
+            f1s.append(f1)
+        per_class.append((label, support, prec, rec, f1))
+    macro_f1 = sum(f1s) / max(len(f1s), 1)
+
+    confusion_rows = [
+        (labels[g], labels[p], c)
+        for (g, p), c in confusions.most_common(top_confusions)
+    ]
+
+    return {
+        "top1":       top1,
+        "top3":       top3,
+        "macro_f1":   macro_f1,
+        "n_val":      total,
+        "per_class":  per_class,
+        "confusions": confusion_rows,
+    }
+
+
+def write_eval_outputs(out_dir, eval_result: dict, summary_extra: dict | None = None):
+    """Write per_class_metrics.csv, top_confusions.csv, and summary.json.
+
+    ``summary_extra`` is merged into summary.json so callers can stamp the run
+    with checkpoint path, training flags, run name, etc.
+    """
+    import csv
+    from pathlib import Path
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    per_class_path = out_dir / "per_class_metrics.csv"
+    with open(per_class_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["label", "support", "precision", "recall", "f1"])
+        for label, support, prec, rec, f1 in eval_result["per_class"]:
+            w.writerow([label, support, f"{prec:.4f}", f"{rec:.4f}", f"{f1:.4f}"])
+
+    confusions_path = out_dir / "top_confusions.csv"
+    with open(confusions_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["true_label", "pred_label", "count"])
+        for true_label, pred_label, count in eval_result["confusions"]:
+            w.writerow([true_label, pred_label, count])
+
+    summary = {
+        "n_val":    eval_result["n_val"],
+        "top1":     eval_result["top1"],
+        "top3":     eval_result["top3"],
+        "macro_f1": eval_result["macro_f1"],
+    }
+    if summary_extra:
+        summary.update(summary_extra)
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+
+    return per_class_path, confusions_path, out_dir / "summary.json"

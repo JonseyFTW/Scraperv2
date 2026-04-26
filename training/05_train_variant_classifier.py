@@ -73,9 +73,47 @@ from variant_classifier_lib import (  # noqa: E402
     extract_features,
     build_set_class_mask,
     masked_cross_entropy,
+    evaluate_head,
+    write_eval_outputs,
 )
 
 console = Console()
+
+
+# ---------------------------------------------------------------------------
+# Feature-flag stamping
+# ---------------------------------------------------------------------------
+
+def _feature_flags_from_args(args) -> dict:
+    """Snapshot of which experimental recs are enabled for this run.
+
+    Stamped into the checkpoint and into runs/<run_name>/summary.json so the
+    07_compare_runs.py harness can label the diff columns with the active rec.
+    """
+    return {
+        "color_hist":      getattr(args, "color_hist",      "none"),
+        "supcon_lambda":   float(getattr(args, "supcon_lambda",   0.0)),
+        "foil_aux_lambda": float(getattr(args, "foil_aux_lambda", 0.0)),
+        "edge_channel":    bool(getattr(args, "edge_channel",    False)),
+    }
+
+
+def _default_run_name(args) -> str:
+    """Build a stable, descriptive run name from the active feature flags.
+
+    Format:   <arch>[__color=lab32][__supcon=0.1][__foil=0.5][__edge]__YYYYMMDDHHMMSS
+    """
+    parts = [args.arch]
+    if getattr(args, "color_hist", "none") not in (None, "none"):
+        parts.append(f"color={args.color_hist}")
+    if float(getattr(args, "supcon_lambda", 0.0)) > 0:
+        parts.append(f"supcon={args.supcon_lambda}")
+    if float(getattr(args, "foil_aux_lambda", 0.0)) > 0:
+        parts.append(f"foil={args.foil_aux_lambda}")
+    if getattr(args, "edge_channel", False):
+        parts.append("edge")
+    parts.append(datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"))
+    return "__".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +518,8 @@ def train(args):
             "sampler":                args.sampler,
             "scheduler":              args.scheduler,
             "epoch":                  epoch,
+            "run_name":               args.run_name,
+            "feature_flags":          _feature_flags_from_args(args),
         }
 
         if val_top1 > best_top1:
@@ -518,6 +558,62 @@ def train(args):
 
     console.print(f"\n[bold green]Done.[/bold green] best val@1={best_top1:.3f}  val@3={best_top3:.3f}")
     console.print(f"Checkpoint: [cyan]{ckpt_path}[/cyan]")
+
+    # ── Auto-eval (feature comparison harness) ───────────────────────────
+    # Re-load best head and run the full eval on the cached val loader so
+    # every training run drops a comparable summary.json + top_confusions.csv
+    # under runs/<run_name>/. This is what 07_compare_runs.py reads to diff
+    # rec-by-rec impact (top1/top3/macro_f1, plus confusion-pair deltas).
+    if args.auto_eval:
+        run_name = args.run_name
+        run_dir = Path(args.eval_output_dir) / run_name
+        console.print(f"\n[bold]Auto-eval[/bold] -> [cyan]{run_dir}[/cyan]")
+
+        # Reload the BEST checkpoint (val_top1 leader) for the report so the
+        # numbers match what gets shipped, not the last epoch.
+        best_state = torch.load(ckpt_path, map_location=device, weights_only=False)
+        head.load_state_dict(best_state["head_state_dict"])
+
+        result = evaluate_head(
+            head=head,
+            val_loader=val_loader,
+            labels=labels,
+            class_set_mask=class_set_mask,
+            device=device,
+            backbone=backbone,
+            use_cache=use_cache,
+            top_confusions=args.eval_top_confusions,
+        )
+
+        summary_extra = {
+            "checkpoint":     str(ckpt_path),
+            "n_labels":       num_classes,
+            "n_sets":         num_sets,
+            "arch":           args.arch,
+            "hierarchical":   args.hierarchical,
+            "trained_at":     base_payload["trained_at"],
+            "backbone":       "dinov2_vitl14_reg",
+            "finetuned_sha":  sha256_of_file(args.finetuned_backbone),
+            "sampler":        args.sampler,
+            "scheduler":      args.scheduler,
+            "run_name":       run_name,
+            "feature_flags":  _feature_flags_from_args(args),
+            "epochs_trained": epoch,
+        }
+        per_class_path, confusions_path, summary_path = write_eval_outputs(
+            run_dir, result, summary_extra=summary_extra
+        )
+
+        console.print(
+            f"  samples={result['n_val']:,}  "
+            f"top1={result['top1']:.4f}  top3={result['top3']:.4f}  "
+            f"macro_f1={result['macro_f1']:.4f}"
+        )
+        console.print(f"  Wrote [green]{summary_path}[/green]")
+        console.print(
+            f"  Diff vs other runs: "
+            f"[cyan]python training/07_compare_runs.py {args.eval_output_dir}[/cyan]"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -597,7 +693,28 @@ def main():
     ap.add_argument("--resume", default=None, nargs="?", const="auto",
                     help="Resume from checkpoint. Bare --resume uses variant_classifier_{arch}_last.pt; "
                          "pass an explicit path to use a different file.")
+
+    # Run identification + auto-eval harness
+    ap.add_argument("--run-name", default=None,
+                    help="Name for this training run; outputs land at "
+                         "<eval-output-dir>/<run-name>/. Defaults to a flag-derived "
+                         "name like 'mlp__color=lab32__supcon=0.1__YYYYMMDDHHMMSS'.")
+    ap.add_argument("--auto-eval", dest="auto_eval", action="store_true", default=True,
+                    help="After training, run a full val-set eval and write "
+                         "summary.json + top_confusions.csv + per_class_metrics.csv "
+                         "for 07_compare_runs.py to diff against other runs (default).")
+    ap.add_argument("--no-auto-eval", dest="auto_eval", action="store_false",
+                    help="Skip the post-training eval pass.")
+    ap.add_argument("--eval-output-dir", default="./eval/runs",
+                    help="Parent directory for per-run eval outputs.")
+    ap.add_argument("--eval-top-confusions", type=int, default=200,
+                    help="How many (true,pred) confusion pairs to write. Bumped "
+                         "from step-6's 50 so the comparison harness has long enough "
+                         "tails to track regression on rare hard pairs.")
+
     args = ap.parse_args()
+    if not args.run_name:
+        args.run_name = _default_run_name(args)
 
     train(args)
 
