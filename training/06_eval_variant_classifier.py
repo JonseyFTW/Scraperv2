@@ -100,7 +100,11 @@ def evaluate(args):
         console.print(f"[cyan]Hierarchical eval:[/cyan] applying per-sample set mask")
 
     transform = build_preprocess()
-    ds = ImageDataset(val_records, transform, set_to_idx)
+    ds = ImageDataset(
+        val_records, transform, set_to_idx,
+        color_hist_kind=ckpt.get("color_hist_kind", "none"),
+        color_hist_bins=int(ckpt.get("color_hist_bins", 32)),
+    )
     loader = DataLoader(
         ds, batch_size=args.batch, shuffle=False,
         num_workers=args.workers, pin_memory=True,

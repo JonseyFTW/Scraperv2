@@ -41,6 +41,80 @@ RARE_CLASS = "__rare__"
 
 
 # ---------------------------------------------------------------------------
+# Color-histogram side channel (rec 2)
+# ---------------------------------------------------------------------------
+# DINOv2 is largely color-invariant by design — its self-supervised pretraining
+# pushes representations to ignore color shifts. For ~30-40% of our top
+# confusions, color IS the only thing that separates classes (Topps Now
+# purple↔blue, OPC red/blue border, mosaic finishes, etc.). Concatenating a
+# tiny per-image color histogram onto the DINOv2 feature gives the head the
+# explicit color signal it needs without changing the backbone.
+#
+# The histogram is computed once per image during cache-building, persisted as
+# fp16 next to the DINOv2 features, and concatenated into the feature vector
+# at training and eval time. Cache invalidation is keyed on (kind, bins) so
+# changing the setting forces a rebuild.
+
+COLOR_HIST_CHOICES = ("none", "lab32", "hsv32", "rgb32")
+
+
+def color_hist_dim(kind: str | None, bins: int) -> int:
+    """Total flattened histogram dimension. 0 when disabled."""
+    if not kind or kind == "none":
+        return 0
+    return 3 * int(bins)
+
+
+def compute_color_histogram(
+    pil_image,
+    kind: str,
+    bins: int,
+    center_crop_pct: float = 0.7,
+) -> np.ndarray:
+    """L2-normalized concatenated 3-channel histogram for a PIL image.
+
+    The crop trims the outer border of the image so background pixels (the
+    matte beyond the card edge) don't dominate the histogram — sports-card
+    crops generally have the card filling roughly the center 70%.
+
+    kind:
+        ``lab32``  perceptual color space; best for the parallel-color failure
+                   modes since L/a/b separate luminance from chroma.
+        ``hsv32``  H ranges over hue circle; useful when foil tone is the
+                   discriminator (orange vs gold).
+        ``rgb32``  raw RGB; baseline.
+        ``none``   disabled — returns a zero-length array.
+    """
+    if not kind or kind == "none":
+        return np.zeros(0, dtype=np.float32)
+
+    W, H = pil_image.size
+    if center_crop_pct < 1.0 and W > 4 and H > 4:
+        cw, ch = int(W * center_crop_pct), int(H * center_crop_pct)
+        x0, y0 = (W - cw) // 2, (H - ch) // 2
+        pil_image = pil_image.crop((x0, y0, x0 + cw, y0 + ch))
+
+    if kind == "lab32":
+        arr = np.asarray(pil_image.convert("LAB"), dtype=np.uint8)
+    elif kind == "hsv32":
+        arr = np.asarray(pil_image.convert("HSV"), dtype=np.uint8)
+    elif kind == "rgb32":
+        arr = np.asarray(pil_image.convert("RGB"), dtype=np.uint8)
+    else:
+        raise ValueError(f"Unknown color-hist kind: {kind!r}")
+
+    hists = []
+    for c in range(3):
+        h, _ = np.histogram(arr[:, :, c], bins=bins, range=(0, 256))
+        hists.append(h.astype(np.float32))
+    out = np.concatenate(hists)
+    norm = float(np.linalg.norm(out))
+    if norm > 0:
+        out /= norm
+    return out
+
+
+# ---------------------------------------------------------------------------
 # File + manifest helpers
 # ---------------------------------------------------------------------------
 
@@ -80,12 +154,28 @@ def derive_set_labels(records: list[dict]) -> tuple[list[str], dict[str, int]]:
 # ---------------------------------------------------------------------------
 
 class ImageDataset:
-    """Returns (image_tensor, label_idx, set_idx) tuples."""
+    """Returns ``(image_tensor, color_hist_or_None, label_idx, set_idx)`` tuples.
 
-    def __init__(self, records: list[dict], transform, set_to_idx: dict[str, int]):
+    ``color_hist_kind`` defaults to ``"none"`` for backwards compatibility —
+    older callers will see ``None`` in the second slot and can ignore it. The
+    step-6 eval path enables it to match a checkpoint trained with the color
+    side channel.
+    """
+
+    def __init__(
+        self,
+        records: list[dict],
+        transform,
+        set_to_idx: dict[str, int],
+        color_hist_kind: str = "none",
+        color_hist_bins: int = 32,
+    ):
         self.records = records
         self.transform = transform
         self.set_to_idx = set_to_idx
+        self.color_hist_kind = color_hist_kind or "none"
+        self.color_hist_bins = int(color_hist_bins)
+        self.color_enabled = self.color_hist_kind != "none"
 
     def __len__(self):
         return len(self.records)
@@ -99,7 +189,10 @@ class ImageDataset:
             return None
         set_slug = (rec.get("set_slug") or "").strip().lower()
         set_idx = self.set_to_idx.get(set_slug, 0)
-        return self.transform(img), int(rec["label_idx"]), int(set_idx)
+        color = None
+        if self.color_enabled:
+            color = compute_color_histogram(img, self.color_hist_kind, self.color_hist_bins)
+        return self.transform(img), color, int(rec["label_idx"]), int(set_idx)
 
 
 def collate_image_skip_none(batch):
@@ -108,9 +201,14 @@ def collate_image_skip_none(batch):
     if not batch:
         return None
     imgs     = torch.stack([b[0] for b in batch])
-    labels   = torch.tensor([b[1] for b in batch], dtype=torch.long)
-    set_idxs = torch.tensor([b[2] for b in batch], dtype=torch.long)
-    return imgs, labels, set_idxs
+    has_color = batch[0][1] is not None
+    if has_color:
+        color = torch.from_numpy(np.stack([b[1] for b in batch], axis=0)).float()
+    else:
+        color = None
+    labels   = torch.tensor([b[2] for b in batch], dtype=torch.long)
+    set_idxs = torch.tensor([b[3] for b in batch], dtype=torch.long)
+    return imgs, color, labels, set_idxs
 
 
 # ---------------------------------------------------------------------------
@@ -124,9 +222,19 @@ class CachedFeatureDataset:
     reason to re-run DINOv2 every epoch. We compute features once to disk and
     the "model" becomes a tiny Linear head on cached 1024-dim vectors — which
     turns each training epoch from hours into seconds.
+
+    When a color-histogram cache is also present (rec 2), it is concatenated
+    onto each feature vector at lookup time so the downstream head sees a
+    single ``(1024 + 3*bins)``-dim input.
     """
 
-    def __init__(self, features_path: str, labels: np.ndarray, set_idxs: np.ndarray):
+    def __init__(
+        self,
+        features_path: str,
+        labels: np.ndarray,
+        set_idxs: np.ndarray,
+        color_path: str | None = None,
+    ):
         # mmap_mode="r" keeps the 4-8GB tensor out of RAM — the OS pages it in
         # as the sampler touches random indices.
         self.features = np.load(features_path, mmap_mode="r")
@@ -134,6 +242,12 @@ class CachedFeatureDataset:
             f"cache length mismatch: features={self.features.shape[0]} "
             f"labels={len(labels)} set_idxs={len(set_idxs)}"
         )
+        self.color = np.load(color_path, mmap_mode="r") if color_path else None
+        if self.color is not None:
+            assert self.color.shape[0] == self.features.shape[0], (
+                f"color cache length {self.color.shape[0]} does not match "
+                f"feature cache length {self.features.shape[0]}"
+            )
         self.labels = labels
         self.set_idxs = set_idxs
 
@@ -141,8 +255,11 @@ class CachedFeatureDataset:
         return self.features.shape[0]
 
     def __getitem__(self, idx):
-        # Copy the row — the memmap is fp16 on disk; cast happens in collate.
+        # Copy the rows — the memmap is fp16 on disk; cast happens in collate.
         feat = np.array(self.features[idx], copy=True)
+        if self.color is not None:
+            color = np.array(self.color[idx], copy=True)
+            feat = np.concatenate([feat, color], axis=0)
         return feat, int(self.labels[idx]), int(self.set_idxs[idx])
 
 
@@ -176,6 +293,8 @@ def _expected_cache_info(
     records_train: list[dict],
     records_val: list[dict],
     finetuned_backbone: str | None,
+    color_hist_kind: str = "none",
+    color_hist_bins: int = 0,
 ) -> dict:
     return {
         "preprocess_spec":     PREPROCESS_SPEC,
@@ -183,6 +302,8 @@ def _expected_cache_info(
         "finetuned_sha":       sha256_of_file(finetuned_backbone),
         "n_train":             len(records_train),
         "n_val":               len(records_val),
+        "color_hist_kind":     color_hist_kind or "none",
+        "color_hist_bins":     int(color_hist_bins) if color_hist_kind and color_hist_kind != "none" else 0,
     }
 
 
@@ -196,35 +317,51 @@ def cache_features_if_needed(
     batch_size: int = 64,
     num_workers: int = 4,
     console=None,
-) -> tuple[Path, Path, Path]:
+    color_hist_kind: str = "none",
+    color_hist_bins: int = 32,
+) -> tuple[Path, Path, Path, Path | None, Path | None]:
     """Ensure a fp16 feature cache exists on disk; build it if not.
 
-    Returns (cache_dir, train_features_path, val_features_path).
+    Returns ``(cache_dir, train_features_path, val_features_path,
+    train_color_path, val_color_path)`` — the color paths are ``None`` when
+    ``color_hist_kind == "none"``.
 
     Layout:
-        <data_dir>/features_cache/<backbone_key>/
+        <data_dir>/features_cache/<backbone_key>__<color_key>/
             train.npy            (N_train, 1024) fp16
             val.npy              (N_val,   1024) fp16
+            train_color.npy      (N_train, 3*bins) fp16   [if color enabled]
+            val_color.npy        (N_val,   3*bins) fp16   [if color enabled]
             train_meta.npz       (labels: int64[N_train], set_idxs: int64[N_train])
             val_meta.npz
-            cache_info.json      (preprocess + backbone SHAs for invalidation)
+            cache_info.json      (preprocess + backbone SHAs + color cfg for invalidation)
     """
     import torch
     from PIL import Image
 
-    key = _cache_key(finetuned_backbone)
+    base_key = _cache_key(finetuned_backbone)
+    color_key = "color-none" if (not color_hist_kind or color_hist_kind == "none") else f"color-{color_hist_kind}-{color_hist_bins}"
+    key = f"{base_key}__{color_key}"
+    hist_dim = color_hist_dim(color_hist_kind, color_hist_bins)
     cache_dir = data_dir / "features_cache" / key
     cache_dir.mkdir(parents=True, exist_ok=True)
     train_feat = cache_dir / "train.npy"
     val_feat   = cache_dir / "val.npy"
+    train_color = cache_dir / "train_color.npy" if hist_dim else None
+    val_color   = cache_dir / "val_color.npy"   if hist_dim else None
     train_meta = cache_dir / "train_meta.npz"
     val_meta   = cache_dir / "val_meta.npz"
     info_path  = cache_dir / "cache_info.json"
 
-    expected = _expected_cache_info(records_train, records_val, finetuned_backbone)
+    expected = _expected_cache_info(
+        records_train, records_val, finetuned_backbone,
+        color_hist_kind=color_hist_kind, color_hist_bins=color_hist_bins,
+    )
 
-    if info_path.exists() and train_feat.exists() and val_feat.exists() \
-            and train_meta.exists() and val_meta.exists():
+    required_files = [train_feat, val_feat, train_meta, val_meta]
+    if hist_dim:
+        required_files += [train_color, val_color]
+    if info_path.exists() and all(p.exists() for p in required_files):
         try:
             stored = json.loads(info_path.read_text())
         except Exception:
@@ -232,7 +369,7 @@ def cache_features_if_needed(
         if stored == expected:
             if console:
                 console.print(f"[green]Feature cache hit:[/green] {cache_dir}")
-            return cache_dir, train_feat, val_feat
+            return cache_dir, train_feat, val_feat, train_color, val_color
         if console:
             console.print(f"[yellow]Feature cache stale — rebuilding {cache_dir}[/yellow]")
 
@@ -251,12 +388,18 @@ def cache_features_if_needed(
     # augmentation, keep it shape/crop/blur only — never color.
     transform = build_preprocess()
 
-    def _write_split(records, feat_path: Path, meta_path: Path, split_name: str):
+    def _write_split(records, feat_path: Path, color_path: Path | None,
+                     meta_path: Path, split_name: str):
         n = len(records)
         # memmap in "w+" mode to avoid holding 2M x 1024 fp16 = 4GB in memory.
         memmap = np.lib.format.open_memmap(
             str(feat_path), mode="w+", dtype=np.float16, shape=(n, 1024)
         )
+        color_mm = None
+        if color_path is not None and hist_dim:
+            color_mm = np.lib.format.open_memmap(
+                str(color_path), mode="w+", dtype=np.float16, shape=(n, hist_dim)
+            )
         labels   = np.zeros(n, dtype=np.int64)
         set_idxs = np.zeros(n, dtype=np.int64)
 
@@ -277,11 +420,16 @@ def cache_features_if_needed(
             while i < n:
                 chunk_records = records[i:i + batch_size]
                 tensors = []
+                color_vecs: list[np.ndarray] = []
                 idx_in_chunk = []
                 for j, rec in enumerate(chunk_records):
                     try:
                         img = Image.open(rec["image_path"]).convert("RGB")
                         tensors.append(transform(img))
+                        if color_mm is not None:
+                            color_vecs.append(
+                                compute_color_histogram(img, color_hist_kind, color_hist_bins)
+                            )
                         idx_in_chunk.append(j)
                     except Exception:
                         bad_count += 1
@@ -297,6 +445,8 @@ def cache_features_if_needed(
                     for j_local, rec_local_idx in enumerate(idx_in_chunk):
                         out_idx = i + rec_local_idx
                         memmap[out_idx] = feats_np[j_local]
+                        if color_mm is not None:
+                            color_mm[out_idx] = color_vecs[j_local].astype(np.float16)
                         labels[out_idx]   = int(chunk_records[rec_local_idx]["label_idx"])
                         set_slug = (chunk_records[rec_local_idx].get("set_slug") or "").strip().lower()
                         set_idxs[out_idx] = int(set_to_idx.get(set_slug, 0))
@@ -316,7 +466,8 @@ def cache_features_if_needed(
                 console.print(f"  [yellow]{split_name}: skipped {bad_count} unreadable images[/yellow]")
             keep = np.where(valid_mask)[0]
             if len(keep) != n:
-                # Write a compacted copy then atomically swap.
+                # Write a compacted copy then atomically swap. Repeat for the
+                # color memmap if present so the two stay row-aligned.
                 tmp = feat_path.with_suffix(".compact.npy")
                 compacted = np.lib.format.open_memmap(
                     str(tmp), mode="w+", dtype=np.float16, shape=(len(keep), 1024)
@@ -325,19 +476,33 @@ def cache_features_if_needed(
                     compacted[out_i] = memmap[src_i]
                 del compacted, memmap
                 os.replace(tmp, feat_path)
+                memmap = None
+
+                if color_mm is not None and color_path is not None:
+                    tmp_c = color_path.with_suffix(".compact.npy")
+                    compacted_c = np.lib.format.open_memmap(
+                        str(tmp_c), mode="w+", dtype=np.float16, shape=(len(keep), hist_dim)
+                    )
+                    for out_i, src_i in enumerate(keep):
+                        compacted_c[out_i] = color_mm[src_i]
+                    del compacted_c, color_mm
+                    os.replace(tmp_c, color_path)
+                    color_mm = None
+
                 labels   = labels[keep]
                 set_idxs = set_idxs[keep]
 
         memmap = None  # flush
+        color_mm = None
         np.savez(meta_path, labels=labels, set_idxs=set_idxs)
 
-    _write_split(records_train, train_feat, train_meta, "train")
-    _write_split(records_val,   val_feat,   val_meta,   "val")
+    _write_split(records_train, train_feat, train_color, train_meta, "train")
+    _write_split(records_val,   val_feat,   val_color,   val_meta,   "val")
 
     info_path.write_text(json.dumps(expected, indent=2))
     if console:
         console.print(f"[green]Feature cache ready:[/green] {cache_dir}")
-    return cache_dir, train_feat, val_feat
+    return cache_dir, train_feat, val_feat, train_color, val_color
 
 
 def load_cached_meta(meta_path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -599,12 +764,16 @@ def evaluate_head(
             if batch is None:
                 continue
             if use_cache:
+                # Cache path: feature row already includes color hist (if any)
+                # because CachedFeatureDataset concatenates at lookup time.
                 feats, gold, set_idxs = batch
                 feats = feats.to(device, non_blocking=True)
             else:
-                imgs, gold, set_idxs = batch
+                imgs, color, gold, set_idxs = batch
                 imgs = imgs.to(device, non_blocking=True)
                 feats = extract_features(backbone, imgs, device)
+                if color is not None:
+                    feats = torch.cat([feats, color.to(device, non_blocking=True)], dim=-1)
             gold = gold.to(device, non_blocking=True)
             set_idxs = set_idxs.to(device, non_blocking=True)
 

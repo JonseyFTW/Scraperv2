@@ -75,6 +75,8 @@ from variant_classifier_lib import (  # noqa: E402
     masked_cross_entropy,
     evaluate_head,
     write_eval_outputs,
+    color_hist_dim,
+    COLOR_HIST_CHOICES,
 )
 
 console = Console()
@@ -163,6 +165,8 @@ def _build_loaders_cached(
     train_features: Path,
     val_features: Path,
     args,
+    train_color: Path | None = None,
+    val_color: Path | None = None,
 ):
     """Construct DataLoaders over the fp16 feature cache."""
     import torch
@@ -171,8 +175,14 @@ def _build_loaders_cached(
     train_labels, train_set_idxs = load_cached_meta(cache_dir / "train_meta.npz")
     val_labels,   val_set_idxs   = load_cached_meta(cache_dir / "val_meta.npz")
 
-    train_ds = CachedFeatureDataset(str(train_features), train_labels, train_set_idxs)
-    val_ds   = CachedFeatureDataset(str(val_features),   val_labels,   val_set_idxs)
+    train_ds = CachedFeatureDataset(
+        str(train_features), train_labels, train_set_idxs,
+        color_path=str(train_color) if train_color else None,
+    )
+    val_ds   = CachedFeatureDataset(
+        str(val_features),   val_labels,   val_set_idxs,
+        color_path=str(val_color) if val_color else None,
+    )
 
     train_loader_kwargs = dict(
         num_workers=args.workers,
@@ -223,8 +233,14 @@ def _build_loaders_image(train_records, val_records, set_to_idx, args):
     from torch.utils.data import DataLoader
 
     transform = build_preprocess()
-    train_ds = ImageDataset(train_records, transform, set_to_idx)
-    val_ds   = ImageDataset(val_records,   transform, set_to_idx)
+    train_ds = ImageDataset(
+        train_records, transform, set_to_idx,
+        color_hist_kind=args.color_hist, color_hist_bins=args.color_hist_bins,
+    )
+    val_ds   = ImageDataset(
+        val_records,   transform, set_to_idx,
+        color_hist_kind=args.color_hist, color_hist_bins=args.color_hist_bins,
+    )
 
     if args.sampler == "set_stratified":
         set_arr = np.array([r["set_idx"] for r in train_records], dtype=np.int64)
@@ -311,9 +327,17 @@ def train(args):
     if args.cache and device != "cuda":
         console.print("[yellow]Feature caching requires CUDA — falling back to image dataset[/yellow]")
 
+    # ── Color-hist side channel sizing (rec 2) ───────────────────────────
+    hist_dim = color_hist_dim(args.color_hist, args.color_hist_bins)
+    if hist_dim:
+        console.print(
+            f"[cyan]Color-hist side channel:[/cyan] kind={args.color_hist} "
+            f"bins={args.color_hist_bins} dim={hist_dim}"
+        )
+
     backbone = None
     if use_cache:
-        _, train_feat, val_feat = cache_features_if_needed(
+        _, train_feat, val_feat, train_color, val_color = cache_features_if_needed(
             data_dir=data_dir,
             records_train=train_records,
             records_val=val_records,
@@ -323,10 +347,13 @@ def train(args):
             batch_size=args.cache_batch,
             num_workers=args.workers,
             console=console,
+            color_hist_kind=args.color_hist,
+            color_hist_bins=args.color_hist_bins,
         )
         cache_dir = train_feat.parent
         train_loader, val_loader = _build_loaders_cached(
-            cache_dir, train_feat, val_feat, args
+            cache_dir, train_feat, val_feat, args,
+            train_color=train_color, val_color=val_color,
         )
     else:
         backbone = setup_backbone(device, args.finetuned_backbone, console=console)
@@ -344,8 +371,9 @@ def train(args):
         )
 
     # ── Head + optimizer + scheduler ─────────────────────────────────────
+    head_input_dim = 1024 + hist_dim
     head = build_head(
-        args.arch, 1024, num_classes,
+        args.arch, head_input_dim, num_classes,
         hidden_dim=args.hidden_dim, dropout=args.dropout,
     ).to(device)
     optim = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -404,12 +432,16 @@ def train(args):
         """
         import torch.nn.functional as F
         if use_cache:
+            # Cache row already includes the color hist (if enabled), since
+            # CachedFeatureDataset concatenates at __getitem__.
             feats, labels_t, set_idxs_t = batch
             feats = feats.to(device, non_blocking=True)
         else:
-            imgs, labels_t, set_idxs_t = batch
+            imgs, color, labels_t, set_idxs_t = batch
             imgs = imgs.to(device, non_blocking=True)
             feats = extract_features(backbone, imgs, device)
+            if color is not None:
+                feats = torch.cat([feats, color.to(device, non_blocking=True)], dim=-1)
         if training and args.feat_dropout > 0.0:
             feats = F.dropout(feats, p=args.feat_dropout, training=True)
         labels_t   = labels_t.to(device, non_blocking=True)
@@ -509,7 +541,10 @@ def train(args):
             "feat_dropout":           args.feat_dropout,
             "weight_decay":           args.weight_decay,
             "label_smoothing":        args.label_smoothing,
-            "input_dim":              1024,
+            "input_dim":              head_input_dim,
+            "color_hist_kind":        args.color_hist,
+            "color_hist_bins":        int(args.color_hist_bins),
+            "color_hist_dim":         hist_dim,
             "preprocess":             PREPROCESS_SPEC,
             "trained_at":             datetime.now(timezone.utc).isoformat(),
             "train_samples":          len(train_records),
@@ -689,6 +724,19 @@ def main():
                     help="Train variant head with per-sample masked softmax — loss "
                          "restricted to the classes belonging to that sample's set. "
                          "Matches the inference flow: search picks set, head ranks variants.")
+
+    # Rec 2: color-histogram side channel
+    ap.add_argument("--color-hist", choices=list(COLOR_HIST_CHOICES), default="none",
+                    help="Concatenate a 3*bins-dim color histogram onto each DINOv2 "
+                         "feature so the head sees explicit color signal. DINOv2 is "
+                         "color-invariant by design, which is fatal for parallels "
+                         "where color is the only label-distinguishing feature "
+                         "(Topps Now purple/blue, OPC red/blue border, mosaic "
+                         "finishes, etc.). Recommended: lab32. Cache is keyed on "
+                         "(kind, bins) so changing this rebuilds automatically.")
+    ap.add_argument("--color-hist-bins", type=int, default=32,
+                    help="Per-channel bin count for --color-hist. Total dim = 3*bins. "
+                         "32 -> 96-dim side channel.")
 
     ap.add_argument("--resume", default=None, nargs="?", const="auto",
                     help="Resume from checkpoint. Bare --resume uses variant_classifier_{arch}_last.pt; "
