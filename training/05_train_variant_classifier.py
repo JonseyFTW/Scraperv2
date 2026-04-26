@@ -77,6 +77,9 @@ from variant_classifier_lib import (  # noqa: E402
     write_eval_outputs,
     color_hist_dim,
     COLOR_HIST_CHOICES,
+    build_projection_head,
+    supcon_within_set_loss,
+    head_forward_with_trunk,
 )
 
 console = Console()
@@ -376,7 +379,35 @@ def train(args):
         args.arch, head_input_dim, num_classes,
         hidden_dim=args.hidden_dim, dropout=args.dropout,
     ).to(device)
-    optim = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # Rec 3: SupCon projection. Hung off the head's trunk output (the pre-
+    # classifier hidden representation for --arch mlp; the input features for
+    # --arch linear, where it does nothing useful since features are frozen).
+    projection = None
+    if args.supcon_lambda > 0:
+        if args.arch == "linear":
+            console.print(
+                "[yellow]--supcon-lambda > 0 with --arch linear has no effect on the "
+                "classifier (no shared trunk above the frozen DINOv2 features). "
+                "Disabling SupCon. Use --arch mlp to enable.[/yellow]"
+            )
+            args.supcon_lambda = 0.0
+        else:
+            trunk_dim = args.hidden_dim
+            projection = build_projection_head(
+                input_dim=trunk_dim,
+                proj_dim=args.supcon_proj_dim,
+            ).to(device)
+            console.print(
+                f"[cyan]SupCon (rec 3):[/cyan] lambda={args.supcon_lambda} "
+                f"temp={args.supcon_temperature} proj_dim={args.supcon_proj_dim} "
+                f"trunk_dim={trunk_dim}"
+            )
+
+    params = list(head.parameters())
+    if projection is not None:
+        params += list(projection.parameters())
+    optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     sched = _build_scheduler(optim, args)
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     console.print(
@@ -400,6 +431,11 @@ def train(args):
             console.print(f"[cyan]Resuming from {resume_path}[/cyan]")
             state = torch.load(resume_path, map_location=device, weights_only=False)
             head.load_state_dict(state["head_state_dict"])
+            if projection is not None and state.get("projection_state_dict"):
+                try:
+                    projection.load_state_dict(state["projection_state_dict"])
+                except Exception as e:
+                    console.print(f"[yellow]Projection resume skipped ({e})[/yellow]")
             if "optimizer_state_dict" in state:
                 optim.load_state_dict(state["optimizer_state_dict"])
             if "scheduler_state_dict" in state:
@@ -422,13 +458,15 @@ def train(args):
                 f"[yellow]--resume specified but {resume_path} not found; starting fresh.[/yellow]"
             )
 
-    def _forward(batch, training: bool):
-        """Unpack a batch and return (logits, labels, set_idxs). Cache path
-        yields features directly; image path runs a DINOv2 pass first.
+    def _forward(batch, training: bool, want_trunk: bool = False):
+        """Unpack a batch and return (logits, labels, set_idxs[, trunk]).
 
         ``feat_dropout`` applies stochastic feature dropout before the head —
         cheap feature-space regularization when image augmentation isn't an
         option (cached features are a single fixed view per image).
+
+        When ``want_trunk`` is True, the head's pre-classifier representation
+        is also returned so auxiliary losses (SupCon) can attach to it.
         """
         import torch.nn.functional as F
         if use_cache:
@@ -446,6 +484,9 @@ def train(args):
             feats = F.dropout(feats, p=args.feat_dropout, training=True)
         labels_t   = labels_t.to(device, non_blocking=True)
         set_idxs_t = set_idxs_t.to(device, non_blocking=True)
+        if want_trunk:
+            logits, trunk = head_forward_with_trunk(head, feats)
+            return logits, labels_t, set_idxs_t, trunk
         return head(feats), labels_t, set_idxs_t
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -463,11 +504,18 @@ def train(args):
             TimeRemainingColumn(),
         ) as progress:
             task = progress.add_task("train", total=len(train_loader), loss=0.0)
+            running_supcon_loss = 0.0
             for batch in train_loader:
                 if batch is None:
                     progress.advance(task); continue
 
-                logits, labels_t, set_idxs_t = _forward(batch, training=True)
+                if args.supcon_lambda > 0:
+                    logits, labels_t, set_idxs_t, trunk = _forward(
+                        batch, training=True, want_trunk=True
+                    )
+                else:
+                    logits, labels_t, set_idxs_t = _forward(batch, training=True)
+                    trunk = None
 
                 if args.hierarchical:
                     loss = masked_cross_entropy(
@@ -482,6 +530,18 @@ def train(args):
                 else:
                     loss = criterion(logits, labels_t)
                     pred = logits.argmax(-1)
+
+                # Rec 3: same-set SupCon. Anchors = batch elements; positives =
+                # same class; candidates restricted to same-set siblings.
+                if projection is not None and trunk is not None:
+                    import torch.nn.functional as F_
+                    z = projection(trunk)
+                    z = F_.normalize(z, dim=-1)
+                    supcon = supcon_within_set_loss(
+                        z, labels_t, set_idxs_t, temperature=args.supcon_temperature
+                    )
+                    loss = loss + args.supcon_lambda * supcon
+                    running_supcon_loss += float(supcon.detach()) * labels_t.size(0)
 
                 optim.zero_grad()
                 loss.backward()
@@ -498,6 +558,7 @@ def train(args):
         sched.step()
         train_loss = running_loss / max(n_seen, 1)
         train_top1 = n_correct / max(n_seen, 1)
+        train_supcon = running_supcon_loss / max(n_seen, 1) if projection is not None else None
 
         # ── Eval ─────────────────────────────────────────────────────────
         head.eval()
@@ -522,8 +583,9 @@ def train(args):
         val_top1 = v_top1 / max(v_seen, 1)
         val_top3 = v_top3 / max(v_seen, 1)
         dt = time.time() - t0
+        supcon_msg = f"  supcon {train_supcon:.4f}" if train_supcon is not None else ""
         console.print(
-            f"  epoch {epoch:>2d}  loss {train_loss:.4f}  "
+            f"  epoch {epoch:>2d}  loss {train_loss:.4f}{supcon_msg}  "
             f"train@1 {train_top1:.3f}  val@1 {val_top1:.3f}  val@3 {val_top3:.3f}  ({dt:.0f}s)"
         )
 
@@ -545,6 +607,10 @@ def train(args):
             "color_hist_kind":        args.color_hist,
             "color_hist_bins":        int(args.color_hist_bins),
             "color_hist_dim":         hist_dim,
+            "supcon_lambda":          float(args.supcon_lambda),
+            "supcon_temperature":     float(args.supcon_temperature),
+            "supcon_proj_dim":        int(args.supcon_proj_dim),
+            "projection_state_dict":  (projection.state_dict() if projection is not None else None),
             "preprocess":             PREPROCESS_SPEC,
             "trained_at":             datetime.now(timezone.utc).isoformat(),
             "train_samples":          len(train_records),
@@ -737,6 +803,18 @@ def main():
     ap.add_argument("--color-hist-bins", type=int, default=32,
                     help="Per-channel bin count for --color-hist. Total dim = 3*bins. "
                          "32 -> 96-dim side channel.")
+
+    # Rec 3: pairwise contrastive (SupCon) within-set
+    ap.add_argument("--supcon-lambda", type=float, default=0.0,
+                    help="Weight on the supervised-contrastive auxiliary loss "
+                         "(rec 3). Loss is restricted to same-set candidates so the "
+                         "gradient pulls sibling parallels apart in the projection "
+                         "space. 0 disables. Try 0.1–0.5 with --arch mlp; useless "
+                         "with --arch linear (no shared trunk).")
+    ap.add_argument("--supcon-temperature", type=float, default=0.1,
+                    help="SupCon temperature τ. Lower = harder.")
+    ap.add_argument("--supcon-proj-dim", type=int, default=128,
+                    help="Output dim of the SupCon projection head.")
 
     ap.add_argument("--resume", default=None, nargs="?", const="auto",
                     help="Resume from checkpoint. Bare --resume uses variant_classifier_{arch}_last.pt; "

@@ -612,6 +612,112 @@ def build_head(arch: str, input_dim: int, num_classes: int,
     raise ValueError(f"Unknown arch: {arch}")
 
 
+def head_forward_with_trunk(head, x):
+    """Forward through ``head`` and return ``(logits, trunk_features)``.
+
+    The "trunk" is the input to the head's final ``Linear`` layer. Auxiliary
+    heads (SupCon projection — rec 3, foil aux — rec 4) hang off this trunk so
+    their gradients flow through the same shared layers as the classifier.
+
+    For ``nn.Linear`` (the --arch linear case) there is no trunk — gradients
+    from auxiliary losses can't influence the classifier. Caller is expected
+    to short-circuit auxiliary losses in that case.
+    """
+    import torch.nn as nn
+    if isinstance(head, nn.Linear):
+        return head(x), x
+    # nn.Sequential MLP: pass through every layer except the final Linear, then
+    # apply the final layer separately so we can return the pre-classifier
+    # representation as the trunk output.
+    layers = list(head)
+    trunk = x
+    for layer in layers[:-1]:
+        trunk = layer(trunk)
+    logits = layers[-1](trunk)
+    return logits, trunk
+
+
+# ---------------------------------------------------------------------------
+# Pairwise contrastive (rec 3): SupCon with same-set candidate masking
+# ---------------------------------------------------------------------------
+# DINOv2 + CE alone collapses sibling parallels (e.g. Topps Now purple vs blue)
+# into the same neighborhood because the visual difference is tiny and the
+# softmax has no incentive to push them further apart than "different argmax".
+# A supervised contrastive loss restricted to within-set pairs explicitly pulls
+# same-class samples together and pushes same-set siblings apart — exactly the
+# fine-grained gradient signal these confusions need.
+#
+# We piggyback on the existing set_stratified sampler: each batch already
+# contains K sets x N variants per set, so within-set candidates are abundant.
+
+class ProjectionHead:
+    """Two-layer MLP projection used for SupCon. Output is L2-normalized.
+
+    Defined as a factory function rather than a torch.nn.Module subclass to
+    avoid importing torch at module import time (other lib functions defer
+    that). Use ``build_projection_head`` below.
+    """
+    pass
+
+
+def build_projection_head(input_dim: int, proj_dim: int = 128,
+                          hidden_dim: int | None = None, dropout: float = 0.0):
+    import torch.nn as nn
+    hd = hidden_dim or input_dim
+    layers = [nn.Linear(input_dim, hd), nn.GELU()]
+    if dropout > 0:
+        layers.append(nn.Dropout(dropout))
+    layers.append(nn.Linear(hd, proj_dim))
+    return nn.Sequential(*layers)
+
+
+def supcon_within_set_loss(z, labels, set_idxs, temperature: float = 0.1):
+    """Supervised contrastive loss with same-set candidate masking.
+
+    For each anchor i:
+        candidates = j s.t. set_idxs[j] == set_idxs[i] and j != i
+        positives  = j s.t. labels[j]   == labels[i]   and j is a candidate
+        loss_i     = -(1/|P|) Σ_p log( exp(sim_ip/τ) / Σ_c exp(sim_ic/τ) )
+
+    Anchors with zero positives in their batch are skipped (they happen when a
+    rare class lands in a batch with no siblings).
+
+    ``z`` MUST already be L2-normalized for the dot-product to be a cosine
+    similarity. ``ProjectionHead`` handles that for the SupCon pathway.
+
+    Returns 0 (with grad enabled) when no anchor has a positive — keeps the
+    optimizer happy on degenerate batches.
+    """
+    import torch
+
+    B = z.size(0)
+    if B < 2:
+        return torch.zeros((), device=z.device, dtype=z.dtype, requires_grad=True)
+
+    sim = (z @ z.t()) / float(temperature)
+
+    self_mask = torch.eye(B, dtype=torch.bool, device=z.device)
+    same_set  = set_idxs.unsqueeze(0) == set_idxs.unsqueeze(1)
+    cand_mask = same_set & ~self_mask
+    same_cls  = labels.unsqueeze(0) == labels.unsqueeze(1)
+    pos_mask  = same_cls & cand_mask
+
+    has_pos = pos_mask.any(dim=-1)
+    if not has_pos.any():
+        return torch.zeros((), device=z.device, dtype=z.dtype, requires_grad=True)
+
+    # logsumexp over candidates only — masked positions contribute nothing.
+    sim_for_lse = sim.masked_fill(~cand_mask, float("-inf"))
+    log_denom = torch.logsumexp(sim_for_lse, dim=-1)  # (B,)
+
+    # log P(j | i) = sim[i,j] - log_denom[i] for j in candidate set.
+    log_prob = sim - log_denom.unsqueeze(-1)
+
+    pos_count = pos_mask.float().sum(dim=-1).clamp(min=1.0)
+    per_anchor_loss = -(log_prob * pos_mask.float()).sum(dim=-1) / pos_count
+    return per_anchor_loss[has_pos].mean()
+
+
 def setup_backbone(device, finetuned_path: str | None, console=None):
     import torch
     if console:
