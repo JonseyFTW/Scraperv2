@@ -44,6 +44,25 @@ VARIANT_WEIGHTS_PATH = os.environ.get(
     "VARIANT_CLASSIFIER_WEIGHTS", "/runpod-volume/variant_classifier.pt"
 )
 
+# --- Color-ROI disambiguator (rec 6) ----------------------------------------
+# Loaded lazily from a JSON produced by training/08_train_color_roi.py. When
+# present, classify_variant uses a deterministic LAB-distance classifier on a
+# per-set ROI to override the variant MLP for color-swap-only sets (Topps
+# Heritage borders, OPC borders, Topps Day ribbons, Donruss press proof,
+# Topps Now color foils, etc.). The MLP fundamentally can't win against
+# DINOv2's color invariance for these — see the rec 6 comment in
+# training/color_roi_lib.py for the full rationale.
+#
+# IMPORTANT: changes here only take effect after rebuilding & redeploying the
+# Docker image (CLAUDE.md: "rebuild Docker image in C:\\Scripts\\CardScanner\\
+# dinov2-service\\, push to GHCR, trigger new release in RunPod dashboard").
+COLOR_ROI_REFERENCES_PATH = os.environ.get(
+    "COLOR_ROI_REFERENCES", "/runpod-volume/color_roi_references.json"
+)
+COLOR_ROI_MARGIN = float(os.environ.get("COLOR_ROI_MARGIN", "4.0"))
+_color_roi_references: dict | None = None
+_color_roi_load_error: str | None = None
+
 # --- Global state (loaded once on cold start) ---
 model = None
 transform = None
@@ -262,6 +281,35 @@ def _build_variant_head(arch: str, input_dim: int, num_classes: int,
             nn.Linear(hidden_dim, num_classes),
         )
     raise ValueError(f"Unknown variant arch: {arch}")
+
+
+def _load_color_roi_references():
+    """Lazy-load the per-set color-ROI reference table (rec 6).
+
+    The JSON layout is produced by ``training/08_train_color_roi.py``:
+        {"references": {set_slug: {variant: [L,a,b], ...}, ...}, ...}
+
+    Returns the dict on success, None when the file isn't present (handler
+    falls back to MLP-only behaviour). Stamps any load error in the global
+    so /classify_variant responses can surface it.
+    """
+    global _color_roi_references, _color_roi_load_error
+    if _color_roi_references is not None or _color_roi_load_error is not None:
+        return _color_roi_references
+    if not os.path.exists(COLOR_ROI_REFERENCES_PATH):
+        _color_roi_load_error = f"not found: {COLOR_ROI_REFERENCES_PATH}"
+        return None
+    try:
+        with open(COLOR_ROI_REFERENCES_PATH) as f:
+            payload = json.load(f)
+        _color_roi_references = payload.get("references") or {}
+        print(f"[color-roi] loaded {len(_color_roi_references)} set references "
+              f"from {COLOR_ROI_REFERENCES_PATH}")
+        return _color_roi_references
+    except Exception as e:
+        _color_roi_load_error = f"{type(e).__name__}: {e}"
+        _color_roi_references = None
+        return None
 
 
 def load_variant_classifier():
@@ -526,13 +574,91 @@ def handler(event):
             return {"error": "No matching labels in scores"}
 
         top = max(scores, key=scores.get)
+        mlp_top = top  # remember pre-override pick for inspection in the response
+
+        # Rec 6: color-ROI override for color-swap-only sets. Disabled when no
+        # references JSON has been deployed (default), or when the requested
+        # set isn't registered, or when the LAB-distance classifier isn't
+        # confident. See training/color_roi_lib.py for the registry and
+        # training/08_train_color_roi.py for building the references file.
+        color_roi_used = False
+        color_roi_info: dict | None = None
+        roi_refs = _load_color_roi_references()
+        if roi_refs and set_slug:
+            set_refs = roi_refs.get(set_slug)
+            if set_refs:
+                # Inline minimal LAB classifier — keeps the handler self-
+                # contained so the Docker image doesn't need training/.
+                roi_cfg = {
+                    # Default ROI fallback if not stamped into the JSON.
+                    "roi": (0.15, 0.15, 0.85, 0.85),
+                }
+                # Pull the stored ROI from the references JSON if present.
+                stored_registry = (roi_refs.get if isinstance(roi_refs, dict) else None)
+                # We didn't pass the registry through the bare references dict,
+                # so re-read directly from the on-disk payload (cheap; cached
+                # by the OS). This keeps the handler inert if the JSON only
+                # has references and no registry block.
+                try:
+                    with open(COLOR_ROI_REFERENCES_PATH) as _f:
+                        _payload = json.load(_f)
+                    _registry = _payload.get("registry") or {}
+                    if set_slug in _registry and "roi" in _registry[set_slug]:
+                        roi_cfg["roi"] = tuple(_registry[set_slug]["roi"])
+                except Exception:
+                    pass
+
+                W, H = img.size
+                rx0, ry0, rx1, ry1 = roi_cfg["roi"]
+                cx0 = max(0, int(rx0 * W))
+                cy0 = max(0, int(ry0 * H))
+                cx1 = min(W, int(rx1 * W))
+                cy1 = min(H, int(ry1 * H))
+                if cx1 > cx0 and cy1 > cy0:
+                    crop = img.crop((cx0, cy0, cx1, cy1)).convert("LAB")
+                    arr = np.asarray(crop, dtype=np.float32)
+                    query_lab = arr.reshape(-1, 3).mean(axis=0)
+
+                    distances: dict[str, float] = {}
+                    for variant, ref in set_refs.items():
+                        # Restrict to candidate_labels intersection so callers
+                        # who pass an explicit shortlist still get respected.
+                        if candidate_labels:
+                            full_label = f"{set_slug}::{variant}"
+                            if full_label not in candidate_labels and variant not in candidate_labels:
+                                continue
+                        ref_arr = np.asarray(ref, dtype=np.float32)
+                        distances[variant] = float(np.linalg.norm(query_lab - ref_arr))
+
+                    if len(distances) >= 2:
+                        sorted_vals = sorted(distances.values())
+                        best_d   = sorted_vals[0]
+                        second_d = sorted_vals[1]
+                        if (second_d - best_d) >= COLOR_ROI_MARGIN:
+                            best_variant = min(distances, key=distances.get)
+                            best_label = f"{set_slug}::{best_variant}"
+                            if best_label in scores:
+                                top = best_label
+                                color_roi_used = True
+                                color_roi_info = {
+                                    "best": best_variant,
+                                    "best_distance":   round(best_d, 3),
+                                    "second_distance": round(second_d, 3),
+                                    "margin":          COLOR_ROI_MARGIN,
+                                    "all_distances":   {k: round(v, 3) for k, v in distances.items()},
+                                }
+
         elapsed_ms = (time.monotonic() - start) * 1000
-        return {
+        response: dict = {
             "scores":       scores,
             "top":          top,
             "top_score":    scores[top],
             "inference_ms": round(elapsed_ms, 1),
         }
+        if color_roi_used:
+            response["mlp_top"]    = mlp_top
+            response["color_roi"]  = color_roi_info
+        return response
 
     if action == "upsert":
         ids = input_data.get("ids")
