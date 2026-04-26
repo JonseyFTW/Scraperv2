@@ -718,6 +718,102 @@ def supcon_within_set_loss(z, labels, set_idxs, temperature: float = 0.1):
     return per_anchor_loss[has_pos].mean()
 
 
+# ---------------------------------------------------------------------------
+# Foil-tone auxiliary head (rec 4)
+# ---------------------------------------------------------------------------
+# Foil and refractor tones (gold/orange/blue/red/holo/shimmer/etc.) are
+# derivable from the variant label string. We hang a tiny CE aux head off the
+# shared MLP trunk that predicts the foil tone, and mix it into the loss with
+# --foil-aux-lambda. This forces the trunk to encode foil tone explicitly,
+# which is a much weaker signal than the per-class label and so survives in
+# the feature space rather than being lost to one-hot collapse.
+
+# Closed canonical taxonomy. Order matters only for output stability — at
+# train time we index class -> tone via this list, and the same list is
+# stamped into the checkpoint so the aux head's output column meanings are
+# reproducible.
+FOIL_TONES = [
+    "none",        # no foil/refractor keyword detected (base, border-color-only, mini, etc.)
+    "gold",
+    "rainbow",
+    "silver",
+    "red",
+    "orange",
+    "yellow",
+    "green",
+    "blue",
+    "purple",
+    "pink",
+    "aqua",
+    "black",
+    "white",
+    "negative",
+    "holo",        # "holofoil" / "hologram" / "holo blue" — generic holo
+    "mosaic",
+    "wave",
+    "shimmer",
+    "refractor",   # "refractor" / "prizm" with no color qualifier
+    "ice",
+    "die_cut",
+]
+
+
+# Color tokens are checked before texture tokens so "blue refractor" -> "blue"
+# rather than "refractor". The first match wins.
+import re as _re
+_FOIL_KEYWORD_RULES = [
+    (_re.compile(r"\bgold\b"),                  "gold"),
+    (_re.compile(r"\brainbow\b"),               "rainbow"),
+    (_re.compile(r"\bsilver\b"),                "silver"),
+    (_re.compile(r"\bred\b"),                   "red"),
+    (_re.compile(r"\borange\b"),                "orange"),
+    (_re.compile(r"\b(yellow|canary)\b"),       "yellow"),
+    (_re.compile(r"\bgreen\b"),                 "green"),
+    (_re.compile(r"\bblue\b"),                  "blue"),
+    (_re.compile(r"\b(purple|amethyst)\b"),     "purple"),
+    (_re.compile(r"\b(pink|fuchsia)\b"),        "pink"),
+    (_re.compile(r"\b(aqua|teal)\b"),           "aqua"),
+    (_re.compile(r"\bblack\b"),                 "black"),
+    (_re.compile(r"\bwhite\b"),                 "white"),
+    (_re.compile(r"\bnegative\b"),              "negative"),
+    (_re.compile(r"\b(holo|hologram|holofoil)\b"), "holo"),
+    (_re.compile(r"\bmosaic\b"),                "mosaic"),
+    (_re.compile(r"\bwave\b"),                  "wave"),
+    (_re.compile(r"\bshimmer\b"),               "shimmer"),
+    (_re.compile(r"\b(refractor|prizm)\b"),     "refractor"),
+    (_re.compile(r"\bice\b"),                   "ice"),
+    (_re.compile(r"\b(die cut|die-cut)\b"),     "die_cut"),
+]
+
+
+def parse_foil_tone(variant_label: str) -> str:
+    """Map a free-text variant label to one of FOIL_TONES."""
+    if not variant_label:
+        return "none"
+    s = variant_label.lower()
+    for pat, tone in _FOIL_KEYWORD_RULES:
+        if pat.search(s):
+            return tone
+    return "none"
+
+
+def build_class_to_foil_tone(labels: list[str]) -> np.ndarray:
+    """For each class index, return the corresponding foil-tone index.
+
+    ``labels`` are full class keys (``<set>::<variant>``). ``__rare__`` and
+    classes without a foil-tone keyword are mapped to ``none``.
+    """
+    tone_to_idx = {t: i for i, t in enumerate(FOIL_TONES)}
+    out = np.zeros(len(labels), dtype=np.int64)
+    for i, label in enumerate(labels):
+        if label == RARE_CLASS:
+            out[i] = tone_to_idx["none"]
+            continue
+        variant = label.split("::", 1)[1] if "::" in label else label
+        out[i] = tone_to_idx[parse_foil_tone(variant)]
+    return out
+
+
 def setup_backbone(device, finetuned_path: str | None, console=None):
     import torch
     if console:

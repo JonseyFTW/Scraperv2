@@ -80,6 +80,8 @@ from variant_classifier_lib import (  # noqa: E402
     build_projection_head,
     supcon_within_set_loss,
     head_forward_with_trunk,
+    FOIL_TONES,
+    build_class_to_foil_tone,
 )
 
 console = Console()
@@ -404,9 +406,35 @@ def train(args):
                 f"trunk_dim={trunk_dim}"
             )
 
+    # Rec 4: foil-tone auxiliary head. Trains the trunk to encode foil tone
+    # explicitly (gold/orange/blue/red/holo/shimmer/...). Same trunk-sharing
+    # constraint as SupCon — only useful with --arch mlp.
+    foil_aux = None
+    class_to_foil_tone_t = None
+    if args.foil_aux_lambda > 0:
+        if args.arch == "linear":
+            console.print(
+                "[yellow]--foil-aux-lambda > 0 with --arch linear has no effect on the "
+                "classifier (no shared trunk above frozen DINOv2 features). "
+                "Disabling foil aux. Use --arch mlp to enable.[/yellow]"
+            )
+            args.foil_aux_lambda = 0.0
+        else:
+            cls_tone_np = build_class_to_foil_tone(labels)
+            class_to_foil_tone_t = torch.from_numpy(cls_tone_np).to(device)
+            num_tones = len(FOIL_TONES)
+            foil_aux = nn.Linear(args.hidden_dim, num_tones).to(device)
+            tone_counts = np.bincount(cls_tone_np, minlength=num_tones)
+            console.print(
+                f"[cyan]Foil aux head (rec 4):[/cyan] lambda={args.foil_aux_lambda} "
+                f"num_tones={num_tones}  none-bucket={tone_counts[0]}/{len(labels)} classes"
+            )
+
     params = list(head.parameters())
     if projection is not None:
         params += list(projection.parameters())
+    if foil_aux is not None:
+        params += list(foil_aux.parameters())
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     sched = _build_scheduler(optim, args)
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
@@ -436,6 +464,11 @@ def train(args):
                     projection.load_state_dict(state["projection_state_dict"])
                 except Exception as e:
                     console.print(f"[yellow]Projection resume skipped ({e})[/yellow]")
+            if foil_aux is not None and state.get("foil_aux_state_dict"):
+                try:
+                    foil_aux.load_state_dict(state["foil_aux_state_dict"])
+                except Exception as e:
+                    console.print(f"[yellow]Foil aux resume skipped ({e})[/yellow]")
             if "optimizer_state_dict" in state:
                 optim.load_state_dict(state["optimizer_state_dict"])
             if "scheduler_state_dict" in state:
@@ -505,11 +538,13 @@ def train(args):
         ) as progress:
             task = progress.add_task("train", total=len(train_loader), loss=0.0)
             running_supcon_loss = 0.0
+            running_foil_loss = 0.0
             for batch in train_loader:
                 if batch is None:
                     progress.advance(task); continue
 
-                if args.supcon_lambda > 0:
+                want_trunk = (args.supcon_lambda > 0) or (args.foil_aux_lambda > 0)
+                if want_trunk:
                     logits, labels_t, set_idxs_t, trunk = _forward(
                         batch, training=True, want_trunk=True
                     )
@@ -543,6 +578,17 @@ def train(args):
                     loss = loss + args.supcon_lambda * supcon
                     running_supcon_loss += float(supcon.detach()) * labels_t.size(0)
 
+                # Rec 4: foil-tone aux CE. Forces the trunk to encode foil
+                # tone explicitly so gold/orange/blue/red/holo/shimmer don't
+                # collapse into the same neighborhood.
+                if foil_aux is not None and trunk is not None:
+                    import torch.nn.functional as F_
+                    tone_targets = class_to_foil_tone_t[labels_t]
+                    tone_logits = foil_aux(trunk)
+                    aux_loss = F_.cross_entropy(tone_logits, tone_targets)
+                    loss = loss + args.foil_aux_lambda * aux_loss
+                    running_foil_loss += float(aux_loss.detach()) * labels_t.size(0)
+
                 optim.zero_grad()
                 loss.backward()
                 optim.step()
@@ -559,6 +605,7 @@ def train(args):
         train_loss = running_loss / max(n_seen, 1)
         train_top1 = n_correct / max(n_seen, 1)
         train_supcon = running_supcon_loss / max(n_seen, 1) if projection is not None else None
+        train_foil   = running_foil_loss   / max(n_seen, 1) if foil_aux   is not None else None
 
         # ── Eval ─────────────────────────────────────────────────────────
         head.eval()
@@ -584,8 +631,9 @@ def train(args):
         val_top3 = v_top3 / max(v_seen, 1)
         dt = time.time() - t0
         supcon_msg = f"  supcon {train_supcon:.4f}" if train_supcon is not None else ""
+        foil_msg   = f"  foil_ce {train_foil:.4f}"   if train_foil   is not None else ""
         console.print(
-            f"  epoch {epoch:>2d}  loss {train_loss:.4f}{supcon_msg}  "
+            f"  epoch {epoch:>2d}  loss {train_loss:.4f}{supcon_msg}{foil_msg}  "
             f"train@1 {train_top1:.3f}  val@1 {val_top1:.3f}  val@3 {val_top3:.3f}  ({dt:.0f}s)"
         )
 
@@ -611,6 +659,9 @@ def train(args):
             "supcon_temperature":     float(args.supcon_temperature),
             "supcon_proj_dim":        int(args.supcon_proj_dim),
             "projection_state_dict":  (projection.state_dict() if projection is not None else None),
+            "foil_aux_lambda":        float(args.foil_aux_lambda),
+            "foil_tones":             list(FOIL_TONES) if foil_aux is not None else None,
+            "foil_aux_state_dict":    (foil_aux.state_dict() if foil_aux is not None else None),
             "preprocess":             PREPROCESS_SPEC,
             "trained_at":             datetime.now(timezone.utc).isoformat(),
             "train_samples":          len(train_records),
@@ -815,6 +866,14 @@ def main():
                     help="SupCon temperature τ. Lower = harder.")
     ap.add_argument("--supcon-proj-dim", type=int, default=128,
                     help="Output dim of the SupCon projection head.")
+
+    # Rec 4: foil-tone auxiliary head
+    ap.add_argument("--foil-aux-lambda", type=float, default=0.0,
+                    help="Weight on the foil-tone auxiliary CE loss (rec 4). The "
+                         "tone for each class is parsed from its variant label "
+                         "(gold/orange/blue/red/holo/shimmer/...). Forces the trunk "
+                         "to encode foil tone explicitly so it doesn't get lost to "
+                         "one-hot collapse. 0 disables. Try 0.1–0.3 with --arch mlp.")
 
     ap.add_argument("--resume", default=None, nargs="?", const="auto",
                     help="Resume from checkpoint. Bare --resume uses variant_classifier_{arch}_last.pt; "
