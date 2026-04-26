@@ -73,9 +73,55 @@ from variant_classifier_lib import (  # noqa: E402
     extract_features,
     build_set_class_mask,
     masked_cross_entropy,
+    evaluate_head,
+    write_eval_outputs,
+    color_hist_dim,
+    COLOR_HIST_CHOICES,
+    build_projection_head,
+    supcon_within_set_loss,
+    head_forward_with_trunk,
+    FOIL_TONES,
+    build_class_to_foil_tone,
+    edge_profile_dim,
 )
 
 console = Console()
+
+
+# ---------------------------------------------------------------------------
+# Feature-flag stamping
+# ---------------------------------------------------------------------------
+
+def _feature_flags_from_args(args) -> dict:
+    """Snapshot of which experimental recs are enabled for this run.
+
+    Stamped into the checkpoint and into runs/<run_name>/summary.json so the
+    07_compare_runs.py harness can label the diff columns with the active rec.
+    """
+    return {
+        "color_hist":      getattr(args, "color_hist",      "none"),
+        "supcon_lambda":   float(getattr(args, "supcon_lambda",   0.0)),
+        "foil_aux_lambda": float(getattr(args, "foil_aux_lambda", 0.0)),
+        "edge_channel":    bool(getattr(args, "edge_channel",    False)),
+    }
+
+
+def _default_run_name(args) -> str:
+    """Build a stable, descriptive run name from the active feature flags.
+
+    Format:   <arch>[__color=lab32][__supcon=0.1][__foil=0.5][__edge]__YYYYMMDDHHMMSS
+    """
+    parts = [args.arch]
+    if getattr(args, "color_hist", "none") not in (None, "none"):
+        parts.append(f"color={args.color_hist}")
+    if float(getattr(args, "supcon_lambda", 0.0)) > 0:
+        parts.append(f"supcon={args.supcon_lambda}")
+    if float(getattr(args, "foil_aux_lambda", 0.0)) > 0:
+        parts.append(f"foil={args.foil_aux_lambda}")
+    if getattr(args, "edge_channel", False):
+        parts.append("edge")
+    parts.append(datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"))
+    return "__".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +171,10 @@ def _build_loaders_cached(
     train_features: Path,
     val_features: Path,
     args,
+    train_color: Path | None = None,
+    val_color: Path | None = None,
+    train_edge: Path | None = None,
+    val_edge: Path | None = None,
 ):
     """Construct DataLoaders over the fp16 feature cache."""
     import torch
@@ -133,8 +183,16 @@ def _build_loaders_cached(
     train_labels, train_set_idxs = load_cached_meta(cache_dir / "train_meta.npz")
     val_labels,   val_set_idxs   = load_cached_meta(cache_dir / "val_meta.npz")
 
-    train_ds = CachedFeatureDataset(str(train_features), train_labels, train_set_idxs)
-    val_ds   = CachedFeatureDataset(str(val_features),   val_labels,   val_set_idxs)
+    train_ds = CachedFeatureDataset(
+        str(train_features), train_labels, train_set_idxs,
+        color_path=str(train_color) if train_color else None,
+        edge_path=str(train_edge)  if train_edge  else None,
+    )
+    val_ds   = CachedFeatureDataset(
+        str(val_features),   val_labels,   val_set_idxs,
+        color_path=str(val_color) if val_color else None,
+        edge_path=str(val_edge)  if val_edge  else None,
+    )
 
     train_loader_kwargs = dict(
         num_workers=args.workers,
@@ -185,8 +243,16 @@ def _build_loaders_image(train_records, val_records, set_to_idx, args):
     from torch.utils.data import DataLoader
 
     transform = build_preprocess()
-    train_ds = ImageDataset(train_records, transform, set_to_idx)
-    val_ds   = ImageDataset(val_records,   transform, set_to_idx)
+    train_ds = ImageDataset(
+        train_records, transform, set_to_idx,
+        color_hist_kind=args.color_hist, color_hist_bins=args.color_hist_bins,
+        edge_channel=args.edge_channel,
+    )
+    val_ds   = ImageDataset(
+        val_records,   transform, set_to_idx,
+        color_hist_kind=args.color_hist, color_hist_bins=args.color_hist_bins,
+        edge_channel=args.edge_channel,
+    )
 
     if args.sampler == "set_stratified":
         set_arr = np.array([r["set_idx"] for r in train_records], dtype=np.int64)
@@ -273,9 +339,20 @@ def train(args):
     if args.cache and device != "cuda":
         console.print("[yellow]Feature caching requires CUDA — falling back to image dataset[/yellow]")
 
+    # ── Side channels: color hist (rec 2) + edge profile (rec 5) ─────────
+    hist_dim = color_hist_dim(args.color_hist, args.color_hist_bins)
+    edge_dim = edge_profile_dim(args.edge_channel)
+    if hist_dim:
+        console.print(
+            f"[cyan]Color-hist side channel:[/cyan] kind={args.color_hist} "
+            f"bins={args.color_hist_bins} dim={hist_dim}"
+        )
+    if edge_dim:
+        console.print(f"[cyan]Edge profile (rec 5):[/cyan] dim={edge_dim}")
+
     backbone = None
     if use_cache:
-        _, train_feat, val_feat = cache_features_if_needed(
+        _, train_feat, val_feat, train_color, val_color, train_edge, val_edge = cache_features_if_needed(
             data_dir=data_dir,
             records_train=train_records,
             records_val=val_records,
@@ -285,10 +362,15 @@ def train(args):
             batch_size=args.cache_batch,
             num_workers=args.workers,
             console=console,
+            color_hist_kind=args.color_hist,
+            color_hist_bins=args.color_hist_bins,
+            edge_channel=args.edge_channel,
         )
         cache_dir = train_feat.parent
         train_loader, val_loader = _build_loaders_cached(
-            cache_dir, train_feat, val_feat, args
+            cache_dir, train_feat, val_feat, args,
+            train_color=train_color, val_color=val_color,
+            train_edge=train_edge,   val_edge=val_edge,
         )
     else:
         backbone = setup_backbone(device, args.finetuned_backbone, console=console)
@@ -306,11 +388,66 @@ def train(args):
         )
 
     # ── Head + optimizer + scheduler ─────────────────────────────────────
+    head_input_dim = 1024 + hist_dim + edge_dim
     head = build_head(
-        args.arch, 1024, num_classes,
+        args.arch, head_input_dim, num_classes,
         hidden_dim=args.hidden_dim, dropout=args.dropout,
     ).to(device)
-    optim = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # Rec 3: SupCon projection. Hung off the head's trunk output (the pre-
+    # classifier hidden representation for --arch mlp; the input features for
+    # --arch linear, where it does nothing useful since features are frozen).
+    projection = None
+    if args.supcon_lambda > 0:
+        if args.arch == "linear":
+            console.print(
+                "[yellow]--supcon-lambda > 0 with --arch linear has no effect on the "
+                "classifier (no shared trunk above the frozen DINOv2 features). "
+                "Disabling SupCon. Use --arch mlp to enable.[/yellow]"
+            )
+            args.supcon_lambda = 0.0
+        else:
+            trunk_dim = args.hidden_dim
+            projection = build_projection_head(
+                input_dim=trunk_dim,
+                proj_dim=args.supcon_proj_dim,
+            ).to(device)
+            console.print(
+                f"[cyan]SupCon (rec 3):[/cyan] lambda={args.supcon_lambda} "
+                f"temp={args.supcon_temperature} proj_dim={args.supcon_proj_dim} "
+                f"trunk_dim={trunk_dim}"
+            )
+
+    # Rec 4: foil-tone auxiliary head. Trains the trunk to encode foil tone
+    # explicitly (gold/orange/blue/red/holo/shimmer/...). Same trunk-sharing
+    # constraint as SupCon — only useful with --arch mlp.
+    foil_aux = None
+    class_to_foil_tone_t = None
+    if args.foil_aux_lambda > 0:
+        if args.arch == "linear":
+            console.print(
+                "[yellow]--foil-aux-lambda > 0 with --arch linear has no effect on the "
+                "classifier (no shared trunk above frozen DINOv2 features). "
+                "Disabling foil aux. Use --arch mlp to enable.[/yellow]"
+            )
+            args.foil_aux_lambda = 0.0
+        else:
+            cls_tone_np = build_class_to_foil_tone(labels)
+            class_to_foil_tone_t = torch.from_numpy(cls_tone_np).to(device)
+            num_tones = len(FOIL_TONES)
+            foil_aux = nn.Linear(args.hidden_dim, num_tones).to(device)
+            tone_counts = np.bincount(cls_tone_np, minlength=num_tones)
+            console.print(
+                f"[cyan]Foil aux head (rec 4):[/cyan] lambda={args.foil_aux_lambda} "
+                f"num_tones={num_tones}  none-bucket={tone_counts[0]}/{len(labels)} classes"
+            )
+
+    params = list(head.parameters())
+    if projection is not None:
+        params += list(projection.parameters())
+    if foil_aux is not None:
+        params += list(foil_aux.parameters())
+    optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     sched = _build_scheduler(optim, args)
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     console.print(
@@ -334,6 +471,16 @@ def train(args):
             console.print(f"[cyan]Resuming from {resume_path}[/cyan]")
             state = torch.load(resume_path, map_location=device, weights_only=False)
             head.load_state_dict(state["head_state_dict"])
+            if projection is not None and state.get("projection_state_dict"):
+                try:
+                    projection.load_state_dict(state["projection_state_dict"])
+                except Exception as e:
+                    console.print(f"[yellow]Projection resume skipped ({e})[/yellow]")
+            if foil_aux is not None and state.get("foil_aux_state_dict"):
+                try:
+                    foil_aux.load_state_dict(state["foil_aux_state_dict"])
+                except Exception as e:
+                    console.print(f"[yellow]Foil aux resume skipped ({e})[/yellow]")
             if "optimizer_state_dict" in state:
                 optim.load_state_dict(state["optimizer_state_dict"])
             if "scheduler_state_dict" in state:
@@ -356,26 +503,35 @@ def train(args):
                 f"[yellow]--resume specified but {resume_path} not found; starting fresh.[/yellow]"
             )
 
-    def _forward(batch, training: bool):
-        """Unpack a batch and return (logits, labels, set_idxs). Cache path
-        yields features directly; image path runs a DINOv2 pass first.
+    def _forward(batch, training: bool, want_trunk: bool = False):
+        """Unpack a batch and return (logits, labels, set_idxs[, trunk]).
 
         ``feat_dropout`` applies stochastic feature dropout before the head —
         cheap feature-space regularization when image augmentation isn't an
         option (cached features are a single fixed view per image).
+
+        When ``want_trunk`` is True, the head's pre-classifier representation
+        is also returned so auxiliary losses (SupCon) can attach to it.
         """
         import torch.nn.functional as F
         if use_cache:
+            # Cache row already includes the color hist (if enabled), since
+            # CachedFeatureDataset concatenates at __getitem__.
             feats, labels_t, set_idxs_t = batch
             feats = feats.to(device, non_blocking=True)
         else:
-            imgs, labels_t, set_idxs_t = batch
+            imgs, side, labels_t, set_idxs_t = batch
             imgs = imgs.to(device, non_blocking=True)
             feats = extract_features(backbone, imgs, device)
+            if side is not None:
+                feats = torch.cat([feats, side.to(device, non_blocking=True)], dim=-1)
         if training and args.feat_dropout > 0.0:
             feats = F.dropout(feats, p=args.feat_dropout, training=True)
         labels_t   = labels_t.to(device, non_blocking=True)
         set_idxs_t = set_idxs_t.to(device, non_blocking=True)
+        if want_trunk:
+            logits, trunk = head_forward_with_trunk(head, feats)
+            return logits, labels_t, set_idxs_t, trunk
         return head(feats), labels_t, set_idxs_t
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -393,11 +549,20 @@ def train(args):
             TimeRemainingColumn(),
         ) as progress:
             task = progress.add_task("train", total=len(train_loader), loss=0.0)
+            running_supcon_loss = 0.0
+            running_foil_loss = 0.0
             for batch in train_loader:
                 if batch is None:
                     progress.advance(task); continue
 
-                logits, labels_t, set_idxs_t = _forward(batch, training=True)
+                want_trunk = (args.supcon_lambda > 0) or (args.foil_aux_lambda > 0)
+                if want_trunk:
+                    logits, labels_t, set_idxs_t, trunk = _forward(
+                        batch, training=True, want_trunk=True
+                    )
+                else:
+                    logits, labels_t, set_idxs_t = _forward(batch, training=True)
+                    trunk = None
 
                 if args.hierarchical:
                     loss = masked_cross_entropy(
@@ -412,6 +577,29 @@ def train(args):
                 else:
                     loss = criterion(logits, labels_t)
                     pred = logits.argmax(-1)
+
+                # Rec 3: same-set SupCon. Anchors = batch elements; positives =
+                # same class; candidates restricted to same-set siblings.
+                if projection is not None and trunk is not None:
+                    import torch.nn.functional as F_
+                    z = projection(trunk)
+                    z = F_.normalize(z, dim=-1)
+                    supcon = supcon_within_set_loss(
+                        z, labels_t, set_idxs_t, temperature=args.supcon_temperature
+                    )
+                    loss = loss + args.supcon_lambda * supcon
+                    running_supcon_loss += float(supcon.detach()) * labels_t.size(0)
+
+                # Rec 4: foil-tone aux CE. Forces the trunk to encode foil
+                # tone explicitly so gold/orange/blue/red/holo/shimmer don't
+                # collapse into the same neighborhood.
+                if foil_aux is not None and trunk is not None:
+                    import torch.nn.functional as F_
+                    tone_targets = class_to_foil_tone_t[labels_t]
+                    tone_logits = foil_aux(trunk)
+                    aux_loss = F_.cross_entropy(tone_logits, tone_targets)
+                    loss = loss + args.foil_aux_lambda * aux_loss
+                    running_foil_loss += float(aux_loss.detach()) * labels_t.size(0)
 
                 optim.zero_grad()
                 loss.backward()
@@ -428,6 +616,8 @@ def train(args):
         sched.step()
         train_loss = running_loss / max(n_seen, 1)
         train_top1 = n_correct / max(n_seen, 1)
+        train_supcon = running_supcon_loss / max(n_seen, 1) if projection is not None else None
+        train_foil   = running_foil_loss   / max(n_seen, 1) if foil_aux   is not None else None
 
         # ── Eval ─────────────────────────────────────────────────────────
         head.eval()
@@ -452,8 +642,10 @@ def train(args):
         val_top1 = v_top1 / max(v_seen, 1)
         val_top3 = v_top3 / max(v_seen, 1)
         dt = time.time() - t0
+        supcon_msg = f"  supcon {train_supcon:.4f}" if train_supcon is not None else ""
+        foil_msg   = f"  foil_ce {train_foil:.4f}"   if train_foil   is not None else ""
         console.print(
-            f"  epoch {epoch:>2d}  loss {train_loss:.4f}  "
+            f"  epoch {epoch:>2d}  loss {train_loss:.4f}{supcon_msg}{foil_msg}  "
             f"train@1 {train_top1:.3f}  val@1 {val_top1:.3f}  val@3 {val_top3:.3f}  ({dt:.0f}s)"
         )
 
@@ -471,7 +663,19 @@ def train(args):
             "feat_dropout":           args.feat_dropout,
             "weight_decay":           args.weight_decay,
             "label_smoothing":        args.label_smoothing,
-            "input_dim":              1024,
+            "input_dim":              head_input_dim,
+            "color_hist_kind":        args.color_hist,
+            "color_hist_bins":        int(args.color_hist_bins),
+            "color_hist_dim":         hist_dim,
+            "edge_channel":           bool(args.edge_channel),
+            "edge_profile_dim":       edge_dim,
+            "supcon_lambda":          float(args.supcon_lambda),
+            "supcon_temperature":     float(args.supcon_temperature),
+            "supcon_proj_dim":        int(args.supcon_proj_dim),
+            "projection_state_dict":  (projection.state_dict() if projection is not None else None),
+            "foil_aux_lambda":        float(args.foil_aux_lambda),
+            "foil_tones":             list(FOIL_TONES) if foil_aux is not None else None,
+            "foil_aux_state_dict":    (foil_aux.state_dict() if foil_aux is not None else None),
             "preprocess":             PREPROCESS_SPEC,
             "trained_at":             datetime.now(timezone.utc).isoformat(),
             "train_samples":          len(train_records),
@@ -480,6 +684,8 @@ def train(args):
             "sampler":                args.sampler,
             "scheduler":              args.scheduler,
             "epoch":                  epoch,
+            "run_name":               args.run_name,
+            "feature_flags":          _feature_flags_from_args(args),
         }
 
         if val_top1 > best_top1:
@@ -518,6 +724,62 @@ def train(args):
 
     console.print(f"\n[bold green]Done.[/bold green] best val@1={best_top1:.3f}  val@3={best_top3:.3f}")
     console.print(f"Checkpoint: [cyan]{ckpt_path}[/cyan]")
+
+    # ── Auto-eval (feature comparison harness) ───────────────────────────
+    # Re-load best head and run the full eval on the cached val loader so
+    # every training run drops a comparable summary.json + top_confusions.csv
+    # under runs/<run_name>/. This is what 07_compare_runs.py reads to diff
+    # rec-by-rec impact (top1/top3/macro_f1, plus confusion-pair deltas).
+    if args.auto_eval:
+        run_name = args.run_name
+        run_dir = Path(args.eval_output_dir) / run_name
+        console.print(f"\n[bold]Auto-eval[/bold] -> [cyan]{run_dir}[/cyan]")
+
+        # Reload the BEST checkpoint (val_top1 leader) for the report so the
+        # numbers match what gets shipped, not the last epoch.
+        best_state = torch.load(ckpt_path, map_location=device, weights_only=False)
+        head.load_state_dict(best_state["head_state_dict"])
+
+        result = evaluate_head(
+            head=head,
+            val_loader=val_loader,
+            labels=labels,
+            class_set_mask=class_set_mask,
+            device=device,
+            backbone=backbone,
+            use_cache=use_cache,
+            top_confusions=args.eval_top_confusions,
+        )
+
+        summary_extra = {
+            "checkpoint":     str(ckpt_path),
+            "n_labels":       num_classes,
+            "n_sets":         num_sets,
+            "arch":           args.arch,
+            "hierarchical":   args.hierarchical,
+            "trained_at":     base_payload["trained_at"],
+            "backbone":       "dinov2_vitl14_reg",
+            "finetuned_sha":  sha256_of_file(args.finetuned_backbone),
+            "sampler":        args.sampler,
+            "scheduler":      args.scheduler,
+            "run_name":       run_name,
+            "feature_flags":  _feature_flags_from_args(args),
+            "epochs_trained": epoch,
+        }
+        per_class_path, confusions_path, summary_path = write_eval_outputs(
+            run_dir, result, summary_extra=summary_extra
+        )
+
+        console.print(
+            f"  samples={result['n_val']:,}  "
+            f"top1={result['top1']:.4f}  top3={result['top3']:.4f}  "
+            f"macro_f1={result['macro_f1']:.4f}"
+        )
+        console.print(f"  Wrote [green]{summary_path}[/green]")
+        console.print(
+            f"  Diff vs other runs: "
+            f"[cyan]python training/07_compare_runs.py {args.eval_output_dir}[/cyan]"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -594,10 +856,73 @@ def main():
                          "restricted to the classes belonging to that sample's set. "
                          "Matches the inference flow: search picks set, head ranks variants.")
 
+    # Rec 2: color-histogram side channel
+    ap.add_argument("--color-hist", choices=list(COLOR_HIST_CHOICES), default="none",
+                    help="Concatenate a 3*bins-dim color histogram onto each DINOv2 "
+                         "feature so the head sees explicit color signal. DINOv2 is "
+                         "color-invariant by design, which is fatal for parallels "
+                         "where color is the only label-distinguishing feature "
+                         "(Topps Now purple/blue, OPC red/blue border, mosaic "
+                         "finishes, etc.). Recommended: lab32. Cache is keyed on "
+                         "(kind, bins) so changing this rebuilds automatically.")
+    ap.add_argument("--color-hist-bins", type=int, default=32,
+                    help="Per-channel bin count for --color-hist. Total dim = 3*bins. "
+                         "32 -> 96-dim side channel.")
+
+    # Rec 3: pairwise contrastive (SupCon) within-set
+    ap.add_argument("--supcon-lambda", type=float, default=0.0,
+                    help="Weight on the supervised-contrastive auxiliary loss "
+                         "(rec 3). Loss is restricted to same-set candidates so the "
+                         "gradient pulls sibling parallels apart in the projection "
+                         "space. 0 disables. Try 0.1–0.5 with --arch mlp; useless "
+                         "with --arch linear (no shared trunk).")
+    ap.add_argument("--supcon-temperature", type=float, default=0.1,
+                    help="SupCon temperature τ. Lower = harder.")
+    ap.add_argument("--supcon-proj-dim", type=int, default=128,
+                    help="Output dim of the SupCon projection head.")
+
+    # Rec 5: edge-profile side channel
+    ap.add_argument("--edge-channel", action="store_true",
+                    help="Concatenate a 16-dim edge profile (4 borders x 4 stats: "
+                         "mean / std / max / p90 of Sobel gradient) onto each feature. "
+                         "Targets die-cut vs base confusions where the only difference "
+                         "is irregular notches at the card boundary, which DINOv2's "
+                         "global features mostly ignore. Cache key includes this flag, "
+                         "so toggling forces a clean rebuild.")
+
+    # Rec 4: foil-tone auxiliary head
+    ap.add_argument("--foil-aux-lambda", type=float, default=0.0,
+                    help="Weight on the foil-tone auxiliary CE loss (rec 4). The "
+                         "tone for each class is parsed from its variant label "
+                         "(gold/orange/blue/red/holo/shimmer/...). Forces the trunk "
+                         "to encode foil tone explicitly so it doesn't get lost to "
+                         "one-hot collapse. 0 disables. Try 0.1–0.3 with --arch mlp.")
+
     ap.add_argument("--resume", default=None, nargs="?", const="auto",
                     help="Resume from checkpoint. Bare --resume uses variant_classifier_{arch}_last.pt; "
                          "pass an explicit path to use a different file.")
+
+    # Run identification + auto-eval harness
+    ap.add_argument("--run-name", default=None,
+                    help="Name for this training run; outputs land at "
+                         "<eval-output-dir>/<run-name>/. Defaults to a flag-derived "
+                         "name like 'mlp__color=lab32__supcon=0.1__YYYYMMDDHHMMSS'.")
+    ap.add_argument("--auto-eval", dest="auto_eval", action="store_true", default=True,
+                    help="After training, run a full val-set eval and write "
+                         "summary.json + top_confusions.csv + per_class_metrics.csv "
+                         "for 07_compare_runs.py to diff against other runs (default).")
+    ap.add_argument("--no-auto-eval", dest="auto_eval", action="store_false",
+                    help="Skip the post-training eval pass.")
+    ap.add_argument("--eval-output-dir", default="./eval/runs",
+                    help="Parent directory for per-run eval outputs.")
+    ap.add_argument("--eval-top-confusions", type=int, default=200,
+                    help="How many (true,pred) confusion pairs to write. Bumped "
+                         "from step-6's 50 so the comparison harness has long enough "
+                         "tails to track regression on rare hard pairs.")
+
     args = ap.parse_args()
+    if not args.run_name:
+        args.run_name = _default_run_name(args)
 
     train(args)
 

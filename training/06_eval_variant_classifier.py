@@ -21,11 +21,9 @@ Run from repo root:
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 import sys
-from collections import Counter
 from pathlib import Path
 
 # Repo root importable + also expose training/ for the shared lib import.
@@ -44,6 +42,8 @@ from variant_classifier_lib import (
     load_jsonl,
     derive_set_labels,
     build_set_class_mask,
+    evaluate_head,
+    write_eval_outputs,
 )
 
 console = Console()
@@ -100,7 +100,12 @@ def evaluate(args):
         console.print(f"[cyan]Hierarchical eval:[/cyan] applying per-sample set mask")
 
     transform = build_preprocess()
-    ds = ImageDataset(val_records, transform, set_to_idx)
+    ds = ImageDataset(
+        val_records, transform, set_to_idx,
+        color_hist_kind=ckpt.get("color_hist_kind", "none"),
+        color_hist_bins=int(ckpt.get("color_hist_bins", 32)),
+        edge_channel=bool(ckpt.get("edge_channel", False)),
+    )
     loader = DataLoader(
         ds, batch_size=args.batch, shuffle=False,
         num_workers=args.workers, pin_memory=True,
@@ -119,80 +124,21 @@ def evaluate(args):
     head.load_state_dict(ckpt["head_state_dict"])
     head.eval()
 
-    tp = Counter()
-    fp = Counter()
-    fn = Counter()
-    confusions: Counter = Counter()
-    total = 0
-    top1_correct = 0
-    top3_correct = 0
+    result = evaluate_head(
+        head=head,
+        val_loader=loader,
+        labels=labels,
+        class_set_mask=class_set_mask,
+        device=device,
+        backbone=backbone,
+        use_cache=False,
+        top_confusions=args.top_confusions,
+    )
 
-    with torch.no_grad():
-        for batch in loader:
-            if batch is None:
-                continue
-            imgs, gold, set_idxs = batch
-            imgs = imgs.to(device, non_blocking=True)
-            gold = gold.to(device, non_blocking=True)
-            set_idxs = set_idxs.to(device, non_blocking=True)
-            feats = extract_features(backbone, imgs, device)
-            logits = head(feats)
-            if class_set_mask is not None:
-                logits = logits.masked_fill(~class_set_mask[set_idxs], float("-inf"))
-            k = min(3, len(labels))
-            topk = logits.topk(k, dim=-1).indices
-            pred = topk[:, 0]
-
-            total += gold.size(0)
-            top1_correct += (pred == gold).sum().item()
-            top3_correct += (topk == gold.unsqueeze(-1)).any(-1).sum().item()
-
-            for g, p in zip(gold.cpu().tolist(), pred.cpu().tolist()):
-                if g == p:
-                    tp[g] += 1
-                else:
-                    fp[p] += 1
-                    fn[g] += 1
-                    confusions[(g, p)] += 1
-
-    top1 = top1_correct / max(total, 1)
-    top3 = top3_correct / max(total, 1)
-
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    per_class_path = out_dir / "per_class_metrics.csv"
-    f1s = []
-    with open(per_class_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["label", "support", "precision", "recall", "f1"])
-        for idx, label in enumerate(labels):
-            support = tp[idx] + fn[idx]
-            prec = tp[idx] / (tp[idx] + fp[idx]) if (tp[idx] + fp[idx]) else 0.0
-            rec  = tp[idx] / support if support else 0.0
-            f1   = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
-            if support:
-                f1s.append(f1)
-            w.writerow([label, support, f"{prec:.4f}", f"{rec:.4f}", f"{f1:.4f}"])
-
-    macro_f1 = sum(f1s) / max(len(f1s), 1)
-
-    confusions_path = out_dir / "top_confusions.csv"
-    with open(confusions_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["true_label", "pred_label", "count"])
-        for (g, p), c in confusions.most_common(args.top_confusions):
-            w.writerow([labels[g], labels[p], c])
-
-    summary_path = out_dir / "summary.json"
-    summary = {
+    summary_extra = {
         "checkpoint":     str(ckpt_path),
-        "n_val":          total,
         "n_labels":       len(labels),
         "n_sets":         len(set_labels),
-        "top1":           top1,
-        "top3":           top3,
-        "macro_f1":       macro_f1,
         "arch":           arch,
         "hierarchical":   hierarchical,
         "trained_at":     ckpt.get("trained_at"),
@@ -200,14 +146,18 @@ def evaluate(args):
         "finetuned_sha":  ckpt.get("finetuned_backbone_sha"),
         "sampler":        ckpt.get("sampler"),
         "scheduler":      ckpt.get("scheduler"),
+        "run_name":       ckpt.get("run_name"),
+        "feature_flags":  ckpt.get("feature_flags"),
     }
-    summary_path.write_text(json.dumps(summary, indent=2))
+    per_class_path, confusions_path, summary_path = write_eval_outputs(
+        args.output_dir, result, summary_extra=summary_extra
+    )
 
     console.print(f"\n[bold]Eval summary[/bold]")
-    console.print(f"  samples:  [cyan]{total:,}[/cyan]")
-    console.print(f"  top-1:    [green]{top1:.4f}[/green]")
-    console.print(f"  top-3:    [green]{top3:.4f}[/green]")
-    console.print(f"  macro F1: [cyan]{macro_f1:.4f}[/cyan]")
+    console.print(f"  samples:  [cyan]{result['n_val']:,}[/cyan]")
+    console.print(f"  top-1:    [green]{result['top1']:.4f}[/green]")
+    console.print(f"  top-3:    [green]{result['top3']:.4f}[/green]")
+    console.print(f"  macro F1: [cyan]{result['macro_f1']:.4f}[/cyan]")
     console.print(f"\nWrote:")
     console.print(f"  [green]{per_class_path}[/green]")
     console.print(f"  [green]{confusions_path}[/green]")

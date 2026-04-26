@@ -180,7 +180,13 @@ def export(output_dir: str, min_samples: int, val_ratio: float, seed: int,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--output", default="./training_data/variant_classifier")
-    ap.add_argument("--min-samples", type=int, default=10)
+    ap.add_argument("--min-samples", type=int, default=20,
+                    help="Class keys with fewer than this many samples are routed "
+                         "to the single __rare__ bucket. Default bumped to 20 — at "
+                         "min_samples=10 with val_ratio=0.1, classes get exactly 1 "
+                         "val sample, which is statistical noise. Going to 20 routes "
+                         "the long tail (e.g. 1998 Topps Tek 'pattern N' classes "
+                         "with n=1–2) into __rare__ where it belongs.")
     ap.add_argument("--val-ratio", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--no-verify-images", action="store_true",
