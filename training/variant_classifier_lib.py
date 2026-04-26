@@ -58,6 +58,69 @@ RARE_CLASS = "__rare__"
 COLOR_HIST_CHOICES = ("none", "lab32", "hsv32", "rgb32")
 
 
+# ---------------------------------------------------------------------------
+# Edge / die-cut profile (rec 5)
+# ---------------------------------------------------------------------------
+# Die-cut variants (zebra prizm die cut vs base, dragon scale die cut vs base)
+# differ from base cards only at the silhouette: die-cuts have irregular
+# notches at the card boundary while bases have straight edges. DINOv2's
+# global features mostly ignore the silhouette since the same artwork sits in
+# the middle of both. A 16-dim edge profile captures the boundary signal
+# directly without standing up a full segmentation model.
+EDGE_PROFILE_DIM = 16  # 4 borders (top/right/bottom/left) x 4 stats (mean/std/max/p90)
+
+
+def edge_profile_dim(enabled: bool) -> int:
+    return EDGE_PROFILE_DIM if enabled else 0
+
+
+def compute_edge_profile(pil_image, target_size: int = 64, border_thickness: int = 4) -> np.ndarray:
+    """16-dim per-image edge-profile vector.
+
+    Pipeline:
+        1. Resize the image to ``target_size × target_size`` grayscale
+           (deterministic so stats are comparable across cards of different
+           original resolutions).
+        2. 3-pixel central-difference gradient (cheap Sobel approximation).
+        3. For each of the 4 image borders (top / right / bottom / left), take
+           the ``border_thickness``-pixel-wide strip and compute
+           (mean, std, max, p90) of the gradient magnitude.
+
+    Output is a (16,) float32 vector. A regular full-bleed card produces 4
+    similar high-mean / low-std edges; a die-cut produces high-std edges with
+    larger max because the gradient is dominated by the notches.
+    """
+    from PIL import Image
+    if pil_image.mode != "L":
+        gray = pil_image.convert("L")
+    else:
+        gray = pil_image
+    gray = gray.resize((target_size, target_size), Image.BILINEAR)
+    arr = np.asarray(gray, dtype=np.float32) / 255.0
+
+    gx = np.zeros_like(arr)
+    gy = np.zeros_like(arr)
+    gx[:, 1:-1] = arr[:, 2:] - arr[:, :-2]
+    gy[1:-1, :] = arr[2:, :] - arr[:-2, :]
+    grad = np.sqrt(gx * gx + gy * gy)
+
+    bt = border_thickness
+    strips = {
+        "top":    grad[:bt, :].ravel(),
+        "right":  grad[:, -bt:].ravel(),
+        "bottom": grad[-bt:, :].ravel(),
+        "left":   grad[:, :bt].ravel(),
+    }
+    out: list[float] = []
+    for k in ("top", "right", "bottom", "left"):
+        s = strips[k]
+        out.append(float(s.mean()))
+        out.append(float(s.std()))
+        out.append(float(s.max()))
+        out.append(float(np.percentile(s, 90)))
+    return np.asarray(out, dtype=np.float32)
+
+
 def color_hist_dim(kind: str | None, bins: int) -> int:
     """Total flattened histogram dimension. 0 when disabled."""
     if not kind or kind == "none":
@@ -154,12 +217,12 @@ def derive_set_labels(records: list[dict]) -> tuple[list[str], dict[str, int]]:
 # ---------------------------------------------------------------------------
 
 class ImageDataset:
-    """Returns ``(image_tensor, color_hist_or_None, label_idx, set_idx)`` tuples.
+    """Returns ``(image_tensor, side_channels, label_idx, set_idx)`` tuples.
 
-    ``color_hist_kind`` defaults to ``"none"`` for backwards compatibility —
-    older callers will see ``None`` in the second slot and can ignore it. The
-    step-6 eval path enables it to match a checkpoint trained with the color
-    side channel.
+    ``side_channels`` is a numpy float32 array combining color hist (if
+    enabled) and edge profile (if enabled), in that fixed order. It is
+    ``None`` when neither is enabled. Step 6's eval path mirrors whatever
+    the checkpoint was trained with.
     """
 
     def __init__(
@@ -169,6 +232,7 @@ class ImageDataset:
         set_to_idx: dict[str, int],
         color_hist_kind: str = "none",
         color_hist_bins: int = 32,
+        edge_channel: bool = False,
     ):
         self.records = records
         self.transform = transform
@@ -176,6 +240,7 @@ class ImageDataset:
         self.color_hist_kind = color_hist_kind or "none"
         self.color_hist_bins = int(color_hist_bins)
         self.color_enabled = self.color_hist_kind != "none"
+        self.edge_enabled = bool(edge_channel)
 
     def __len__(self):
         return len(self.records)
@@ -189,10 +254,15 @@ class ImageDataset:
             return None
         set_slug = (rec.get("set_slug") or "").strip().lower()
         set_idx = self.set_to_idx.get(set_slug, 0)
-        color = None
+        side_parts: list[np.ndarray] = []
         if self.color_enabled:
-            color = compute_color_histogram(img, self.color_hist_kind, self.color_hist_bins)
-        return self.transform(img), color, int(rec["label_idx"]), int(set_idx)
+            side_parts.append(
+                compute_color_histogram(img, self.color_hist_kind, self.color_hist_bins)
+            )
+        if self.edge_enabled:
+            side_parts.append(compute_edge_profile(img))
+        side = np.concatenate(side_parts) if side_parts else None
+        return self.transform(img), side, int(rec["label_idx"]), int(set_idx)
 
 
 def collate_image_skip_none(batch):
@@ -201,14 +271,14 @@ def collate_image_skip_none(batch):
     if not batch:
         return None
     imgs     = torch.stack([b[0] for b in batch])
-    has_color = batch[0][1] is not None
-    if has_color:
-        color = torch.from_numpy(np.stack([b[1] for b in batch], axis=0)).float()
+    has_side = batch[0][1] is not None
+    if has_side:
+        side = torch.from_numpy(np.stack([b[1] for b in batch], axis=0)).float()
     else:
-        color = None
+        side = None
     labels   = torch.tensor([b[2] for b in batch], dtype=torch.long)
     set_idxs = torch.tensor([b[3] for b in batch], dtype=torch.long)
-    return imgs, color, labels, set_idxs
+    return imgs, side, labels, set_idxs
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +304,7 @@ class CachedFeatureDataset:
         labels: np.ndarray,
         set_idxs: np.ndarray,
         color_path: str | None = None,
+        edge_path: str | None = None,
     ):
         # mmap_mode="r" keeps the 4-8GB tensor out of RAM — the OS pages it in
         # as the sampler touches random indices.
@@ -248,6 +319,12 @@ class CachedFeatureDataset:
                 f"color cache length {self.color.shape[0]} does not match "
                 f"feature cache length {self.features.shape[0]}"
             )
+        self.edge = np.load(edge_path, mmap_mode="r") if edge_path else None
+        if self.edge is not None:
+            assert self.edge.shape[0] == self.features.shape[0], (
+                f"edge cache length {self.edge.shape[0]} does not match "
+                f"feature cache length {self.features.shape[0]}"
+            )
         self.labels = labels
         self.set_idxs = set_idxs
 
@@ -260,6 +337,9 @@ class CachedFeatureDataset:
         if self.color is not None:
             color = np.array(self.color[idx], copy=True)
             feat = np.concatenate([feat, color], axis=0)
+        if self.edge is not None:
+            edge = np.array(self.edge[idx], copy=True)
+            feat = np.concatenate([feat, edge], axis=0)
         return feat, int(self.labels[idx]), int(self.set_idxs[idx])
 
 
@@ -295,6 +375,7 @@ def _expected_cache_info(
     finetuned_backbone: str | None,
     color_hist_kind: str = "none",
     color_hist_bins: int = 0,
+    edge_channel: bool = False,
 ) -> dict:
     return {
         "preprocess_spec":     PREPROCESS_SPEC,
@@ -304,6 +385,8 @@ def _expected_cache_info(
         "n_val":               len(records_val),
         "color_hist_kind":     color_hist_kind or "none",
         "color_hist_bins":     int(color_hist_bins) if color_hist_kind and color_hist_kind != "none" else 0,
+        "edge_channel":        bool(edge_channel),
+        "edge_profile_dim":    EDGE_PROFILE_DIM if edge_channel else 0,
     }
 
 
@@ -319,7 +402,8 @@ def cache_features_if_needed(
     console=None,
     color_hist_kind: str = "none",
     color_hist_bins: int = 32,
-) -> tuple[Path, Path, Path, Path | None, Path | None]:
+    edge_channel: bool = False,
+) -> tuple[Path, Path, Path, Path | None, Path | None, Path | None, Path | None]:
     """Ensure a fp16 feature cache exists on disk; build it if not.
 
     Returns ``(cache_dir, train_features_path, val_features_path,
@@ -341,14 +425,18 @@ def cache_features_if_needed(
 
     base_key = _cache_key(finetuned_backbone)
     color_key = "color-none" if (not color_hist_kind or color_hist_kind == "none") else f"color-{color_hist_kind}-{color_hist_bins}"
-    key = f"{base_key}__{color_key}"
+    edge_key = "edge-on" if edge_channel else "edge-off"
+    key = f"{base_key}__{color_key}__{edge_key}"
     hist_dim = color_hist_dim(color_hist_kind, color_hist_bins)
+    edge_dim = edge_profile_dim(edge_channel)
     cache_dir = data_dir / "features_cache" / key
     cache_dir.mkdir(parents=True, exist_ok=True)
     train_feat = cache_dir / "train.npy"
     val_feat   = cache_dir / "val.npy"
     train_color = cache_dir / "train_color.npy" if hist_dim else None
     val_color   = cache_dir / "val_color.npy"   if hist_dim else None
+    train_edge  = cache_dir / "train_edge.npy"  if edge_dim else None
+    val_edge    = cache_dir / "val_edge.npy"    if edge_dim else None
     train_meta = cache_dir / "train_meta.npz"
     val_meta   = cache_dir / "val_meta.npz"
     info_path  = cache_dir / "cache_info.json"
@@ -356,11 +444,14 @@ def cache_features_if_needed(
     expected = _expected_cache_info(
         records_train, records_val, finetuned_backbone,
         color_hist_kind=color_hist_kind, color_hist_bins=color_hist_bins,
+        edge_channel=edge_channel,
     )
 
     required_files = [train_feat, val_feat, train_meta, val_meta]
     if hist_dim:
         required_files += [train_color, val_color]
+    if edge_dim:
+        required_files += [train_edge, val_edge]
     if info_path.exists() and all(p.exists() for p in required_files):
         try:
             stored = json.loads(info_path.read_text())
@@ -369,7 +460,7 @@ def cache_features_if_needed(
         if stored == expected:
             if console:
                 console.print(f"[green]Feature cache hit:[/green] {cache_dir}")
-            return cache_dir, train_feat, val_feat, train_color, val_color
+            return cache_dir, train_feat, val_feat, train_color, val_color, train_edge, val_edge
         if console:
             console.print(f"[yellow]Feature cache stale — rebuilding {cache_dir}[/yellow]")
 
@@ -389,7 +480,7 @@ def cache_features_if_needed(
     transform = build_preprocess()
 
     def _write_split(records, feat_path: Path, color_path: Path | None,
-                     meta_path: Path, split_name: str):
+                     edge_path: Path | None, meta_path: Path, split_name: str):
         n = len(records)
         # memmap in "w+" mode to avoid holding 2M x 1024 fp16 = 4GB in memory.
         memmap = np.lib.format.open_memmap(
@@ -399,6 +490,11 @@ def cache_features_if_needed(
         if color_path is not None and hist_dim:
             color_mm = np.lib.format.open_memmap(
                 str(color_path), mode="w+", dtype=np.float16, shape=(n, hist_dim)
+            )
+        edge_mm = None
+        if edge_path is not None and edge_dim:
+            edge_mm = np.lib.format.open_memmap(
+                str(edge_path), mode="w+", dtype=np.float16, shape=(n, edge_dim)
             )
         labels   = np.zeros(n, dtype=np.int64)
         set_idxs = np.zeros(n, dtype=np.int64)
@@ -421,6 +517,7 @@ def cache_features_if_needed(
                 chunk_records = records[i:i + batch_size]
                 tensors = []
                 color_vecs: list[np.ndarray] = []
+                edge_vecs:  list[np.ndarray] = []
                 idx_in_chunk = []
                 for j, rec in enumerate(chunk_records):
                     try:
@@ -430,6 +527,8 @@ def cache_features_if_needed(
                             color_vecs.append(
                                 compute_color_histogram(img, color_hist_kind, color_hist_bins)
                             )
+                        if edge_mm is not None:
+                            edge_vecs.append(compute_edge_profile(img))
                         idx_in_chunk.append(j)
                     except Exception:
                         bad_count += 1
@@ -447,6 +546,8 @@ def cache_features_if_needed(
                         memmap[out_idx] = feats_np[j_local]
                         if color_mm is not None:
                             color_mm[out_idx] = color_vecs[j_local].astype(np.float16)
+                        if edge_mm is not None:
+                            edge_mm[out_idx] = edge_vecs[j_local].astype(np.float16)
                         labels[out_idx]   = int(chunk_records[rec_local_idx]["label_idx"])
                         set_slug = (chunk_records[rec_local_idx].get("set_slug") or "").strip().lower()
                         set_idxs[out_idx] = int(set_to_idx.get(set_slug, 0))
@@ -489,20 +590,32 @@ def cache_features_if_needed(
                     os.replace(tmp_c, color_path)
                     color_mm = None
 
+                if edge_mm is not None and edge_path is not None:
+                    tmp_e = edge_path.with_suffix(".compact.npy")
+                    compacted_e = np.lib.format.open_memmap(
+                        str(tmp_e), mode="w+", dtype=np.float16, shape=(len(keep), edge_dim)
+                    )
+                    for out_i, src_i in enumerate(keep):
+                        compacted_e[out_i] = edge_mm[src_i]
+                    del compacted_e, edge_mm
+                    os.replace(tmp_e, edge_path)
+                    edge_mm = None
+
                 labels   = labels[keep]
                 set_idxs = set_idxs[keep]
 
         memmap = None  # flush
         color_mm = None
+        edge_mm = None
         np.savez(meta_path, labels=labels, set_idxs=set_idxs)
 
-    _write_split(records_train, train_feat, train_color, train_meta, "train")
-    _write_split(records_val,   val_feat,   val_color,   val_meta,   "val")
+    _write_split(records_train, train_feat, train_color, train_edge, train_meta, "train")
+    _write_split(records_val,   val_feat,   val_color,   val_edge,   val_meta,   "val")
 
     info_path.write_text(json.dumps(expected, indent=2))
     if console:
         console.print(f"[green]Feature cache ready:[/green] {cache_dir}")
-    return cache_dir, train_feat, val_feat, train_color, val_color
+    return cache_dir, train_feat, val_feat, train_color, val_color, train_edge, val_edge
 
 
 def load_cached_meta(meta_path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -971,11 +1084,11 @@ def evaluate_head(
                 feats, gold, set_idxs = batch
                 feats = feats.to(device, non_blocking=True)
             else:
-                imgs, color, gold, set_idxs = batch
+                imgs, side, gold, set_idxs = batch
                 imgs = imgs.to(device, non_blocking=True)
                 feats = extract_features(backbone, imgs, device)
-                if color is not None:
-                    feats = torch.cat([feats, color.to(device, non_blocking=True)], dim=-1)
+                if side is not None:
+                    feats = torch.cat([feats, side.to(device, non_blocking=True)], dim=-1)
             gold = gold.to(device, non_blocking=True)
             set_idxs = set_idxs.to(device, non_blocking=True)
 

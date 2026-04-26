@@ -104,6 +104,7 @@ def evaluate(args):
         val_records, transform, set_to_idx,
         color_hist_kind=ckpt.get("color_hist_kind", "none"),
         color_hist_bins=int(ckpt.get("color_hist_bins", 32)),
+        edge_channel=bool(ckpt.get("edge_channel", False)),
     )
     loader = DataLoader(
         ds, batch_size=args.batch, shuffle=False,

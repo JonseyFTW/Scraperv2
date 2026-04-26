@@ -82,6 +82,7 @@ from variant_classifier_lib import (  # noqa: E402
     head_forward_with_trunk,
     FOIL_TONES,
     build_class_to_foil_tone,
+    edge_profile_dim,
 )
 
 console = Console()
@@ -172,6 +173,8 @@ def _build_loaders_cached(
     args,
     train_color: Path | None = None,
     val_color: Path | None = None,
+    train_edge: Path | None = None,
+    val_edge: Path | None = None,
 ):
     """Construct DataLoaders over the fp16 feature cache."""
     import torch
@@ -183,10 +186,12 @@ def _build_loaders_cached(
     train_ds = CachedFeatureDataset(
         str(train_features), train_labels, train_set_idxs,
         color_path=str(train_color) if train_color else None,
+        edge_path=str(train_edge)  if train_edge  else None,
     )
     val_ds   = CachedFeatureDataset(
         str(val_features),   val_labels,   val_set_idxs,
         color_path=str(val_color) if val_color else None,
+        edge_path=str(val_edge)  if val_edge  else None,
     )
 
     train_loader_kwargs = dict(
@@ -241,10 +246,12 @@ def _build_loaders_image(train_records, val_records, set_to_idx, args):
     train_ds = ImageDataset(
         train_records, transform, set_to_idx,
         color_hist_kind=args.color_hist, color_hist_bins=args.color_hist_bins,
+        edge_channel=args.edge_channel,
     )
     val_ds   = ImageDataset(
         val_records,   transform, set_to_idx,
         color_hist_kind=args.color_hist, color_hist_bins=args.color_hist_bins,
+        edge_channel=args.edge_channel,
     )
 
     if args.sampler == "set_stratified":
@@ -332,17 +339,20 @@ def train(args):
     if args.cache and device != "cuda":
         console.print("[yellow]Feature caching requires CUDA — falling back to image dataset[/yellow]")
 
-    # ── Color-hist side channel sizing (rec 2) ───────────────────────────
+    # ── Side channels: color hist (rec 2) + edge profile (rec 5) ─────────
     hist_dim = color_hist_dim(args.color_hist, args.color_hist_bins)
+    edge_dim = edge_profile_dim(args.edge_channel)
     if hist_dim:
         console.print(
             f"[cyan]Color-hist side channel:[/cyan] kind={args.color_hist} "
             f"bins={args.color_hist_bins} dim={hist_dim}"
         )
+    if edge_dim:
+        console.print(f"[cyan]Edge profile (rec 5):[/cyan] dim={edge_dim}")
 
     backbone = None
     if use_cache:
-        _, train_feat, val_feat, train_color, val_color = cache_features_if_needed(
+        _, train_feat, val_feat, train_color, val_color, train_edge, val_edge = cache_features_if_needed(
             data_dir=data_dir,
             records_train=train_records,
             records_val=val_records,
@@ -354,11 +364,13 @@ def train(args):
             console=console,
             color_hist_kind=args.color_hist,
             color_hist_bins=args.color_hist_bins,
+            edge_channel=args.edge_channel,
         )
         cache_dir = train_feat.parent
         train_loader, val_loader = _build_loaders_cached(
             cache_dir, train_feat, val_feat, args,
             train_color=train_color, val_color=val_color,
+            train_edge=train_edge,   val_edge=val_edge,
         )
     else:
         backbone = setup_backbone(device, args.finetuned_backbone, console=console)
@@ -376,7 +388,7 @@ def train(args):
         )
 
     # ── Head + optimizer + scheduler ─────────────────────────────────────
-    head_input_dim = 1024 + hist_dim
+    head_input_dim = 1024 + hist_dim + edge_dim
     head = build_head(
         args.arch, head_input_dim, num_classes,
         hidden_dim=args.hidden_dim, dropout=args.dropout,
@@ -508,11 +520,11 @@ def train(args):
             feats, labels_t, set_idxs_t = batch
             feats = feats.to(device, non_blocking=True)
         else:
-            imgs, color, labels_t, set_idxs_t = batch
+            imgs, side, labels_t, set_idxs_t = batch
             imgs = imgs.to(device, non_blocking=True)
             feats = extract_features(backbone, imgs, device)
-            if color is not None:
-                feats = torch.cat([feats, color.to(device, non_blocking=True)], dim=-1)
+            if side is not None:
+                feats = torch.cat([feats, side.to(device, non_blocking=True)], dim=-1)
         if training and args.feat_dropout > 0.0:
             feats = F.dropout(feats, p=args.feat_dropout, training=True)
         labels_t   = labels_t.to(device, non_blocking=True)
@@ -655,6 +667,8 @@ def train(args):
             "color_hist_kind":        args.color_hist,
             "color_hist_bins":        int(args.color_hist_bins),
             "color_hist_dim":         hist_dim,
+            "edge_channel":           bool(args.edge_channel),
+            "edge_profile_dim":       edge_dim,
             "supcon_lambda":          float(args.supcon_lambda),
             "supcon_temperature":     float(args.supcon_temperature),
             "supcon_proj_dim":        int(args.supcon_proj_dim),
@@ -866,6 +880,15 @@ def main():
                     help="SupCon temperature τ. Lower = harder.")
     ap.add_argument("--supcon-proj-dim", type=int, default=128,
                     help="Output dim of the SupCon projection head.")
+
+    # Rec 5: edge-profile side channel
+    ap.add_argument("--edge-channel", action="store_true",
+                    help="Concatenate a 16-dim edge profile (4 borders x 4 stats: "
+                         "mean / std / max / p90 of Sobel gradient) onto each feature. "
+                         "Targets die-cut vs base confusions where the only difference "
+                         "is irregular notches at the card boundary, which DINOv2's "
+                         "global features mostly ignore. Cache key includes this flag, "
+                         "so toggling forces a clean rebuild.")
 
     # Rec 4: foil-tone auxiliary head
     ap.add_argument("--foil-aux-lambda", type=float, default=0.0,
