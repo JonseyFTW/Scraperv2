@@ -243,6 +243,12 @@ def cache_features_if_needed(
         console.print(f"[cyan]Building feature cache → {cache_dir}[/cyan]")
 
     backbone = setup_backbone(device, finetuned_backbone, console=console)
+    # Note (rec 1): build_preprocess() is the deterministic DINOv2 preprocess —
+    # resize, center-crop, ImageNet normalize. There is intentionally no
+    # ColorJitter / hue-shift / saturation augmentation here, because color is
+    # the only label-distinguishing feature for the parallel-color confusions
+    # (Topps Now purple↔blue, OPC red/blue border, etc.). If you ever add
+    # augmentation, keep it shape/crop/blur only — never color.
     transform = build_preprocess()
 
     def _write_split(records, feat_path: Path, meta_path: Path, split_name: str):
