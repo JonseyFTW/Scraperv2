@@ -420,16 +420,23 @@ def build_class_balanced_sampler(labels: np.ndarray, num_samples: int | None = N
 # Heads and backbones
 # ---------------------------------------------------------------------------
 
-def build_head(arch: str, input_dim: int, num_classes: int):
+def build_head(arch: str, input_dim: int, num_classes: int,
+               hidden_dim: int = 256, dropout: float = 0.1):
+    """Build the classification head.
+
+    ``linear`` ignores ``hidden_dim`` / ``dropout``. ``mlp`` is a single hidden
+    layer with GELU + Dropout; bump ``dropout`` for stronger regularization when
+    the head is overfitting.
+    """
     import torch.nn as nn
     if arch == "linear":
         return nn.Linear(input_dim, num_classes)
     if arch == "mlp":
         return nn.Sequential(
-            nn.Linear(input_dim, 256),
+            nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, num_classes),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes),
         )
     raise ValueError(f"Unknown arch: {arch}")
 
@@ -503,16 +510,38 @@ def masked_cross_entropy(
 ):
     """Cross-entropy loss where logits outside the sample's set are suppressed.
 
-    This focuses gradients on "which variant within this set" instead of the
-    easy "which set entirely" problem, which is the whole point of the
-    hierarchical restructuring.
+    Gradients focus on "which variant within this set" instead of the easy
+    "which set entirely" problem, which is the point of the hierarchical
+    restructuring.
+
+    Label smoothing is distributed uniformly over the *allowed* classes for
+    each sample rather than over all C classes, which is the correct per-sample
+    smoothing under a masked softmax and avoids the ``loss=inf`` NaN that
+    ``F.cross_entropy(masked, targets, label_smoothing=α)`` produces when α
+    tries to put mass on -inf logits.
     """
     import torch
     import torch.nn.functional as F
 
     # (B, C) gather the per-sample allowed-class mask.
     sample_mask = class_set_mask.to(logits.device)[sample_set_idx]
-    # Masked softmax via -inf on disallowed classes. The gold class is always
-    # allowed by construction (see build_set_class_mask).
-    masked = logits.masked_fill(~sample_mask, float("-inf"))
-    return F.cross_entropy(masked, targets, label_smoothing=label_smoothing)
+    masked_logits = logits.masked_fill(~sample_mask, float("-inf"))
+
+    if label_smoothing <= 0.0:
+        return F.cross_entropy(masked_logits, targets)
+
+    # Manually compute smoothed CE while respecting the mask.
+    log_probs = F.log_softmax(masked_logits, dim=-1)
+    # log_probs at masked positions is -inf. Zero them out in the final sum so
+    # 0 * -inf never appears — the smoothed target has zero mass there anyway.
+    log_probs = torch.where(sample_mask, log_probs, torch.zeros_like(log_probs))
+
+    # Smoothed target: (1-α) on gold + α uniformly over the K allowed classes.
+    # Equivalent closed form: α/K on each allowed class, plus (1-α) extra on gold.
+    K = sample_mask.sum(dim=-1, keepdim=True).float().clamp(min=1.0)
+    uniform_over_allowed = sample_mask.float() / K
+    one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
+    smoothed_target = (1.0 - label_smoothing) * one_hot + label_smoothing * uniform_over_allowed
+
+    loss = -(smoothed_target * log_probs).sum(dim=-1)
+    return loss.mean()

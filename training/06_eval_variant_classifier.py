@@ -109,7 +109,13 @@ def evaluate(args):
     )
 
     backbone = setup_backbone(device, ckpt.get("finetuned_backbone"), console=console)
-    head = build_head(arch, input_dim, len(labels)).to(device)
+    # Rebuild the head with the same hyperparams it was trained with, so the
+    # state_dict shapes match for MLPs with non-default hidden_dim.
+    head = build_head(
+        arch, input_dim, len(labels),
+        hidden_dim=ckpt.get("hidden_dim", 256),
+        dropout=ckpt.get("dropout", 0.1),
+    ).to(device)
     head.load_state_dict(ckpt["head_state_dict"])
     head.eval()
 
