@@ -800,7 +800,13 @@ def main():
                     help="Head-training batch size. With cached features the head "
                          "is just a Linear, so 4096-8192 fits comfortably on a 4070.")
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=0,
+                    help="DataLoader subprocess count. Default 0: the cache path "
+                         "is just memmap reads with no IPC benefit, and on Windows "
+                         "DataLoader workers can hit OSError [Errno 22] when "
+                         "pickling memmap-backed datasets (especially with multiple "
+                         "side-channel memmaps from --color-hist / --edge-channel). "
+                         "Bump to 4-8 only if you're running --no-cache.")
     ap.add_argument("--seed", type=int, default=42)
 
     # Regularization
